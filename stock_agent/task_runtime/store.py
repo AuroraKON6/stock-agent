@@ -319,15 +319,31 @@ class TaskStore:
                     stored_payload is not None
                     and self._content_fingerprint(stored_payload) == self._content_fingerprint(input_payload)
                 )
-                # For event-derived tasks the logical request IS the event
-                # identity: a rebuilt public context (later signals, refreshed
-                # cache) is not a different request. Byte equality stays
-                # mandatory for every non-event key.
+                # For event- and question-derived tasks the logical request IS
+                # the stable identity (event key / question hash): a rebuilt
+                # public context (later signals, refreshed cache) is not a
+                # different request. Byte equality stays mandatory for every
+                # other key.
+                def _same_logical(payload_a: Dict[str, Any], payload_b: Dict[str, Any]) -> bool:
+                    origin_a = payload_a.get("origin") if isinstance(payload_a.get("origin"), dict) else {}
+                    origin_b = payload_b.get("origin") if isinstance(payload_b.get("origin"), dict) else {}
+                    if str(origin_a.get("event_key") or "") and \
+                            origin_a.get("event_key") == origin_b.get("event_key"):
+                        return True
+                    sha_a = str(origin_a.get("question_sha256") or "")
+                    if sha_a and sha_a == str(origin_b.get("question_sha256") or "") \
+                            and origin_a.get("kind") == origin_b.get("kind") == "question":
+                        return True
+                    return False
+
                 same_logical_request = same_content or (
                     consumption is not None
                     and isinstance(stored_payload, dict)
                     and str((stored_payload.get("origin") or {}).get("event_key") or "")
                     == consumption["event_key"]
+                ) or (
+                    isinstance(stored_payload, dict)
+                    and _same_logical(stored_payload, input_payload)
                 )
                 if str(existing["execution_mode"]) != execution_mode or not same_logical_request:
                     self._rollback()

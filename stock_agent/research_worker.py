@@ -362,6 +362,13 @@ def run_research_task(
 
     config = config or {}
     max_rounds = max(1, int(max_rounds))
+    runtime_cfg = config.get("task_runtime") or {}
+    # Plan budget 4.2: a case's total wall-clock time is bounded (default 10
+    # minutes); retries live inside the same budget and never extend it.
+    try:
+        case_time_limit = max(60, int(runtime_cfg.get("case_time_limit_seconds") or 600))
+    except (TypeError, ValueError):
+        case_time_limit = 600
     task = store.get_task(task_id)
     store.mark_running(task_id, worker_id=worker_id, fencing_token=task["fencing_token"], expected_version=task["version"])
     task = store.get_task(task_id)
@@ -480,6 +487,12 @@ def run_research_task(
             current = store.cancel_if_requested(task_id, worker_id=worker_id, fencing_token=task["fencing_token"])
             if current["status"] == "cancelled":
                 return {"status": "cancelled", "model_call": model_call}
+            elapsed = time.perf_counter() - started
+            if elapsed > case_time_limit:
+                return _fail(
+                    "case time limit exceeded after {0:.0f}s (limit {1}s); no further model rounds".format(
+                        elapsed, case_time_limit),
+                    retryable=False)
 
             if round_index > 1:
                 # Governance and context verification re-run on every round
