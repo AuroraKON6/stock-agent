@@ -1,0 +1,51 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.venv*/
+venv/
+
+# Local credentials and machine state
+.env
+.env.*
+config/watchlist.local.json
+.agents/
+.codex/
+.openclaw/
+.playwright-cli/
+.mimosa/
+.video_agent/
+openclaw-workspace-state.json
+openclaw/
+output/
+pi_runtime/node_modules/
+pi_runtime/.npm-cache/
+pi_runtime/agent_home/sessions/
+pi_runtime/agent_home/auth.json
+pi_runtime/agent_home/models-store.json
+config/*.local.json
+
+# Legacy workspace identity and temporary diagnostics are not production source.
+HEARTBEAT.md
+IDENTITY.md
+SOUL.md
+TOOLS.md
+USER.md
+_db_check.py
+_tmp_plain_listener.py
+
+# Runtime databases, evidence, decisions, and generated artifacts
+data/*
+!data/inbox/
+data/inbox/*
+!data/inbox/manual_signals.example.jsonl
+!data/inbox/full_flow_test_20260429.jsonl
+reports/
+logs/
+
+# Downloaded third-party skill repositories are installed locally.
+skills/*
+!skills/README.md
+
+# Local diagram-tool plugin state (machine pointer file, not source).
+.v2c/

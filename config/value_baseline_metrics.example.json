@@ -1,0 +1,20 @@
+{
+  "template_only": true,
+  "started_at": "2026-09-01T09:00:00+08:00",
+  "completed_at": "2026-09-01T12:00:00+08:00",
+  "active_minutes": 120,
+  "segment_minutes": {
+    "collection": 20,
+    "evidence": 30,
+    "analysis": 35,
+    "drafting": 20,
+    "review": 10,
+    "correction": 5
+  },
+  "measurement_method": "time_log",
+  "measurement_evidence_ref": "archive:replace-with-approved-time-log-ref",
+  "measurement_evidence_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "tool_switch_count": 0,
+  "source_count": 0,
+  "citation_count": 0
+}

@@ -1,0 +1,192 @@
+{
+  "bundle_sha256": "85289fa6508f5cff0ac7df8ea60fee4480f2b0a92c57475ce06a266f94030235",
+  "policy_version": "26.0",
+  "registry_sha256": "7894dba4e40b1c61121064397538eb5364239a74eb88f32a9601685c2522a780",
+  "role_bundles": {
+    "case_analyst": {
+      "bytes": 8521,
+      "sha256": "613d0b036b2c3f807a63a9d1a639bbddceaefec318269a06415b0a8cdaefbddd",
+      "skill_ids": [
+        "evidence-challenge",
+        "risk-guard",
+        "research-synthesis",
+        "source-provenance-audit",
+        "a-share-disclosure-analysis",
+        "financial-quality-review",
+        "thesis-catalyst-ledger",
+        "sector-competitive-map"
+      ]
+    },
+    "public_handoff": {
+      "bytes": 1913,
+      "sha256": "b259d7f7b55e43aa318f8dda036ada870390d98683ae701affc3cb3944225eea",
+      "skill_ids": [
+        "risk-guard",
+        "source-provenance-audit"
+      ]
+    },
+    "research_desk": {
+      "bytes": 8521,
+      "sha256": "613d0b036b2c3f807a63a9d1a639bbddceaefec318269a06415b0a8cdaefbddd",
+      "skill_ids": [
+        "evidence-challenge",
+        "risk-guard",
+        "research-synthesis",
+        "source-provenance-audit",
+        "a-share-disclosure-analysis",
+        "financial-quality-review",
+        "thesis-catalyst-ledger",
+        "sector-competitive-map"
+      ]
+    },
+    "review_optimizer": {
+      "bytes": 2202,
+      "sha256": "41fabb55872916d4dd8129762096db2b4b64e1d3121b877ac22e6aff04f8e9c5",
+      "skill_ids": [
+        "risk-guard",
+        "review-optimization",
+        "incident-learning-review"
+      ]
+    },
+    "signal_analyst": {
+      "bytes": 4519,
+      "sha256": "2c23c6d29bfcffd9e08c8f1e914f112b31b54280ce0bff45583268a80de7680a",
+      "skill_ids": [
+        "signal-analysis",
+        "evidence-challenge",
+        "risk-guard",
+        "source-provenance-audit",
+        "a-share-disclosure-analysis"
+      ]
+    }
+  },
+  "runtime_mode": "compiled_prompt_only",
+  "schema_version": "1.0",
+  "skills": [
+    {
+      "bytes": 541,
+      "id": "signal-analysis",
+      "path": ".pi/skills/signal-analysis/SKILL.md",
+      "roles": [
+        "signal_analyst"
+      ],
+      "sha256": "ffdf763344275f6996166f23fa3065cc8ffb3c190e6555e1fbdde2de4bb9e344",
+      "version": "1.0.0"
+    },
+    {
+      "bytes": 526,
+      "id": "evidence-challenge",
+      "path": ".pi/skills/evidence-challenge/SKILL.md",
+      "roles": [
+        "signal_analyst",
+        "research_desk",
+        "case_analyst"
+      ],
+      "sha256": "68a1716a204a8b10204dc805d9a2294e71de5e2b2c88e3f15e5ebbb219504f6a",
+      "version": "1.0.0"
+    },
+    {
+      "bytes": 468,
+      "id": "risk-guard",
+      "path": ".pi/skills/risk-guard/SKILL.md",
+      "roles": [
+        "signal_analyst",
+        "research_desk",
+        "case_analyst",
+        "public_handoff",
+        "review_optimizer"
+      ],
+      "sha256": "19ee7cf3cf9c3f171659d55d8caaceec0869f7615a6954cecfc772b3799e9e1d",
+      "version": "1.0.0"
+    },
+    {
+      "bytes": 513,
+      "id": "research-synthesis",
+      "path": ".pi/skills/research-synthesis/SKILL.md",
+      "roles": [
+        "research_desk",
+        "case_analyst"
+      ],
+      "sha256": "a49778d76e6b0b8db4db657e0ec1b3ffbbc54bfa78360bd37a2a0c4f3603dbd8",
+      "version": "1.0.0"
+    },
+    {
+      "bytes": 430,
+      "id": "review-optimization",
+      "path": ".pi/skills/review-optimization/SKILL.md",
+      "roles": [
+        "review_optimizer"
+      ],
+      "sha256": "909d979102b5bcb1d2faf96bf84ee4b2dbe1e00b41c534f5b1e6330d0ac22fd2",
+      "version": "1.0.0"
+    },
+    {
+      "bytes": 1445,
+      "id": "source-provenance-audit",
+      "path": ".pi/skills/source-provenance-audit/SKILL.md",
+      "roles": [
+        "signal_analyst",
+        "research_desk",
+        "case_analyst",
+        "public_handoff"
+      ],
+      "sha256": "5951aa160636160a5476e179e17d7aa2e960fc988c47da7cf5fd11a85bfca75f",
+      "version": "1.0.0"
+    },
+    {
+      "bytes": 1539,
+      "id": "a-share-disclosure-analysis",
+      "path": ".pi/skills/a-share-disclosure-analysis/SKILL.md",
+      "roles": [
+        "signal_analyst",
+        "research_desk",
+        "case_analyst"
+      ],
+      "sha256": "7443b6f34200f3248731d895317aa65f3cb6c26952978eca97e136f91429af36",
+      "version": "1.0.0"
+    },
+    {
+      "bytes": 1378,
+      "id": "financial-quality-review",
+      "path": ".pi/skills/financial-quality-review/SKILL.md",
+      "roles": [
+        "research_desk",
+        "case_analyst"
+      ],
+      "sha256": "d0ff4567cc87e7b142fdca61bd616ab6c07fd71bcdbf7948b4e6fa7b94099afe",
+      "version": "1.0.0"
+    },
+    {
+      "bytes": 1345,
+      "id": "thesis-catalyst-ledger",
+      "path": ".pi/skills/thesis-catalyst-ledger/SKILL.md",
+      "roles": [
+        "research_desk",
+        "case_analyst"
+      ],
+      "sha256": "5f79d380982d69cbf425ba9d5855de1afecf96addfc30b31b36948a4a0dc028b",
+      "version": "1.0.0"
+    },
+    {
+      "bytes": 1307,
+      "id": "sector-competitive-map",
+      "path": ".pi/skills/sector-competitive-map/SKILL.md",
+      "roles": [
+        "research_desk",
+        "case_analyst"
+      ],
+      "sha256": "cc755a06f5006da65c89f16e7e2ae6fa7a3761f4e40c04612583d77ab4619b82",
+      "version": "1.0.0"
+    },
+    {
+      "bytes": 1304,
+      "id": "incident-learning-review",
+      "path": ".pi/skills/incident-learning-review/SKILL.md",
+      "roles": [
+        "review_optimizer"
+      ],
+      "sha256": "e46b00b3afbf4c5100cfa946cd4ed147aa881e46807397e3a36d346b46dd8df6",
+      "version": "1.0.0"
+    }
+  ]
+}

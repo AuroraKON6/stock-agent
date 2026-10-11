@@ -1,0 +1,27 @@
+{
+  "template_only": true,
+  "started_at": "2026-09-02T09:00:00+08:00",
+  "completed_at": "2026-09-02T11:00:00+08:00",
+  "active_minutes": 90,
+  "segment_minutes": {
+    "collection": 10,
+    "evidence": 20,
+    "analysis": 25,
+    "drafting": 15,
+    "review": 15,
+    "correction": 5
+  },
+  "measurement_method": "time_log",
+  "measurement_evidence_ref": "archive:replace-with-approved-time-log-ref",
+  "measurement_evidence_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "tool_switch_count": 0,
+  "source_count": 0,
+  "citation_count": 0,
+  "system_duration_seconds": 0,
+  "prompt_tokens": 0,
+  "completion_tokens": 0,
+  "reasoning_tokens": 0,
+  "estimated_cost_cny": 0,
+  "system_run_ref": "report:replace-with-frozen-run-summary-ref",
+  "system_run_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+}

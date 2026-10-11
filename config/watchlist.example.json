@@ -1,0 +1,796 @@
+{
+  "timezone": "Asia/Shanghai",
+  "project_name": "A股智能投研系统",
+  "output_language": "zh-CN",
+  "storage": {
+    "sqlite_path": "data/stock_agent.sqlite3"
+  },
+  "skills": {
+    "path": "skills",
+    "roles": {
+      "source_discovery": [
+        "akshare",
+        "stock-query",
+        "stock-monitor"
+      ],
+      "filing_parser": [
+        "auto-data-analysis-claw",
+        "historical-data-compare-claw"
+      ],
+      "sentiment_analysis": [
+        "stocksight"
+      ],
+      "fund_flow_analysis": [
+        "akshare",
+        "stock-query",
+        "stock-analysis",
+        "stock-daily-analysis",
+        "stock-monitor"
+      ],
+      "report_writer": [
+        "financial-report-render-claw",
+        "dashboard-gen"
+      ]
+    }
+  },
+  "topics": [
+    {
+      "name": "AI算力",
+      "sector": "TMT",
+      "symbols": [
+        "浪潮信息",
+        "中科曙光",
+        "工业富联"
+      ],
+      "keywords": [
+        "算力",
+        "GPU",
+        "服务器",
+        "液冷",
+        "数据中心",
+        "AI芯片"
+      ],
+      "risk_keywords": [
+        "出口管制",
+        "订单取消",
+        "供应受限",
+        "毛利率下滑"
+      ],
+      "update_frequency": "30m"
+    },
+    {
+      "name": "新能源车",
+      "sector": "制造",
+      "symbols": [
+        "宁德时代",
+        "比亚迪",
+        "长安汽车"
+      ],
+      "keywords": [
+        "动力电池",
+        "新能源车",
+        "固态电池",
+        "销量",
+        "碳酸锂"
+      ],
+      "risk_keywords": [
+        "价格战",
+        "召回",
+        "补贴退坡",
+        "库存高企"
+      ],
+      "update_frequency": "60m"
+    },
+    {
+      "name": "中特估与高股息",
+      "sector": "策略",
+      "symbols": [
+        "中国移动",
+        "中国神华",
+        "长江电力"
+      ],
+      "keywords": [
+        "中特估",
+        "高股息",
+        "分红",
+        "央企改革",
+        "市值管理"
+      ],
+      "risk_keywords": [
+        "分红下降",
+        "政策不及预期",
+        "煤价下跌"
+      ],
+      "update_frequency": "1d"
+    }
+  ],
+  "sources": {
+    "local_jsonl": [
+      {
+        "name": "手工情报池",
+        "path": "data/inbox/manual_signals.example.jsonl",
+        "enabled": true
+      }
+    ],
+    "filing_jsonl": [
+      {
+        "name": "公告财报证据池",
+        "path": "data/inbox/examples/filing_evidence.example.jsonl",
+        "enabled": false
+      }
+    ],
+    "eastmoney_filing": {
+      "enabled": false,
+      "symbols": [
+        "600519",
+        "300750",
+        "000001"
+      ],
+      "source_type": "filing",
+      "timeout": 20,
+      "page_size": 20,
+      "max_announcements_per_symbol": 5,
+      "ann_type": "A",
+      "write_jsonl": true,
+      "output_dir": "data/inbox/filings"
+    },
+    "rss": [
+      {
+        "name": "中国新闻网财经RSS",
+        "url": "http://www.chinanews.com/rss/finance.xml",
+        "enabled": false,
+        "source_type": "news"
+      }
+    ],
+    "eastmoney": {
+      "enabled": false,
+      "symbols": [
+        "600519",
+        "300750",
+        "000001"
+      ],
+      "source_type": "price",
+      "timeout": 15
+    },
+    "alltick": {
+      "enabled": false,
+      "symbols": [
+        "600519",
+        "300750",
+        "000001"
+      ],
+      "source_type": "price",
+      "timeout": 15,
+      "max_symbols_per_run": 5,
+      "token_env": "ALLTICK_TOKEN",
+      "base_url": "https://quote.alltick.io/quote-stock-b-api"
+    },
+    "free_quote": {
+      "enabled": false,
+      "symbols": [
+        "600519",
+        "300750",
+        "000001"
+      ],
+      "source_type": "price",
+      "timeout": 15,
+      "max_symbols_per_run": 5,
+      "token_env": "FREE_QUOTE_TOKEN",
+      "base_url": "https://quote.alltick.io/quote-stock-b-api"
+    },
+    "pysnowball": {
+      "enabled": false,
+      "symbols": [
+        "600519",
+        "300750",
+        "000001"
+      ],
+      "source_type": "price",
+      "timeout": 15,
+      "max_symbols_per_run": 10,
+      "token_env": "XUEQIU_TOKEN"
+    },
+    "akshare": {
+      "enabled": false,
+      "symbols": [
+        "600519",
+        "300750",
+        "000001"
+      ],
+      "source_type": "price"
+    }
+  },
+  "priority_rules": {
+    "p0_keywords": [
+      "停牌",
+      "退市",
+      "立案",
+      "爆雷",
+      "债务违约",
+      "重大事故",
+      "实控人失联"
+    ],
+    "p1_keywords": [
+      "业绩预告",
+      "大额订单",
+      "并购重组",
+      "减持",
+      "回购",
+      "定增",
+      "监管问询",
+      "处罚",
+      "涨停",
+      "跌停"
+    ],
+    "positive_keywords": [
+      "超预期",
+      "增长",
+      "中标",
+      "回购",
+      "增持",
+      "订单",
+      "突破",
+      "提价",
+      "分红"
+    ],
+    "negative_keywords": [
+      "不及预期",
+      "下滑",
+      "亏损",
+      "减持",
+      "处罚",
+      "问询",
+      "违约",
+      "召回",
+      "停产",
+      "取消",
+      "承压",
+      "供应受限",
+      "价格战"
+    ],
+    "review_keywords": [
+      "传闻",
+      "据称",
+      "网传",
+      "未证实",
+      "匿名",
+      "小作文"
+    ],
+    "min_priority_for_alert": "P1",
+    "price_rules": {
+      "pct_change_abs_threshold": 3.0,
+      "main_net_inflow_threshold": 100000000,
+      "main_net_outflow_threshold": -100000000,
+      "priority_for_single_price_anomaly": "P2",
+      "priority_for_multi_price_anomaly": "P1"
+    },
+    "filing_importance_rules": {
+      "enabled": true,
+      "high_types": [
+        "performance_forecast",
+        "buyback",
+        "shareholder_reduction",
+        "dividend",
+        "regulatory_inquiry",
+        "major_contract"
+      ],
+      "medium_types": [
+        "annual_report",
+        "semiannual_report",
+        "quarterly_report",
+        "financing"
+      ],
+      "low_types": [
+        "governance",
+        "legal_opinion",
+        "routine",
+        "monthly_report"
+      ],
+      "high_score": 70,
+      "medium_score": 45,
+      "low_score": 10,
+      "unknown_score": 25,
+      "abnormal_evidence_score": 65
+    }
+  },
+  "review": {
+    "effect_window_days": 5,
+    "backlog_warn_count": 20,
+    "pending_file_warn_count": 30,
+    "warn_if_no_completed": true,
+    "fields": [
+      "signal_id",
+      "actual_price_move",
+      "actual_news_followup",
+      "decision_taken",
+      "was_effective",
+      "notes"
+    ]
+  },
+  "report": {
+    "daily_top_n": 20,
+    "include_low_priority": false
+  },
+  "research_framework": {
+    "enabled": true,
+    "mode": "default_plus_config",
+    "playbooks": []
+  },
+  "research_team": {
+    "enabled": true,
+    "mode": "default_plus_config",
+    "supervisor_name": "上司",
+    "roles": []
+  },
+  "research_cases": {
+    "enabled": true,
+    "llm_enabled": false,
+    "min_priority": "P2",
+    "max_cases_per_run": 5,
+    "llm_timeout": 30,
+    "llm_max_attempts": 1
+  },
+  "market_resilience": {
+    "enabled": true,
+    "fallback_priority": ["eastmoney", "akshare", "pysnowball", "alltick", "free_quote", "cache"],
+    "verification_providers": ["akshare"],
+    "allow_disabled_fallbacks": false,
+    "cache_ttl_minutes": 60
+  },
+  "market_data_governance": {
+    "enabled": true,
+    "timezone": "Asia/Shanghai",
+    "calendar": {"weekdays": [0, 1, 2, 3, 4], "holidays": []},
+    "max_live_age_seconds": 120,
+    "max_closed_market_age_hours": 36,
+    "require_quote_timestamp_during_session": true,
+    "block_cache_without_quote_timestamp": true,
+    "allow_degraded_offhours_llm": false,
+    "require_authorized_provider_for_llm": true,
+    "use_production_pilot_provider_registry": true,
+    "approved_internal_research_providers": [],
+    "require_consensus_for_llm": true,
+    "min_consensus_sources": 2,
+    "max_cross_source_deviation_pct": 0.5,
+    "report_dir": "reports/market_data_governance"
+  },
+  "review_queue": {
+    "enabled": true,
+    "enforce_roster": true,
+    "assignment_mode": "suggest_only",
+    "review_dir": "data/review",
+    "index_path": "data/review/queue_index.json",
+    "actions_dir": "data/review/queue_actions",
+    "report_dir": "reports/review_queue",
+    "at_risk_ratio": 0.8,
+    "sla_hours": {"P0": 0.5, "P1": 2, "P2": 8, "P3": 24}
+  },
+  "source_health": {
+    "enabled": true,
+    "warn_score_below": 80,
+    "fail_score_below": 50,
+    "warn_only_source_errors": ["eastmoney", "eastmoney_filing"],
+    "trust_scores": {
+      "eastmoney": 0.85,
+      "eastmoney_filing": 0.85,
+      "local_jsonl": 0.7,
+      "filing_jsonl": 0.75,
+      "rss": 0.65,
+      "pysnowball": 0.75,
+      "alltick": 0.75,
+      "akshare": 0.75,
+      "free_quote": 0.7,
+      "market_cache": 0.55
+    }
+  },
+  "run_ops": {
+    "enabled": true,
+    "max_run_seconds": 420,
+    "warn_run_seconds": 360,
+    "llm_max_calls": 4,
+    "llm_max_seconds": 240,
+    "retry_backoff_seconds": 1,
+    "progress_enabled": true,
+    "stage_warn_seconds": {
+      "collect": 210,
+      "llm_signals": 90,
+      "llm_governance": 5,
+      "multi_role_llm": 150,
+      "research_cases": 120,
+      "research_runtime": 10,
+      "source_health": 10
+    }
+  },
+    "run_coordination": {
+      "enabled": false,
+      "lease_root": "data/run_coordination/leases",
+      "recovered_lease_root": "data/run_coordination/recovered",
+      "checkpoint_path": "data/run_coordination/checkpoints.jsonl",
+      "report_dir": "reports/run_coordination",
+      "lease_ttl_seconds": 900,
+      "require_explicit_stale_recovery": true,
+      "fail_fast_on_lease_conflict": true
+    },
+    "run_manifest": {
+      "enabled": false,
+      "manifest_dir": "data/run_coordination/manifests",
+      "pointer_path": "reports/run_coordination/latest_manifest.json",
+      "require_completed_coordination": true,
+      "verify_artifacts_on_load": true
+    },
+  "model_operations": {
+    "enabled": true,
+    "report_dir": "reports/model_operations",
+    "usage_dir": "data/model_operations/usage",
+    "rolling_window_runs": 20,
+    "service_levels": {
+      "agent_target_seconds": 180,
+      "scheduled_delivery_target_seconds": 300,
+      "signal_llm_warn_seconds": 60,
+      "role_llm_warn_seconds": 90
+    },
+    "deadline_policy": {
+      "post_llm_reserve_seconds": 45,
+      "main_min_start_remaining_seconds": 75,
+      "main_reduce_below_seconds": 105,
+      "reduced_main_max_signals": 1,
+      "role_min_start_remaining_seconds": 75,
+      "role_reduce_below_seconds": 120,
+      "reduced_role_max_signals": 1,
+      "retry_min_remaining_seconds": 75
+    },
+    "quality_thresholds": {
+      "main_success_rate_min": 0.95,
+      "role_success_rate_min": 0.9,
+      "usable_grounding_rate_min": 0.95,
+      "fully_grounded_rate_min": 0.75,
+      "usage_metadata_rate_min": 1.0
+    },
+    "pricing": {
+      "enabled": true,
+      "currency": "USD",
+      "effective_date": "2026-08-12",
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "models": {
+        "deepseek-v4-pro": {
+          "input_cache_hit_per_1m": 0.003625,
+          "input_cache_miss_per_1m": 0.435,
+          "output_per_1m": 0.87
+        }
+      }
+    }
+  },
+
+  "pi_agent": {
+    "enabled": false,
+    "package": "@earendil-works/pi-coding-agent",
+    "version": "0.84.2",
+    "provider": "deepseek",
+    "model": "deepseek-v4-pro",
+    "thinking": "high",
+    "timeout": 60,
+    "agent_home": "pi_runtime/agent_home",
+    "workspace": "data/pi_runtime/workspace",
+    "audit_dir": "logs/pi_runtime",
+    "compiled_skills_enabled": true,
+    "skill_registry": "config/pi_skills.json",
+    "skill_lock": "config/pi_skills.lock.json",
+    "require_skill_lock": true,
+    "allow_legacy_http_fallback": false
+  },
+  "llm_agent": {
+    "enabled": false,
+    "runtime": "pi",
+    "pi_provider": "deepseek",
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-v4-pro",
+    "timeout": 45,
+    "temperature": 0.2,
+    "json_mode": true,
+    "thinking": "high",
+    "reasoning_effort": "high",
+    "max_tokens": 4096,
+    "user_id": "stock-agent-signal-analysis",
+    "min_priority": "P2",
+    "max_signals_per_run": 10,
+    "auto_execute_actions": true,
+    "allowed_actions": [
+      "export_review",
+      "write_action_log"
+    ],
+    "providers": [
+      {
+        "name": "deepseek_primary",
+        "runtime": "pi",
+        "pi_provider": "deepseek",
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-v4-pro",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "timeout": 45,
+        "max_attempts": 2
+      },
+      {
+        "enabled": false,
+        "name": "fallback_openai_compatible",
+        "runtime": "http",
+        "rollback_only": true,
+        "base_url_env": "LLM_FALLBACK_BASE_URL",
+        "model_env": "LLM_FALLBACK_MODEL",
+        "api_key_env": "LLM_FALLBACK_API_KEY",
+        "timeout": 45,
+        "max_attempts": 1
+      }
+    ]
+  },
+  "agent_handoff": {
+    "enabled": true,
+    "max_public_signals": 10
+  },
+  "openclaw_handoff": {
+    "enabled": false,
+    "legacy_read_only": true,
+    "max_public_signals": 10
+  },
+  "llm_governance": {
+    "enabled": false,
+    "enforce": false,
+    "external_provider": true,
+    "default_classification": "internal",
+    "allowed_external_classifications": ["public"],
+    "public_source_types": ["price", "filing", "financial", "announcement", "news"],
+    "trusted_public_sources": ["eastmoney", "eastmoney_filing", "akshare", "pysnowball", "alltick", "free_quote", "cninfo", "sse", "szse", "bse", "csrc", "sac"],
+    "trusted_public_domains": ["cninfo.com.cn", "sse.com.cn", "szse.cn", "bse.cn", "csrc.gov.cn", "sac.net.cn", "eastmoney.com"],
+    "block_secrets": true,
+    "block_personal_data": true,
+    "block_nonpublic_information": true,
+    "block_prompt_injection": true,
+    "require_evidence_refs": true,
+    "max_text_chars": 6000,
+    "max_list_items": 50,
+    "audit_enabled": true,
+    "audit_path": "data/llm_governance/audit",
+    "exception_path": "data/llm_governance/exceptions",
+    "report_path": "reports/llm_governance",
+    "retention_years": 5
+  },
+  "research_git": {
+    "enabled": false,
+    "auto_stage_from_llm": true,
+    "min_priority": "P2",
+    "min_confidence": 0.7,
+    "require_human_decision_needed": true
+  },
+  "research_runtime": {
+    "enabled": true,
+    "auto_sync": true,
+    "retention_years": 5,
+    "require_primary_source_for": ["P0", "P1"],
+    "required_compliance_checks": [
+      "public_information_only",
+      "inside_information_check",
+      "conflict_of_interest_check",
+      "quiet_period_check",
+      "disclosures_complete"
+    ],
+    "human_approval_required": true,
+    "external_publication_enabled": false,
+    "auto_publish": false
+  },
+  "official_evidence_vault": {
+    "enabled": true,
+    "enforce": true,
+    "events_path": "data/evidence_vault/events.jsonl",
+    "index_path": "data/evidence_vault/index.json",
+    "objects_dir": "data/evidence_vault/objects/sha256",
+    "quarantine_dir": "data/evidence_vault/quarantine/sha256",
+    "report_dir": "reports/evidence_vault",
+    "allowed_official_domains": ["bse.cn", "cninfo.com.cn", "csrc.gov.cn", "sac.net.cn", "sse.com.cn", "szse.cn"],
+    "allowed_content_types": ["application/json", "application/pdf", "application/xml", "text/html", "text/plain", "text/xml"],
+    "require_https": true,
+    "resolve_public_ip_on_fetch": true,
+    "allow_network_fetch": false,
+    "auto_capture_official_signals": false,
+    "max_auto_captures_per_run": 3,
+    "max_document_bytes": 26214400,
+    "reject_challenge_pages": true,
+    "require_published_at_for_llm": true,
+    "require_retained_before_external_llm_for": ["announcement", "filing", "financial"],
+    "retention_years": 5,
+    "capture_actor_id": "stock_agent_source_collector",
+    "capture_actor_role": "information_analyst",
+    "automatic_approval": false,
+    "automatic_publication": false,
+    "automatic_trading": false,
+    "production_archive": {
+      "backend": "local_content_addressed_shadow",
+      "evidence_ref": "",
+      "external_immutability_verified": false,
+      "required_review_roles": ["compliance_officer", "information_security_officer"],
+      "activation_roles": ["data_steward", "research_coordinator"]
+    }
+  },
+  "research_workpapers": {
+    "enabled": true,
+    "enforce": true,
+    "events_path": "data/research_workpapers/events.jsonl",
+    "projection_path": "data/research_workpapers/latest.json",
+    "report_dir": "reports/research_workpapers",
+    "retention_years": 5,
+    "require_official_primary_for": ["P0", "P1"],
+    "require_exact_evidence_refs": true,
+    "require_market_governance_pass": true,
+    "require_distinct_human_roles": true,
+    "require_independent_challenge": true,
+    "archive_backend": "local_append_only_shadow",
+    "production_archive_approved": false,
+    "production_archive_evidence_ref": "",
+    "automatic_approval": false,
+    "automatic_assignment": false,
+    "automatic_publication": false,
+    "automatic_trading": false
+  },
+  "research_operations": {
+    "enabled": true,
+    "enforce_roster": true,
+    "assignment_mode": "suggest_only",
+    "roster_path": "config/research_roster.example.json",
+    "restrictions_path": "config/research_restrictions.example.json",
+    "require_recorded_challenge": true,
+    "timezone": "Asia/Shanghai",
+    "at_risk_ratio": 0.8,
+    "business_calendar": {
+      "weekdays": [0, 1, 2, 3, 4],
+      "workday_start": "08:30",
+      "workday_end": "18:00",
+      "holidays": []
+    },
+    "stage_sla_hours": {
+      "P0": {"intake": 0.5, "triage": 0.5, "evidence_collection": 2, "analysis": 4, "challenge": 2, "quality_review": 2, "compliance_review": 2, "human_approval": 2},
+      "P1": {"intake": 2, "triage": 2, "evidence_collection": 8, "analysis": 16, "challenge": 8, "quality_review": 8, "compliance_review": 8, "human_approval": 8},
+      "P2": {"intake": 8, "triage": 8, "evidence_collection": 24, "analysis": 32, "challenge": 16, "quality_review": 16, "compliance_review": 16, "human_approval": 16},
+      "P3": {"intake": 16, "triage": 16, "evidence_collection": 40, "analysis": 56, "challenge": 24, "quality_review": 24, "compliance_review": 24, "human_approval": 24}
+    }
+  },
+  "business_onboarding": {
+    "enabled": false,
+    "enforce": false,
+    "organization_id": "",
+    "control_evidence_event_path": "data/business_onboarding/control_evidence_events.jsonl",
+    "report_dir": "reports/business_onboarding",
+    "intake_pack_dir": "reports/business_onboarding/intake_pack",
+    "require_verified_control_evidence": true,
+    "require_distinct_humans": true,
+    "control_evidence_max_file_bytes": 104857600,
+    "allowed_control_archive_schemes": ["archive", "dms", "records", "https"],
+    "required_governance_evidence": ["governance_mandate", "internal_research_scope", "prohibited_actions_policy"],
+    "required_human_evidence": ["human_employment", "human_confidentiality", "human_training", "role_appointment"],
+    "required_archive_evidence": ["production_archive_contract", "production_archive_security", "production_archive_retention"],
+    "control_evidence_expiring_categories": ["human_qualification", "human_training", "provider_data_rights", "provider_security", "provider_operations"],
+    "control_evidence_review_roles": {
+      "governance_mandate": ["compliance_officer"],
+      "internal_research_scope": ["compliance_officer"],
+      "prohibited_actions_policy": ["compliance_officer", "information_security_officer"],
+      "human_employment": ["research_coordinator"],
+      "human_qualification": ["compliance_officer"],
+      "human_confidentiality": ["compliance_officer"],
+      "human_training": ["compliance_officer"],
+      "role_appointment": ["research_coordinator"],
+      "provider_legal_contract": ["compliance_officer"],
+      "provider_data_rights": ["data_steward", "compliance_officer"],
+      "provider_security": ["information_security_officer"],
+      "provider_operations": ["research_coordinator"],
+      "production_archive_contract": ["compliance_officer"],
+      "production_archive_security": ["information_security_officer"],
+      "production_archive_retention": ["compliance_officer"],
+      "approval_support": ["compliance_officer"]
+    }
+  },
+  "value_validation": {
+    "enabled": false,
+    "study_id": "a_share_research_value_v1",
+    "event_path": "data/value_validation/events.jsonl",
+    "sealed_dir": "data/value_validation/sealed",
+    "report_dir": "reports/value_validation",
+    "blind_report_dir": "reports/value_validation/blind_assignments",
+    "minimum_cases": 20,
+    "maximum_cases": 30,
+    "minimum_strata": 2,
+    "target_efficiency_improvement": 0.2,
+    "quality_non_inferiority_margin": 0,
+    "minimum_blind_coverage": 1.0,
+    "maximum_unauthorized_egress": 0,
+    "require_same_analyst": true,
+    "allowed_priorities": ["P0", "P1"],
+    "allowed_data_classifications": ["public"],
+    "qualifying_measurement_methods": ["time_log"],
+    "release_audit_path": "reports/release_audit/latest.json"
+  },
+  "backup_restore": {
+    "enabled": false,
+    "mode": "local_rehearsal",
+    "bundle_root": "data/backup_restore/bundles",
+    "drill_root": "data/backup_restore/drills",
+    "event_path": "data/backup_restore/events.jsonl",
+    "report_dir": "reports/backup_restore",
+    "sqlite_paths": ["data/stock_agent.sqlite3"],
+    "evidence_objects_dir": "data/evidence_vault/objects/sha256",
+    "maximum_backup_age_minutes": 1440,
+    "rpo_target_minutes": 1440,
+    "rto_target_minutes": 30,
+    "retention_days": 30,
+    "encryption_provider": "",
+    "offsite_target_uri": "",
+    "production_control_evidence_ref": "",
+    "independent_restore_signoff_ref": "",
+    "global_lease_evidence_ref": "",
+    "automatic_restore": false,
+    "automatic_activation": false,
+    "automatic_schedule_install": false
+  },
+  "production_pilot": {
+    "enabled": false,
+    "enforce": false,
+    "mode": "shadow",
+    "vendor_event_path": "data/production_pilot/vendor_events.jsonl",
+    "control_event_path": "data/production_pilot/control_events.jsonl",
+    "incident_event_path": "data/production_pilot/incident_events.jsonl",
+    "run_ledger_path": "data/production_pilot/run_ledger.jsonl",
+    "report_dir": "reports/production_pilot",
+    "minimum_active_providers": 2,
+    "minimum_shadow_runs": 5,
+    "minimum_shadow_trading_days": 3,
+    "maximum_unreconciled_runs": 0,
+    "review_batch_size": 20,
+    "review_wip_limit_per_human": 10,
+    "approval_validity_days": 30,
+    "required_provider_scopes": ["internal_research", "external_llm"],
+    "required_provider_review_roles": ["compliance_officer", "information_security_officer"],
+    "provider_activation_roles": ["data_steward", "research_coordinator"],
+    "required_provider_evidence": [
+      "legal_entity_ref",
+      "service_description_ref",
+      "source_provenance_ref",
+      "data_rights_license_ref",
+      "contract_ref",
+      "confidentiality_ref",
+      "security_assessment_ref",
+      "data_dictionary_ref",
+      "timestamp_semantics_ref",
+      "service_level_ref",
+      "incident_response_ref",
+      "continuity_exit_plan_ref",
+      "external_model_use_ref"
+    ],
+    "required_approval_gates": {
+      "research_readiness": "lead_analyst",
+      "quality_readiness": "quality_reviewer",
+      "compliance_readiness": "compliance_officer",
+      "information_security_readiness": "information_security_officer",
+      "data_readiness": "data_steward",
+      "publication_readiness": "publication_approver"
+    },
+    "automatic_assignment": false,
+    "automatic_approval": false,
+    "automatic_activation": false,
+    "automatic_publication": false,
+    "automatic_trading": false
+  },
+  "multi_role_agent": {
+    "enabled": false,
+    "runtime": "pi",
+    "pi_provider": "deepseek",
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-v4-pro",
+    "timeout": 60,
+    "temperature": 0.2,
+    "json_mode": true,
+    "thinking": "high",
+    "reasoning_effort": "high",
+    "max_tokens": 8192,
+    "user_id": "stock-agent-role-analysis",
+    "min_priority": "P2",
+    "max_signals_per_run": 3,
+    "max_attempts": 2,
+    "roles": []
+  }
+}

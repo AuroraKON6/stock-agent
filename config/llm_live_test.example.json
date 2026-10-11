@@ -1,0 +1,73 @@
+{
+  "timezone": "Asia/Shanghai",
+  "project_name": "A股智能投研系统-LLM测试",
+  "output_language": "zh-CN",
+  "storage": {
+    "sqlite_path": "data/llm_live_test.sqlite3"
+  },
+  "skills": {
+    "path": "skills",
+    "roles": {}
+  },
+  "topics": [
+    {
+      "name": "AI算力",
+      "sector": "TMT",
+      "symbols": ["浪潮信息", "中科曙光", "工业富联"],
+      "keywords": ["算力", "GPU", "服务器", "液冷", "数据中心", "AI芯片"],
+      "risk_keywords": ["出口管制", "订单取消", "供应受限", "毛利率下滑"],
+      "update_frequency": "30m"
+    }
+  ],
+  "sources": {
+    "local_jsonl": [
+      {
+        "name": "LLM测试信号",
+        "path": "data/inbox/examples/llm_test_signal.jsonl",
+        "enabled": true
+      }
+    ],
+    "rss": [],
+    "eastmoney": {
+      "enabled": true,
+      "symbols": ["600519", "300750", "000001"],
+      "source_type": "price",
+      "timeout": 15
+    },
+    "akshare": {
+      "enabled": false
+    }
+  },
+  "priority_rules": {
+    "p0_keywords": ["停牌", "退市", "立案", "爆雷", "债务违约", "重大事故", "实控人失联"],
+    "p1_keywords": ["业绩预告", "大额订单", "并购重组", "减持", "回购", "定增", "监管问询", "处罚", "涨停", "跌停"],
+    "positive_keywords": ["超预期", "增长", "中标", "回购", "增持", "订单", "突破", "提价", "分红"],
+    "negative_keywords": ["不及预期", "下滑", "亏损", "减持", "处罚", "问询", "违约", "召回", "停产", "取消", "承压", "供应受限", "价格战"],
+    "review_keywords": ["传闻", "据称", "网传", "未证实", "匿名", "小作文"],
+    "min_priority_for_alert": "P1",
+    "price_rules": {
+      "pct_change_abs_threshold": 3.0,
+      "main_net_inflow_threshold": 100000000,
+      "main_net_outflow_threshold": -100000000,
+      "priority_for_single_price_anomaly": "P2",
+      "priority_for_multi_price_anomaly": "P1"
+    }
+  },
+  "review": {
+    "effect_window_days": 5,
+    "fields": ["signal_id", "actual_price_move", "actual_news_followup", "decision_taken", "was_effective", "notes"]
+  },
+  "report": {
+    "daily_top_n": 20,
+    "include_low_priority": false
+  },
+  "llm_agent": {
+    "enabled": true,
+    "timeout": 60,
+    "temperature": 0.2,
+    "min_priority": "P2",
+    "max_signals_per_run": 10,
+    "auto_execute_actions": true,
+    "allowed_actions": ["export_review", "write_action_log"]
+  }
+}

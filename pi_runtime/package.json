@@ -1,0 +1,10 @@
+{
+  "name": "stock-agent-pi-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned Pi Agent runtime for the A-share research system",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.2"
+  }
+}

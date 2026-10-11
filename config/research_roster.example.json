@@ -1,0 +1,36 @@
+{
+  "version": "1.0",
+  "description": "Research operations identity roster. Copy a human template, replace every placeholder, and keep inactive until qualifications are verified.",
+  "human_principal_template": {
+    "actor_id": "human:replace_me",
+    "display_name": "Replace Me",
+    "principal_type": "human",
+    "active": false,
+    "roles": [
+      "lead_analyst"
+    ],
+    "information_side": "public",
+    "qualifications": {
+      "securities_analyst_registration": {
+        "status": "unverified",
+        "registration_id": "",
+        "verified_at": "",
+        "evidence_ref": "control:replace_me"
+      }
+    },
+    "authorizations": [],
+    "onboarding_evidence_refs": {
+      "human_employment": "control:replace_me",
+      "human_confidentiality": "control:replace_me",
+      "human_training": "control:replace_me",
+      "role_appointment": "control:replace_me",
+      "human_qualification": "control:replace_me"
+    },
+    "coverage_entities": [
+      "*"
+    ],
+    "restricted_entities": [],
+    "max_active_cases": 10
+  },
+  "principals": []
+}

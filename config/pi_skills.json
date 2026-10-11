@@ -1,0 +1,143 @@
+{
+  "schema_version": "1.0",
+  "policy_version": "26.0",
+  "runtime_mode": "compiled_prompt_only",
+  "dynamic_skill_loading": false,
+  "production_tools_enabled": false,
+  "limits": {
+    "max_skill_bytes": 12000,
+    "max_role_bundle_bytes": 48000
+  },
+  "skills": [
+    {
+      "id": "signal-analysis",
+      "version": "1.0.0",
+      "path": ".pi/skills/signal-analysis/SKILL.md",
+      "status": "approved_project",
+      "license": "Project-Owned",
+      "roles": ["signal_analyst"],
+      "permissions": {"network": false, "shell": false, "filesystem_write": false, "trading": false, "approval": false, "publication": false, "assignment": false, "config_mutation": false},
+      "source_repositories": []
+    },
+    {
+      "id": "evidence-challenge",
+      "version": "1.0.0",
+      "path": ".pi/skills/evidence-challenge/SKILL.md",
+      "status": "approved_project",
+      "license": "Project-Owned",
+      "roles": ["signal_analyst", "research_desk", "case_analyst"],
+      "permissions": {"network": false, "shell": false, "filesystem_write": false, "trading": false, "approval": false, "publication": false, "assignment": false, "config_mutation": false},
+      "source_repositories": []
+    },
+    {
+      "id": "risk-guard",
+      "version": "1.0.0",
+      "path": ".pi/skills/risk-guard/SKILL.md",
+      "status": "approved_project",
+      "license": "Project-Owned",
+      "roles": ["signal_analyst", "research_desk", "case_analyst", "public_handoff", "review_optimizer"],
+      "permissions": {"network": false, "shell": false, "filesystem_write": false, "trading": false, "approval": false, "publication": false, "assignment": false, "config_mutation": false},
+      "source_repositories": []
+    },
+    {
+      "id": "research-synthesis",
+      "version": "1.0.0",
+      "path": ".pi/skills/research-synthesis/SKILL.md",
+      "status": "approved_project",
+      "license": "Project-Owned",
+      "roles": ["research_desk", "case_analyst"],
+      "permissions": {"network": false, "shell": false, "filesystem_write": false, "trading": false, "approval": false, "publication": false, "assignment": false, "config_mutation": false},
+      "source_repositories": []
+    },
+    {
+      "id": "review-optimization",
+      "version": "1.0.0",
+      "path": ".pi/skills/review-optimization/SKILL.md",
+      "status": "approved_project",
+      "license": "Project-Owned",
+      "roles": ["review_optimizer"],
+      "permissions": {"network": false, "shell": false, "filesystem_write": false, "trading": false, "approval": false, "publication": false, "assignment": false, "config_mutation": false},
+      "source_repositories": []
+    },
+    {
+      "id": "source-provenance-audit",
+      "version": "1.0.0",
+      "path": ".pi/skills/source-provenance-audit/SKILL.md",
+      "status": "approved_adapted",
+      "license": "Apache-2.0",
+      "roles": ["signal_analyst", "research_desk", "case_analyst", "public_handoff"],
+      "permissions": {"network": false, "shell": false, "filesystem_write": false, "trading": false, "approval": false, "publication": false, "assignment": false, "config_mutation": false},
+      "source_repositories": [
+        {"url": "https://github.com/nexaforgelab/a-share-investment-skill-pack", "commit": "fe9ec77192e17fd638e7cd61a6254289f9193b3b", "license": "Apache-2.0", "source_paths": ["skills/01_data/data_quality_audit/SKILL.md", "skills/01_data/data_conflict_resolution/SKILL.md"], "incorporation": "methodology_adaptation"},
+        {"url": "https://github.com/rollingSirius/equity-research-skill", "commit": "3d94e64ff53b325d866ea4bff69ad81a5adca8f5", "license": "MIT", "source_paths": ["SKILL.md"], "incorporation": "methodology_adaptation"}
+      ]
+    },
+    {
+      "id": "a-share-disclosure-analysis",
+      "version": "1.0.0",
+      "path": ".pi/skills/a-share-disclosure-analysis/SKILL.md",
+      "status": "approved_adapted",
+      "license": "Apache-2.0",
+      "roles": ["signal_analyst", "research_desk", "case_analyst"],
+      "permissions": {"network": false, "shell": false, "filesystem_write": false, "trading": false, "approval": false, "publication": false, "assignment": false, "config_mutation": false},
+      "source_repositories": [
+        {"url": "https://github.com/nexaforgelab/a-share-investment-skill-pack", "commit": "fe9ec77192e17fd638e7cd61a6254289f9193b3b", "license": "Apache-2.0", "source_paths": ["skills/02_disclosure_financials/disclosure_parser/SKILL.md", "skills/02_disclosure_financials/annual_report_parser/SKILL.md", "skills/02_disclosure_financials/inquiry_letter_parser/SKILL.md"], "incorporation": "methodology_adaptation"}
+      ]
+    },
+    {
+      "id": "financial-quality-review",
+      "version": "1.0.0",
+      "path": ".pi/skills/financial-quality-review/SKILL.md",
+      "status": "approved_adapted",
+      "license": "Apache-2.0",
+      "roles": ["research_desk", "case_analyst"],
+      "permissions": {"network": false, "shell": false, "filesystem_write": false, "trading": false, "approval": false, "publication": false, "assignment": false, "config_mutation": false},
+      "source_repositories": [
+        {"url": "https://github.com/nexaforgelab/a-share-investment-skill-pack", "commit": "fe9ec77192e17fd638e7cd61a6254289f9193b3b", "license": "Apache-2.0", "source_paths": ["skills/02_disclosure_financials/financial_quality_analysis/SKILL.md"], "incorporation": "methodology_adaptation"},
+        {"url": "https://github.com/rollingSirius/equity-research-skill", "commit": "3d94e64ff53b325d866ea4bff69ad81a5adca8f5", "license": "MIT", "source_paths": ["SKILL.md"], "incorporation": "methodology_adaptation"}
+      ]
+    },
+    {
+      "id": "thesis-catalyst-ledger",
+      "version": "1.0.0",
+      "path": ".pi/skills/thesis-catalyst-ledger/SKILL.md",
+      "status": "approved_adapted",
+      "license": "Apache-2.0",
+      "roles": ["research_desk", "case_analyst"],
+      "permissions": {"network": false, "shell": false, "filesystem_write": false, "trading": false, "approval": false, "publication": false, "assignment": false, "config_mutation": false},
+      "source_repositories": [
+        {"url": "https://github.com/anthropics/financial-services", "commit": "33a3d8a9d6e5c3d4861731933a8857cc5e03315d", "license": "Apache-2.0", "source_paths": ["plugins/vertical-plugins/equity-research/skills/thesis-tracker/SKILL.md", "plugins/vertical-plugins/equity-research/skills/catalyst-calendar/SKILL.md"], "incorporation": "methodology_adaptation"}
+      ]
+    },
+    {
+      "id": "sector-competitive-map",
+      "version": "1.0.0",
+      "path": ".pi/skills/sector-competitive-map/SKILL.md",
+      "status": "approved_adapted",
+      "license": "Apache-2.0",
+      "roles": ["research_desk", "case_analyst"],
+      "permissions": {"network": false, "shell": false, "filesystem_write": false, "trading": false, "approval": false, "publication": false, "assignment": false, "config_mutation": false},
+      "source_repositories": [
+        {"url": "https://github.com/anthropics/financial-services", "commit": "33a3d8a9d6e5c3d4861731933a8857cc5e03315d", "license": "Apache-2.0", "source_paths": ["plugins/vertical-plugins/equity-research/skills/sector-overview/SKILL.md", "plugins/vertical-plugins/financial-analysis/skills/competitive-analysis/SKILL.md"], "incorporation": "methodology_adaptation"}
+      ]
+    },
+    {
+      "id": "incident-learning-review",
+      "version": "1.0.0",
+      "path": ".pi/skills/incident-learning-review/SKILL.md",
+      "status": "approved_adapted",
+      "license": "Apache-2.0",
+      "roles": ["review_optimizer"],
+      "permissions": {"network": false, "shell": false, "filesystem_write": false, "trading": false, "approval": false, "publication": false, "assignment": false, "config_mutation": false},
+      "source_repositories": [
+        {"url": "https://github.com/pppop00/Equity-Research-Company", "commit": "bc8663b508569e9716c113626c10523d3230cd1d", "license": "Apache-2.0", "source_paths": ["references/anamnesis_pattern.md", "INCIDENTS.md", "agents/attackers/red_team_numeric.md", "agents/attackers/red_team_narrative.md"], "incorporation": "methodology_adaptation"},
+        {"url": "https://github.com/nexaforgelab/a-share-investment-skill-pack", "commit": "fe9ec77192e17fd638e7cd61a6254289f9193b3b", "license": "Apache-2.0", "source_paths": ["skills/12_review_learning/mistake_case_library/SKILL.md", "skills/11_decision_output/counter_argument/SKILL.md"], "incorporation": "methodology_adaptation"}
+      ]
+    }
+  ],
+  "rejected_candidates": [
+    {"repository": "https://github.com/OctagonAI/skills", "commit": "51e938c4d086f658de8bdcf734e864d34637167e", "reason": "Requires external MCP/API capabilities and contains trading automation; not admitted to the production prompt supply chain."},
+    {"repository": "https://github.com/counterposition/pi", "reason": "Agent runtime/orchestration code with broader execution surface; the project already pins an isolated Pi runtime."},
+    {"repository": "https://github.com/mariozechner/pi-mono", "reason": "Upstream runtime reference only; not a business research skill pack and not installed through this registry."}
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "defaultProvider": "deepseek",
+  "defaultModel": "deepseek-v4-pro",
+  "defaultThinkingLevel": "high",
+  "defaultProjectTrust": "never",
+  "defaultTools": [],
+  "quietStartup": true,
+  "enableInstallTelemetry": false,
+  "enableAnalytics": false,
+  "hideThinkingBlock": true,
+  "compaction": {
+    "enabled": false
+  },
+  "retry": {
+    "enabled": false,
+    "maxRetries": 0,
+    "provider": {
+      "timeoutMs": 60000,
+      "maxRetries": 0,
+      "maxRetryDelayMs": 5000
+    }
+  },
+  "packages": [],
+  "extensions": [],
+  "skills": [],
+  "prompts": [],
+  "themes": []
+}

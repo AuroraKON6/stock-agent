@@ -1,0 +1,502 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "A股投研系统 · 架构总览",
+    "output": "ARCHIFY_SYSTEM_MAP.html",
+    "quality_profile": "showcase",
+    "locale": "zh-CN",
+    "views": [
+      {
+        "id": "main-path",
+        "label": "主研究数据流",
+        "focus": [
+          "ext",
+          "sources",
+          "rules",
+          "model",
+          "core",
+          "delivery"
+        ],
+        "note": "从合法公开信息到人工可批准研究材料的正向主链。"
+      },
+      {
+        "id": "gates",
+        "label": "fail-closed 门禁域",
+        "focus": [
+          "market-gate",
+          "gov",
+          "vault",
+          "ops",
+          "biz",
+          "release"
+        ],
+        "note": "外发、原件、行情、供应商、人员、发布六道治理闸。"
+      },
+      {
+        "id": "release-chain",
+        "label": "发布证据链 v31/32",
+        "focus": [
+          "release",
+          "biz",
+          "delivery"
+        ],
+        "note": "G0 控制物 → release-audit manifest_id → G0.5 价值门 → Pilot Go/No-Go。"
+      }
+    ],
+    "viewBox": [
+      1300,
+      760
+    ]
+  },
+  "components": [
+    {
+      "id": "ext",
+      "type": "external",
+      "label": "外部依赖",
+      "sublabel": "DeepSeek·官方·供应商",
+      "pos": [
+        44,
+        368
+      ],
+      "size": [
+        170,
+        92
+      ],
+      "tag": "可达≠授权"
+    },
+    {
+      "id": "sources",
+      "type": "backend",
+      "label": "采集层 10-sources",
+      "sublabel": "9适配器·RawSignal",
+      "pos": [
+        238,
+        368
+      ],
+      "size": [
+        170,
+        92
+      ]
+    },
+    {
+      "id": "rules",
+      "type": "backend",
+      "label": "规则层 20-rule-engine",
+      "sublabel": "评分·跨源去重·剧本",
+      "pos": [
+        432,
+        368
+      ],
+      "size": [
+        170,
+        92
+      ]
+    },
+    {
+      "id": "model",
+      "type": "backend",
+      "label": "受控推理 30-model-plane",
+      "sublabel": "signal_llm·Pi无工具",
+      "pos": [
+        626,
+        368
+      ],
+      "size": [
+        170,
+        92
+      ]
+    },
+    {
+      "id": "core",
+      "type": "backend",
+      "label": "研究核心 40-research-core",
+      "sublabel": "案件·状态机·底稿",
+      "pos": [
+        820,
+        368
+      ],
+      "size": [
+        170,
+        92
+      ],
+      "tag": "人工门"
+    },
+    {
+      "id": "delivery",
+      "type": "frontend",
+      "label": "交付层 70-delivery",
+      "sublabel": "日报·看板·工作台",
+      "pos": [
+        1014,
+        368
+      ],
+      "size": [
+        170,
+        92
+      ]
+    },
+    {
+      "id": "market-gate",
+      "type": "security",
+      "label": "行情门禁",
+      "sublabel": "新鲜度·共识·核准",
+      "pos": [
+        432,
+        120
+      ],
+      "size": [
+        170,
+        84
+      ],
+      "tag": "fail-closed"
+    },
+    {
+      "id": "gov",
+      "type": "security",
+      "label": "LLM 外发治理",
+      "sublabel": "仅public·例外须真人",
+      "pos": [
+        626,
+        108
+      ],
+      "size": [
+        170,
+        84
+      ],
+      "tag": "fail-closed"
+    },
+    {
+      "id": "vault",
+      "type": "security",
+      "label": "官方原件证据库",
+      "sublabel": "内容寻址·先留存后外发",
+      "pos": [
+        820,
+        104
+      ],
+      "size": [
+        170,
+        92
+      ],
+      "tag": "fail-closed"
+    },
+    {
+      "id": "ops",
+      "type": "security",
+      "label": "人员名册与授权",
+      "sublabel": "真人角色·限制名单",
+      "pos": [
+        820,
+        608
+      ],
+      "size": [
+        170,
+        92
+      ],
+      "tag": "0真人→BLOCKED"
+    },
+    {
+      "id": "biz",
+      "type": "security",
+      "label": "业务门禁 60-business",
+      "sublabel": "Onboarding·Pilot NO_GO",
+      "pos": [
+        1014,
+        608
+      ],
+      "size": [
+        170,
+        92
+      ],
+      "tag": "人工门"
+    },
+    {
+      "id": "release",
+      "type": "security",
+      "label": "发布证据链 85",
+      "sublabel": "控制物→审计→价值门",
+      "pos": [
+        1014,
+        104
+      ],
+      "size": [
+        170,
+        92
+      ],
+      "tag": "须 git HEAD"
+    },
+    {
+      "id": "foundation",
+      "type": "database",
+      "label": "地基 00-foundation",
+      "sublabel": "哈希链·SQLite",
+      "pos": [
+        432,
+        608
+      ],
+      "size": [
+        170,
+        92
+      ],
+      "tag": "链坏拒写"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "EXTERNAL",
+      "wraps": [
+        "ext"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "fail-closed 门禁域",
+      "wraps": [
+        "market-gate",
+        "gov",
+        "vault",
+        "ops",
+        "biz",
+        "release"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "c1",
+      "from": "ext",
+      "to": "sources",
+      "label": "合法输入",
+      "variant": "emphasis",
+      "labelDy": -58
+    },
+    {
+      "id": "c2",
+      "from": "sources",
+      "to": "rules",
+      "label": "RawSignal",
+      "variant": "emphasis",
+      "labelDy": -58
+    },
+    {
+      "id": "c3",
+      "from": "rules",
+      "to": "model",
+      "variant": "emphasis"
+    },
+    {
+      "id": "c4",
+      "from": "model",
+      "to": "core",
+      "label": "研判草稿（不自审批）",
+      "variant": "emphasis",
+      "labelAt": [
+        820,
+        258
+      ]
+    },
+    {
+      "id": "c5",
+      "from": "core",
+      "to": "delivery",
+      "label": "可批准研究材料",
+      "variant": "emphasis",
+      "labelDy": -58
+    },
+    {
+      "id": "c6",
+      "from": "market-gate",
+      "to": "model",
+      "label": "llm_allowed 门",
+      "variant": "security",
+      "labelAt": [
+        580,
+        300
+      ]
+    },
+    {
+      "id": "c7",
+      "from": "gov",
+      "to": "model",
+      "label": "预检/后验",
+      "variant": "security",
+      "labelAt": [
+        724,
+        290
+      ]
+    },
+    {
+      "id": "c8",
+      "from": "vault",
+      "to": "gov",
+      "label": "RETAINED_VERIFIED",
+      "variant": "security",
+      "labelAt": [
+        808,
+        84
+      ],
+      "fromSide": "left",
+      "toSide": "right"
+    },
+    {
+      "id": "c10",
+      "from": "ops",
+      "to": "core",
+      "label": "受保护动作授权",
+      "variant": "security",
+      "labelAt": [
+        968,
+        534
+      ]
+    },
+    {
+      "id": "c11",
+      "from": "foundation",
+      "to": "core",
+      "label": "哈希链 · 持久化",
+      "fromSide": "top",
+      "toSide": "left",
+      "via": [
+        [
+          517,
+          546
+        ],
+        [
+          808,
+          546
+        ],
+        [
+          808,
+          414
+        ]
+      ],
+      "labelAt": [
+        660,
+        532
+      ]
+    },
+    {
+      "id": "c12",
+      "from": "delivery",
+      "to": "core",
+      "label": "人工复核动作（回环）",
+      "variant": "dashed",
+      "labelDy": -58
+    },
+    {
+      "id": "c13",
+      "from": "delivery",
+      "to": "biz",
+      "label": "复核产能门",
+      "variant": "security",
+      "labelAt": [
+        1164,
+        534
+      ]
+    },
+    {
+      "id": "c14",
+      "from": "release",
+      "to": "biz",
+      "label": "manifest_id",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "right",
+      "via": [
+        [
+          1220,
+          150
+        ],
+        [
+          1220,
+          654
+        ]
+      ],
+      "labelAt": [
+        1244,
+        352
+      ]
+    },
+    {
+      "id": "c15",
+      "from": "ext",
+      "to": "vault",
+      "label": "受控 fetch（--live）",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          129,
+          44
+        ],
+        [
+          905,
+          44
+        ]
+      ],
+      "labelAt": [
+        580,
+        30
+      ]
+    },
+    {
+      "id": "c16",
+      "from": "model",
+      "to": "ext",
+      "label": "受治理外发",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "via": [
+        [
+          614,
+          414
+        ],
+        [
+          614,
+          514
+        ],
+        [
+          129,
+          514
+        ]
+      ],
+      "labelAt": [
+        380,
+        500
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "主数据流",
+      "items": [
+        "采集统一 RawSignal，错误降级可见不进主链",
+        "signal_id 供应商无关去重，LLM 仅处理新增信号",
+        "案件 → 11 阶段运行时 → 哈希链工作底稿 → 人工可批准材料"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "fail-closed 门禁",
+      "items": [
+        "外部 LLM 仅放行 public 且引用可验，例外须合规/信安真人",
+        "P0/P1 无官方原件不得外发（先留存后外发）",
+        "受保护审批仅限名册真人，自动化前缀一律拒绝"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "发布证据链与现状",
+      "items": [
+        "G0 五控制物 → release-audit manifest_id（现缺 git HEAD）",
+        "G0.5 价值验证 12 门禁冻结绑定 manifest_id（≥20% 效率）",
+        "Pilot 19 门禁 NO_GO：0 真人、0/2 供应商、0/9 原件、154 积压"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "defaultProvider": "deepseek",
+  "defaultModel": "deepseek-v4-pro",
+  "defaultThinkingLevel": "high",
+  "defaultTools": [],
+  "enableInstallTelemetry": false,
+  "packages": [],
+  "extensions": [],
+  "skills": [
+    "./skills/signal-analysis",
+    "./skills/evidence-challenge",
+    "./skills/risk-guard",
+    "./skills/research-synthesis",
+    "./skills/review-optimization",
+    "./skills/source-provenance-audit",
+    "./skills/a-share-disclosure-analysis",
+    "./skills/financial-quality-review",
+    "./skills/thesis-catalyst-ledger",
+    "./skills/sector-competitive-map",
+    "./skills/incident-learning-review"
+  ]
+}

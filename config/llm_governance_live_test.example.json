@@ -1,0 +1,186 @@
+{
+  "timezone": "Asia/Shanghai",
+  "project_name": "A股投研系统-LLM治理UAT",
+  "output_language": "zh-CN",
+  "run_profile": {
+    "name": "llm_governance_uat",
+    "isolated": true
+  },
+  "storage": {
+    "sqlite_path": "data/llm_governance_live_test_v23_3.sqlite3"
+  },
+  "topics": [
+    {
+      "name": "LLM治理UAT",
+      "sector": "internal_test",
+      "symbols": [],
+      "keywords": ["LLM治理联调", "治理控制"],
+      "risk_keywords": [],
+      "update_frequency": "manual"
+    }
+  ],
+  "sources": {
+    "local_jsonl": [
+      {
+        "name": "LLM治理公开测试样本",
+        "path": "data/inbox/examples/llm_governance_public_test.jsonl",
+        "enabled": true
+      }
+    ],
+    "rss": [],
+    "eastmoney": {"enabled": false, "symbols": []},
+    "eastmoney_filing": {"enabled": false, "symbols": []},
+    "akshare": {"enabled": false}
+  },
+  "priority_rules": {
+    "p0_keywords": [],
+    "p1_keywords": ["LLM治理联调"],
+    "positive_keywords": [],
+    "negative_keywords": [],
+    "review_keywords": ["测试"],
+    "min_priority_for_alert": "P0"
+  },
+  "review": {
+    "effect_window_days": 5,
+    "fields": ["signal_id", "was_effective", "notes"]
+  },
+  "report": {
+    "daily_top_n": 10,
+    "include_low_priority": false,
+    "daily_dir": "reports/uat/llm_governance/daily",
+    "json_dir": "reports/uat/llm_governance/json",
+    "alert_dir": "reports/uat/llm_governance/alerts"
+  },
+  "run_ops": {
+    "enabled": true,
+    "max_run_seconds": 240,
+    "warn_run_seconds": 180,
+    "llm_max_calls": 4,
+    "llm_max_seconds": 180,
+    "retry_backoff_seconds": 1,
+    "progress_enabled": false,
+    "stage_warn_seconds": {"llm_signals": 90, "multi_role_llm": 120, "llm_governance": 5}
+  },
+  "model_operations": {
+    "enabled": true,
+    "report_dir": "reports/uat/model_operations",
+    "usage_dir": "data/model_operations/uat_usage",
+    "rolling_window_runs": 5,
+    "service_levels": {
+      "agent_target_seconds": 180,
+      "scheduled_delivery_target_seconds": 300,
+      "signal_llm_warn_seconds": 60,
+      "role_llm_warn_seconds": 90
+    },
+    "deadline_policy": {
+      "post_llm_reserve_seconds": 30,
+      "main_min_start_remaining_seconds": 60,
+      "main_reduce_below_seconds": 90,
+      "reduced_main_max_signals": 1,
+      "role_min_start_remaining_seconds": 60,
+      "role_reduce_below_seconds": 105,
+      "reduced_role_max_signals": 1,
+      "retry_min_remaining_seconds": 60
+    },
+    "quality_thresholds": {
+      "main_success_rate_min": 0.95,
+      "role_success_rate_min": 0.9,
+      "usable_grounding_rate_min": 0.95,
+      "fully_grounded_rate_min": 0.75,
+      "usage_metadata_rate_min": 1.0
+    },
+    "pricing": {
+      "enabled": true,
+      "currency": "USD",
+      "effective_date": "2026-08-12",
+      "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "models": {
+        "deepseek-v4-pro": {
+          "input_cache_hit_per_1m": 0.003625,
+          "input_cache_miss_per_1m": 0.435,
+          "output_per_1m": 0.87
+        }
+      }
+    }
+  },
+  "llm_agent": {
+    "enabled": true,
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-v4-pro",
+    "timeout": 60,
+    "temperature": 0.1,
+    "json_mode": true,
+    "thinking": "enabled",
+    "reasoning_effort": "high",
+    "max_tokens": 4096,
+    "user_id": "stock-agent-uat-signal",
+    "min_priority": "P2",
+    "max_signals_per_run": 3,
+    "max_attempts": 2,
+    "auto_execute_actions": false,
+    "allowed_actions": ["export_review", "write_action_log"],
+    "providers": [
+      {
+        "name": "deepseek_primary",
+        "base_url": "https://api.deepseek.com/v1",
+        "model": "deepseek-v4-pro",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "timeout": 60,
+        "max_attempts": 2
+      }
+    ]
+  },
+  "multi_role_agent": {
+    "enabled": true,
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-v4-pro",
+    "timeout": 60,
+    "temperature": 0.1,
+    "json_mode": true,
+    "thinking": "enabled",
+    "reasoning_effort": "high",
+    "max_tokens": 8192,
+    "user_id": "stock-agent-uat-role",
+    "min_priority": "P2",
+    "max_signals_per_run": 3,
+    "max_attempts": 1,
+    "roles": []
+  },
+  "llm_governance": {
+    "enabled": true,
+    "enforce": true,
+    "external_provider": true,
+    "default_classification": "internal",
+    "allowed_external_classifications": ["public"],
+    "public_source_types": ["price", "filing", "financial", "announcement", "news"],
+    "trusted_public_sources": ["csrc", "llm_governance_uat"],
+    "trusted_public_domains": ["csrc.gov.cn"],
+    "block_secrets": true,
+    "block_personal_data": true,
+    "block_nonpublic_information": true,
+    "block_prompt_injection": true,
+    "require_evidence_refs": true,
+    "max_text_chars": 3000,
+    "max_list_items": 25,
+    "audit_enabled": true,
+    "audit_path": "data/llm_governance/uat_audit",
+    "exception_path": "data/llm_governance/uat_exceptions",
+    "report_path": "reports/llm_governance_uat",
+    "retention_years": 5
+  },
+  "review_queue": {
+    "enabled": true,
+    "enforce_roster": false,
+    "assignment_mode": "suggest_only",
+    "review_dir": "data/uat/llm_governance/review",
+    "index_path": "data/uat/llm_governance/review/queue_index.json",
+    "actions_dir": "data/uat/llm_governance/review/queue_actions",
+    "report_dir": "reports/uat/llm_governance/review_queue"
+  },
+  "research_git": {"enabled": false},
+  "research_cases": {"enabled": false, "llm_enabled": false},
+  "research_framework": {"enabled": false},
+  "research_team": {"enabled": false, "write_artifacts": false},
+  "research_runtime": {"enabled": false, "auto_sync": false},
+  "research_operations": {"enabled": false, "enforce_roster": false}
+}

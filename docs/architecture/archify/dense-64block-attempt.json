@@ -1,0 +1,1178 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "A股投研系统 · 架构识别总图",
+    "output": "ARCHIFY_SYSTEM_MAP.html",
+    "quality_profile": "standard",
+    "locale": "zh-CN",
+    "viewBox": [
+      1800,
+      1340
+    ],
+    "views": [
+      {
+        "id": "main-path",
+        "label": "主研究数据流",
+        "focus": [
+          "sources-package",
+          "analysis",
+          "storage",
+          "llm-agent",
+          "research-cases",
+          "research-runtime",
+          "research-workpapers",
+          "reports"
+        ],
+        "note": "从采集到人工可批准研究材料的正向主链。"
+      },
+      {
+        "id": "gates",
+        "label": "治理门禁",
+        "focus": [
+          "llm-governance",
+          "evidence-vault",
+          "market-data-governance",
+          "provider-registry",
+          "control-evidence",
+          "research-operations"
+        ],
+        "note": "fail-closed 门禁域：外发、原件、行情、供应商、人员授权。"
+      },
+      {
+        "id": "release-chain",
+        "label": "发布证据链 v31/32",
+        "focus": [
+          "release-controls",
+          "python-environment",
+          "backup-restore",
+          "release-audit",
+          "value-validation",
+          "production-pilot"
+        ],
+        "note": "G0 控制物 → 只读审计 manifest_id → G0.5 价值门 → 生产试点。"
+      }
+    ]
+  },
+  "layout": {
+    "mode": "grid",
+    "cols": 8,
+    "gapX": 64,
+    "gapY": 56,
+    "cellW": 160,
+    "cellH": 52
+  },
+  "components": [
+    {
+      "id": "ext-deepseek",
+      "type": "external",
+      "label": "DeepSeek API",
+      "sublabel": "deepseek-v4-pro",
+      "row": 1,
+      "col": 0,
+      "tag": "仅经治理外发"
+    },
+    {
+      "id": "ext-official",
+      "type": "external",
+      "label": "官方域名白名单",
+      "sublabel": "cninfo/sse/szse/bse/csrc/sac",
+      "row": 2,
+      "col": 0,
+      "tag": "受控 fetch"
+    },
+    {
+      "id": "ext-vendor",
+      "type": "external",
+      "label": "行情供应商",
+      "sublabel": "未获授权 0/2",
+      "row": 3,
+      "col": 0,
+      "tag": "可达≠授权"
+    },
+    {
+      "id": "local-jsonl",
+      "type": "backend",
+      "label": "手工情报池",
+      "sublabel": "local_jsonl.py·49",
+      "row": 1,
+      "col": 1
+    },
+    {
+      "id": "filing-jsonl",
+      "type": "backend",
+      "label": "公告JSONL回放",
+      "sublabel": "filing_jsonl.py·193",
+      "row": 2,
+      "col": 1
+    },
+    {
+      "id": "rss",
+      "type": "backend",
+      "label": "RSS/Atom",
+      "sublabel": "rss.py·128",
+      "row": 3,
+      "col": 1
+    },
+    {
+      "id": "eastmoney-filing",
+      "type": "backend",
+      "label": "东财公告采集",
+      "sublabel": "…filing_adapter.py·326",
+      "row": 4,
+      "col": 1
+    },
+    {
+      "id": "eastmoney-quote",
+      "type": "backend",
+      "label": "东财行情",
+      "sublabel": "eastmoney_adapter.py·159",
+      "row": 5,
+      "col": 1
+    },
+    {
+      "id": "akshare",
+      "type": "backend",
+      "label": "AkShare(可选)",
+      "sublabel": "akshare_adapter.py·95",
+      "row": 6,
+      "col": 1
+    },
+    {
+      "id": "pysnowball",
+      "type": "backend",
+      "label": "雪球(可选)",
+      "sublabel": "pysnowball_adapter.py·245",
+      "row": 7,
+      "col": 1
+    },
+    {
+      "id": "alltick",
+      "type": "backend",
+      "label": "AllTick(可选)",
+      "sublabel": "alltick_adapter.py·198",
+      "row": 8,
+      "col": 1
+    },
+    {
+      "id": "free-quote",
+      "type": "backend",
+      "label": "AllTick网关",
+      "sublabel": "free_quote_adapter.py·22",
+      "row": 9,
+      "col": 1
+    },
+    {
+      "id": "sources-package",
+      "type": "backend",
+      "label": "适配器注册表",
+      "sublabel": "sources/__init__.py·21",
+      "row": 10,
+      "col": 1
+    },
+    {
+      "id": "analysis",
+      "type": "backend",
+      "label": "规则评分引擎",
+      "sublabel": "analysis.py·371",
+      "row": 1,
+      "col": 2,
+      "tag": "signal_id 去重"
+    },
+    {
+      "id": "research-framework",
+      "type": "backend",
+      "label": "研究剧本路由",
+      "sublabel": "research_framework.py·188",
+      "row": 2,
+      "col": 2
+    },
+    {
+      "id": "research-team",
+      "type": "backend",
+      "label": "虚拟投研团队",
+      "sublabel": "research_team.py·311",
+      "row": 3,
+      "col": 2
+    },
+    {
+      "id": "team-ops",
+      "type": "backend",
+      "label": "团队运营工件",
+      "sublabel": "team_ops.py·336",
+      "row": 4,
+      "col": 2
+    },
+    {
+      "id": "evidence-chain",
+      "type": "backend",
+      "label": "证据链构建",
+      "sublabel": "evidence_chain.py·183",
+      "row": 5,
+      "col": 2
+    },
+    {
+      "id": "source-health",
+      "type": "backend",
+      "label": "数据源健康",
+      "sublabel": "source_health.py·482",
+      "row": 6,
+      "col": 2
+    },
+    {
+      "id": "source-remediation",
+      "type": "backend",
+      "label": "补救队列",
+      "sublabel": "source_remediation.py·739",
+      "row": 7,
+      "col": 2,
+      "tag": "人工门"
+    },
+    {
+      "id": "market-resilience",
+      "type": "backend",
+      "label": "行情弹性采集",
+      "sublabel": "market_resilience.py·491",
+      "row": 1,
+      "col": 3
+    },
+    {
+      "id": "market-data-governance",
+      "type": "security",
+      "label": "行情数据门禁",
+      "sublabel": "market_data_governance.py·513",
+      "row": 2,
+      "col": 3,
+      "tag": "fail-closed"
+    },
+    {
+      "id": "provider-registry",
+      "type": "security",
+      "label": "供应商生命周期",
+      "sublabel": "provider_registry.py·630",
+      "row": 3,
+      "col": 3,
+      "tag": "人工门"
+    },
+    {
+      "id": "control-evidence",
+      "type": "security",
+      "label": "控制证据登记",
+      "sublabel": "control_evidence.py·507",
+      "row": 4,
+      "col": 3,
+      "tag": "人工门"
+    },
+    {
+      "id": "evidence-vault",
+      "type": "security",
+      "label": "官方原件证据库",
+      "sublabel": "evidence_vault.py·1431",
+      "row": 5,
+      "col": 3,
+      "tag": "fail-closed·人工门"
+    },
+    {
+      "id": "evidence-vault-uat",
+      "type": "security",
+      "label": "证据库UAT",
+      "sublabel": "evidence_vault_uat.py·200",
+      "row": 6,
+      "col": 3,
+      "tag": "--live"
+    },
+    {
+      "id": "llm-governance",
+      "type": "security",
+      "label": "LLM外发治理",
+      "sublabel": "llm_governance.py·1077",
+      "row": 1,
+      "col": 4,
+      "tag": "仅public"
+    },
+    {
+      "id": "llm-agent",
+      "type": "backend",
+      "label": "信号级LLM研判",
+      "sublabel": "llm_agent.py·791",
+      "row": 2,
+      "col": 4,
+      "tag": "signal_llm"
+    },
+    {
+      "id": "role-analyst",
+      "type": "backend",
+      "label": "多角色研究台",
+      "sublabel": "role_analyst.py·765",
+      "row": 3,
+      "col": 4,
+      "tag": "同模型4角色"
+    },
+    {
+      "id": "model-operations",
+      "type": "backend",
+      "label": "SLO/截止/用量",
+      "sublabel": "model_operations.py·570",
+      "row": 4,
+      "col": 4
+    },
+    {
+      "id": "pi-runtime",
+      "type": "backend",
+      "label": "Pi隔离运行时",
+      "sublabel": "pi_runtime.py·761",
+      "row": 5,
+      "col": 4,
+      "tag": "钉版0.84.2"
+    },
+    {
+      "id": "pi-skills",
+      "type": "security",
+      "label": "方法供应链",
+      "sublabel": "pi_skills.py·448",
+      "row": 6,
+      "col": 4,
+      "tag": "内容锁"
+    },
+    {
+      "id": "openclaw-handoff",
+      "type": "backend",
+      "label": "handoff构造器",
+      "sublabel": "openclaw_handoff.py·228",
+      "row": 7,
+      "col": 4
+    },
+    {
+      "id": "agent-handoff",
+      "type": "backend",
+      "label": "Pi公共摘要",
+      "sublabel": "agent_handoff.py·268",
+      "row": 8,
+      "col": 4,
+      "tag": "0信号=0调用"
+    },
+    {
+      "id": "research-cases",
+      "type": "backend",
+      "label": "研究案件聚合",
+      "sublabel": "research_cases.py·732",
+      "row": 1,
+      "col": 5
+    },
+    {
+      "id": "research-runtime",
+      "type": "backend",
+      "label": "案件运行时状态机",
+      "sublabel": "research_runtime.py·1831",
+      "row": 2,
+      "col": 5,
+      "tag": "11阶段·人工门"
+    },
+    {
+      "id": "research-workpapers",
+      "type": "backend",
+      "label": "工作底稿(哈希链)",
+      "sublabel": "research_workpapers.py·1584",
+      "row": 3,
+      "col": 5,
+      "tag": "fail-closed"
+    },
+    {
+      "id": "research-operations",
+      "type": "security",
+      "label": "名册/授权/SLA",
+      "sublabel": "research_operations.py·937",
+      "row": 4,
+      "col": 5,
+      "tag": "0真人→BLOCKED"
+    },
+    {
+      "id": "research-git",
+      "type": "backend",
+      "label": "草稿通道",
+      "sublabel": "research_git.py·619",
+      "row": 5,
+      "col": 5,
+      "tag": "人工门"
+    },
+    {
+      "id": "business-onboarding",
+      "type": "security",
+      "label": "业务接入八阶段",
+      "sublabel": "business_onboarding.py·747",
+      "row": 1,
+      "col": 6,
+      "tag": "0/8"
+    },
+    {
+      "id": "production-pilot",
+      "type": "security",
+      "label": "生产试点",
+      "sublabel": "production_pilot.py·1563",
+      "row": 2,
+      "col": 6,
+      "tag": "NO_GO·19门禁"
+    },
+    {
+      "id": "value-validation",
+      "type": "security",
+      "label": "G0.5价值验证",
+      "sublabel": "value_validation.py·1672",
+      "row": 3,
+      "col": 6,
+      "tag": "12门禁"
+    },
+    {
+      "id": "release-controls",
+      "type": "security",
+      "label": "发布控制物",
+      "sublabel": "release_controls.py·852",
+      "row": 4,
+      "col": 6,
+      "tag": "scan不落值"
+    },
+    {
+      "id": "python-environment",
+      "type": "security",
+      "label": "环境审计",
+      "sublabel": "python_environment.py·339",
+      "row": 5,
+      "col": 6,
+      "tag": "须--run-tests"
+    },
+    {
+      "id": "release-audit",
+      "type": "security",
+      "label": "只读发布审计",
+      "sublabel": "release_audit.py·792",
+      "row": 6,
+      "col": 6,
+      "tag": "须git HEAD"
+    },
+    {
+      "id": "backup-restore",
+      "type": "security",
+      "label": "备份/恢复演练",
+      "sublabel": "backup_restore.py·1368",
+      "row": 7,
+      "col": 6,
+      "tag": "生产DR=人工门"
+    },
+    {
+      "id": "reports",
+      "type": "frontend",
+      "label": "日报/JSON/预警",
+      "sublabel": "reports.py·1016",
+      "row": 1,
+      "col": 7
+    },
+    {
+      "id": "alerts",
+      "type": "frontend",
+      "label": "预警通知",
+      "sublabel": "alerts.py·485",
+      "row": 2,
+      "col": 7
+    },
+    {
+      "id": "dashboard",
+      "type": "frontend",
+      "label": "静态看板",
+      "sublabel": "dashboard.py·1907",
+      "row": 3,
+      "col": 7
+    },
+    {
+      "id": "review-workbench",
+      "type": "frontend",
+      "label": "回环复核工作台",
+      "sublabel": "review_workbench.py·1901",
+      "row": 4,
+      "col": 7,
+      "tag": "127.0.0.1:8767"
+    },
+    {
+      "id": "workspace-inbox",
+      "type": "frontend",
+      "label": "工作区收件箱",
+      "sublabel": "workspace_inbox.py·306",
+      "row": 5,
+      "col": 7
+    },
+    {
+      "id": "review",
+      "type": "backend",
+      "label": "复盘汇总",
+      "sublabel": "review.py·513",
+      "row": 6,
+      "col": 7
+    },
+    {
+      "id": "review-queue",
+      "type": "backend",
+      "label": "人工复核队列",
+      "sublabel": "review_queue.py·572",
+      "row": 7,
+      "col": 7,
+      "tag": "suggest_only"
+    },
+    {
+      "id": "review-priority",
+      "type": "backend",
+      "label": "优先级队列",
+      "sublabel": "review_priority.py·220",
+      "row": 8,
+      "col": 7
+    },
+    {
+      "id": "decisions",
+      "type": "backend",
+      "label": "上司决策台账",
+      "sublabel": "decisions.py·258",
+      "row": 9,
+      "col": 7,
+      "tag": "7禁交易决策"
+    },
+    {
+      "id": "pipeline",
+      "type": "backend",
+      "label": "主流水线",
+      "sublabel": "pipeline.py·751",
+      "row": 0,
+      "col": 1,
+      "tag": "①-⑯"
+    },
+    {
+      "id": "cli",
+      "type": "backend",
+      "label": "CLI 约90命令",
+      "sublabel": "cli.py·3054",
+      "row": 0,
+      "col": 2
+    },
+    {
+      "id": "run-ops",
+      "type": "backend",
+      "label": "运行预算",
+      "sublabel": "run_ops.py·287",
+      "row": 0,
+      "col": 3
+    },
+    {
+      "id": "doctor",
+      "type": "backend",
+      "label": "健康体检",
+      "sublabel": "doctor.py·1295",
+      "row": 0,
+      "col": 4
+    },
+    {
+      "id": "brokerage-architecture",
+      "type": "messagebus",
+      "label": "事件台账",
+      "sublabel": "brokerage_architecture.py·1089",
+      "row": 0,
+      "col": 5
+    },
+    {
+      "id": "config",
+      "type": "backend",
+      "label": "路径/配置",
+      "sublabel": "config.py·154",
+      "row": 11,
+      "col": 0
+    },
+    {
+      "id": "text",
+      "type": "backend",
+      "label": "文本归一",
+      "sublabel": "text.py·28",
+      "row": 11,
+      "col": 1
+    },
+    {
+      "id": "models",
+      "type": "backend",
+      "label": "数据模型",
+      "sublabel": "models.py·71",
+      "row": 11,
+      "col": 2
+    },
+    {
+      "id": "audit-log",
+      "type": "database",
+      "label": "哈希链原语",
+      "sublabel": "audit_log.py·169",
+      "row": 11,
+      "col": 3,
+      "tag": "链坏拒写"
+    },
+    {
+      "id": "storage",
+      "type": "database",
+      "label": "SQLite持久层",
+      "sublabel": "storage.py·215",
+      "row": 11,
+      "col": 4
+    },
+    {
+      "id": "skills",
+      "type": "backend",
+      "label": "技能发现(非生产)",
+      "sublabel": "skills.py·99",
+      "row": 11,
+      "col": 5
+    },
+    {
+      "id": "package-entry",
+      "type": "backend",
+      "label": "包入口",
+      "sublabel": "__main__/__init__·9",
+      "row": 11,
+      "col": 6
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "EXTERNAL 外部依赖",
+      "wraps": [
+        "ext-deepseek",
+        "ext-official",
+        "ext-vendor"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "10-sources 采集层",
+      "wraps": [
+        "local-jsonl",
+        "filing-jsonl",
+        "rss",
+        "eastmoney-filing",
+        "eastmoney-quote",
+        "akshare",
+        "pysnowball",
+        "alltick",
+        "free-quote",
+        "sources-package"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "20-rule-engine 规则层",
+      "wraps": [
+        "analysis",
+        "research-framework",
+        "research-team",
+        "team-ops",
+        "evidence-chain",
+        "source-health",
+        "source-remediation"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "50-gates fail-closed 门禁域",
+      "wraps": [
+        "market-resilience",
+        "market-data-governance",
+        "provider-registry",
+        "control-evidence",
+        "evidence-vault",
+        "evidence-vault-uat"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "30-model-plane 受控推理",
+      "wraps": [
+        "llm-governance",
+        "llm-agent",
+        "role-analyst",
+        "model-operations",
+        "pi-runtime",
+        "pi-skills",
+        "openclaw-handoff",
+        "agent-handoff"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "40-research-core 研究核心",
+      "wraps": [
+        "research-cases",
+        "research-runtime",
+        "research-workpapers",
+        "research-operations",
+        "research-git"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "60/85 业务与发布门禁",
+      "wraps": [
+        "business-onboarding",
+        "production-pilot",
+        "value-validation",
+        "release-controls",
+        "python-environment",
+        "release-audit",
+        "backup-restore"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "70-delivery 交付层",
+      "wraps": [
+        "reports",
+        "alerts",
+        "dashboard",
+        "review-workbench",
+        "workspace-inbox",
+        "review",
+        "review-queue",
+        "review-priority",
+        "decisions"
+      ]
+    },
+    {
+      "kind": "region",
+      "label": "00-foundation 地基",
+      "wraps": [
+        "config",
+        "text",
+        "models",
+        "audit-log",
+        "storage",
+        "skills",
+        "package-entry"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "e01",
+      "from": "sources-package",
+      "to": "analysis",
+      "label": "RawSignal ×9",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e02",
+      "from": "eastmoney-quote",
+      "to": "market-resilience",
+      "label": "行情信号"
+    },
+    {
+      "id": "e03",
+      "from": "market-resilience",
+      "to": "market-data-governance",
+      "label": "报价+观测"
+    },
+    {
+      "id": "e04",
+      "from": "provider-registry",
+      "to": "market-data-governance",
+      "label": "attested 0/2",
+      "variant": "security"
+    },
+    {
+      "id": "e05",
+      "from": "market-data-governance",
+      "to": "llm-agent",
+      "label": "llm_allowed 门",
+      "variant": "security"
+    },
+    {
+      "id": "e06",
+      "from": "control-evidence",
+      "to": "provider-registry",
+      "label": "证据解析",
+      "variant": "security"
+    },
+    {
+      "id": "e07",
+      "from": "evidence-vault",
+      "to": "llm-governance",
+      "label": "RETAINED_VERIFIED",
+      "variant": "security"
+    },
+    {
+      "id": "e08",
+      "from": "evidence-vault",
+      "to": "research-workpapers",
+      "label": "retained 哈希"
+    },
+    {
+      "id": "e09",
+      "from": "analysis",
+      "to": "llm-agent",
+      "label": "候选信号",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e10",
+      "from": "llm-agent",
+      "to": "llm-governance",
+      "label": "预检/后验",
+      "variant": "security"
+    },
+    {
+      "id": "e11",
+      "from": "llm-governance",
+      "to": "role-analyst",
+      "label": "role_llm 预检",
+      "variant": "security"
+    },
+    {
+      "id": "e12",
+      "from": "llm-agent",
+      "to": "role-analyst",
+      "label": "rule 结果"
+    },
+    {
+      "id": "e13",
+      "from": "pi-skills",
+      "to": "pi-runtime",
+      "label": "编译提示词",
+      "variant": "security"
+    },
+    {
+      "id": "e14",
+      "from": "llm-agent",
+      "to": "pi-runtime",
+      "label": "Pi 分流"
+    },
+    {
+      "id": "e15",
+      "from": "role-analyst",
+      "to": "pi-runtime",
+      "label": "research_desk"
+    },
+    {
+      "id": "e16",
+      "from": "agent-handoff",
+      "to": "pi-runtime",
+      "label": "public_handoff"
+    },
+    {
+      "id": "e17",
+      "from": "openclaw-handoff",
+      "to": "agent-handoff",
+      "label": "构造复用"
+    },
+    {
+      "id": "e18",
+      "from": "llm-agent",
+      "to": "model-operations",
+      "label": "deadline/usage"
+    },
+    {
+      "id": "e19",
+      "from": "analysis",
+      "to": "research-cases",
+      "label": "催化路径",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e20",
+      "from": "research-cases",
+      "to": "research-runtime",
+      "label": "案件投影",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e21",
+      "from": "research-workpapers",
+      "to": "research-runtime",
+      "label": "workpaper gate",
+      "variant": "security"
+    },
+    {
+      "id": "e22",
+      "from": "research-runtime",
+      "to": "research-workpapers",
+      "label": "动作→修订"
+    },
+    {
+      "id": "e23",
+      "from": "research-runtime",
+      "to": "research-operations",
+      "label": "动作授权",
+      "variant": "security"
+    },
+    {
+      "id": "e24",
+      "from": "research-operations",
+      "to": "llm-governance",
+      "label": "例外处置人",
+      "variant": "security"
+    },
+    {
+      "id": "e25",
+      "from": "review-queue",
+      "to": "research-operations",
+      "label": "SLA/名册"
+    },
+    {
+      "id": "e26",
+      "from": "research-operations",
+      "to": "business-onboarding",
+      "label": "阶段2 roster",
+      "variant": "security"
+    },
+    {
+      "id": "e27",
+      "from": "provider-registry",
+      "to": "business-onboarding",
+      "label": "阶段3 供应商",
+      "variant": "security"
+    },
+    {
+      "id": "e28",
+      "from": "evidence-vault",
+      "to": "business-onboarding",
+      "label": "阶段4 原件",
+      "variant": "security"
+    },
+    {
+      "id": "e29",
+      "from": "research-workpapers",
+      "to": "business-onboarding",
+      "label": "阶段6 archive",
+      "variant": "security"
+    },
+    {
+      "id": "e30",
+      "from": "business-onboarding",
+      "to": "production-pilot",
+      "label": "preflight",
+      "variant": "security"
+    },
+    {
+      "id": "e31",
+      "from": "review-queue",
+      "to": "production-pilot",
+      "label": "产能门",
+      "variant": "security"
+    },
+    {
+      "id": "e32",
+      "from": "release-controls",
+      "to": "release-audit",
+      "label": "控制物 PASS"
+    },
+    {
+      "id": "e33",
+      "from": "python-environment",
+      "to": "release-audit",
+      "label": "环境 PASS"
+    },
+    {
+      "id": "e34",
+      "from": "backup-restore",
+      "to": "release-audit",
+      "label": "备份演练 PASS"
+    },
+    {
+      "id": "e35",
+      "from": "release-audit",
+      "to": "value-validation",
+      "label": "manifest_id",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e36",
+      "from": "research-operations",
+      "to": "value-validation",
+      "label": "真人授权",
+      "variant": "security"
+    },
+    {
+      "id": "e37",
+      "from": "reports",
+      "to": "openclaw-handoff",
+      "label": "最新 JSON"
+    },
+    {
+      "id": "e38",
+      "from": "pipeline",
+      "to": "reports",
+      "label": "write_outputs",
+      "variant": "dashed"
+    },
+    {
+      "id": "e39",
+      "from": "review-queue",
+      "to": "alerts",
+      "label": "SLA 触发"
+    },
+    {
+      "id": "e40",
+      "from": "production-pilot",
+      "to": "alerts",
+      "label": "NO_GO 事件"
+    },
+    {
+      "id": "e41",
+      "from": "review-workbench",
+      "to": "research-runtime",
+      "label": "runtime-action",
+      "variant": "dashed"
+    },
+    {
+      "id": "e42",
+      "from": "review-workbench",
+      "to": "review-queue",
+      "label": "review-action",
+      "variant": "dashed"
+    },
+    {
+      "id": "e43",
+      "from": "review-workbench",
+      "to": "source-remediation",
+      "label": "补救动作",
+      "variant": "dashed"
+    },
+    {
+      "id": "e44",
+      "from": "source-remediation",
+      "to": "brokerage-architecture",
+      "label": "事件转发",
+      "variant": "dashed"
+    },
+    {
+      "id": "e45",
+      "from": "research-runtime",
+      "to": "brokerage-architecture",
+      "label": "阶段事件",
+      "variant": "dashed"
+    },
+    {
+      "id": "e46",
+      "from": "audit-log",
+      "to": "research-workpapers",
+      "label": "events 链"
+    },
+    {
+      "id": "e47",
+      "from": "audit-log",
+      "to": "evidence-vault",
+      "label": "vault 链"
+    },
+    {
+      "id": "e48",
+      "from": "audit-log",
+      "to": "pi-runtime",
+      "label": "calls 链"
+    },
+    {
+      "id": "e49",
+      "from": "audit-log",
+      "to": "provider-registry",
+      "label": "供应商链"
+    },
+    {
+      "id": "e50",
+      "from": "audit-log",
+      "to": "backup-restore",
+      "label": "备份链"
+    },
+    {
+      "id": "e51",
+      "from": "doctor",
+      "to": "production-pilot",
+      "label": "读 latest",
+      "variant": "dashed"
+    },
+    {
+      "id": "e52",
+      "from": "doctor",
+      "to": "value-validation",
+      "label": "读 latest",
+      "variant": "dashed"
+    },
+    {
+      "id": "e53",
+      "from": "ext-official",
+      "to": "evidence-vault",
+      "label": "受控 fetch"
+    },
+    {
+      "id": "e54",
+      "from": "pi-runtime",
+      "to": "ext-deepseek",
+      "label": "隔离执行",
+      "variant": "emphasis"
+    },
+    {
+      "id": "e55",
+      "from": "llm-agent",
+      "to": "ext-deepseek",
+      "label": "HTTP 回退",
+      "variant": "dashed"
+    },
+    {
+      "id": "e56",
+      "from": "ext-vendor",
+      "to": "eastmoney-quote",
+      "label": "可达≠授权",
+      "variant": "dashed"
+    },
+    {
+      "id": "e57",
+      "from": "model-operations",
+      "to": "run-ops",
+      "label": "预算协议",
+      "variant": "dashed"
+    },
+    {
+      "id": "e58",
+      "from": "research-framework",
+      "to": "research-team",
+      "label": "tracks"
+    },
+    {
+      "id": "e59",
+      "from": "research-team",
+      "to": "team-ops",
+      "label": "简报"
+    },
+    {
+      "id": "e60",
+      "from": "source-health",
+      "to": "source-remediation",
+      "label": "健康事件"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "主数据流",
+      "items": [
+        "采集统一 RawSignal，错误即信号",
+        "analysis 评分与 signal_id 跨源去重",
+        "案件 → 11 阶段运行时 → 哈希链工作底稿"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "fail-closed 门禁",
+      "items": [
+        "外部 LLM 仅放行 public 且引用可验",
+        "P0/P1 须先留存官方原件",
+        "受保护审批仅限名册真人"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "发布证据链 v31/32",
+      "items": [
+        "G0 控制物 → release-audit manifest_id",
+        "G0.5 价值验证冻结绑定 manifest_id",
+        "生产 GO 需 6 门互异真人批准"
+      ]
+    }
+  ]
+}
