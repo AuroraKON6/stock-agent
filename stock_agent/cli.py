@@ -620,6 +620,11 @@ def main() -> None:
     value_status_parser.add_argument("--config", default="config/watchlist.local.json")
     value_status_parser.add_argument("--require-ready", action="store_true")
 
+    prereg_parser = subparsers.add_parser(
+        "value-validation-prereg", help="预注册评审包：只读展示研究冻结将锁定的标准与目标决策"
+    )
+    prereg_parser.add_argument("--config", default="config/watchlist.local.json")
+
     value_init_parser = subparsers.add_parser(
         "value-study-init", help="Open one human-owned value validation study"
     )
@@ -1253,6 +1258,8 @@ def main() -> None:
         _run_recover_stale(args.config, args.mode, args.reason)
     elif args.command == "value-validation-status":
         _value_validation_status(args.config, args.require_ready)
+    elif args.command == "value-validation-prereg":
+        _value_validation_prereg(args.config)
     elif args.command == "value-study-init":
         _value_study_init(args.config, args.title, args.scenario, args.actor, args.actor_role)
     elif args.command == "value-case-register":
@@ -2893,6 +2900,14 @@ def _value_validation_status(config_path: str, require_ready: bool = False) -> N
     _print_value_validation(output)
     if require_ready and not output["snapshot"].get("value_gate_ready"):
         raise SystemExit(2)
+
+
+def _value_validation_prereg(config_path: str) -> None:
+    from .value_validation import build_preregistration_pack
+
+    config = load_config(config_path)
+    print(json.dumps(build_preregistration_pack(config),
+                     ensure_ascii=False, default=str, indent=2))
 
 
 def _value_study_init(

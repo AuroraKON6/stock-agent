@@ -673,6 +673,78 @@ def record_value_gate_decision(
     )
 
 
+PREREG_PACK_SCHEMA_VERSION = "1.0"
+# Plan section 6 (GLM-12): reviewable pre-registered target for median
+# analyst-time reduction. The CONFIGURED default stays 0.20; the choice
+# between them belongs to the project owner at freeze time, never to GLM.
+PLAN_REVIEWABLE_TARGET = 0.30
+
+PREREG_BLOCKED_ITEMS = (
+    "真实案件样本：20-30 个真实 P0/P1 历史案件需真实来源与人工筛选（BLOCKED）",
+    "真实人工时间日志：基线与辅助用时需真实分析师记录（BLOCKED）",
+    "独立 A/B 盲评与评分后揭盲：需独立评分人（BLOCKED）",
+    "冻结 READY release manifest：需技术发布门禁达成（BLOCKED）",
+    "最终 Go/No-Go：只能由真实授权人员基于真实证据决定（BLOCKED）",
+)
+
+
+def build_preregistration_pack(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Read-only pre-registration review pack: exactly what a study freeze locks.
+
+    Shows the criteria snapshot (with its policy fingerprint) that
+    ``open_value_study`` will freeze, the plan-stated target decision, the
+    measurement procedure, and every item that stays BLOCKED without real
+    humans and real cases. Writes nothing - opening the study is a separate,
+    deliberate step.
+    """
+    cfg = value_validation_config(config)
+    policy = _policy_snapshot(cfg)
+    return {
+        "schema_version": PREREG_PACK_SCHEMA_VERSION,
+        "generated_at": now_iso(),
+        "study_id": cfg["study_id"],
+        "scope_note": "preregistration_review_not_a_study_open",
+        "criteria": {
+            **policy,
+            "fingerprint": object_hash(policy),
+            "lock_mechanism": (
+                "open_value_study records this fingerprint; any later config "
+                "change fails the policy_frozen gate (criteria cannot be "
+                "edited after data collection starts)"
+            ),
+        },
+        "targets_review": {
+            "plan_reviewable_target": PLAN_REVIEWABLE_TARGET,
+            "currently_configured": cfg["target_efficiency_improvement"],
+            "requires_user_decision": True,
+            "note": (
+                "计划 GLM-12 供负责人评审的目标为人工用时中位数减少 30%；当前配置为 "
+                "{0:.0%}。冻结前由项目负责人决定采用哪个（或另行设定）——评分前不可再改。".format(
+                    cfg["target_efficiency_improvement"])
+            ),
+        },
+        "sample_requirements": {
+            "minimum_cases": cfg["minimum_cases"],
+            "maximum_cases": cfg["maximum_cases"],
+            "allowed_priorities": list(cfg["allowed_priorities"]),
+            "allowed_data_classifications": list(cfg["allowed_data_classifications"]),
+            "minimum_strata": cfg["minimum_strata"],
+            "excluded": "mock/fixture/重复/测试/合成案件一律不计入",
+        },
+        "measurement_procedure": [
+            "1. 负责人审定本包并决定效率目标（20% vs 30% 或另定）",
+            "2. 真实人工筛选 20-30 个真实 P0/P1 历史案件入组",
+            "3. open_value_study 冻结标准指纹；此后改配置即 policy_frozen 门禁 FAIL",
+            "4. 真实分析师记录基线用时（time_log）",
+            "5. 冻结 READY release manifest 后冻结 treatment",
+            "6. 真实分析师以辅助流程复测并记录用时",
+            "7. 独立评分人盲评（sealed mapping，评分后由协调员揭盲）",
+            "8. 汇总指标对冻结标准判门禁；最终 Go/No-Go 由真实授权人员决定",
+        ],
+        "blocked_items": list(PREREG_BLOCKED_ITEMS),
+    }
+
+
 def build_value_validation_status(config: Dict[str, Any]) -> Dict[str, Any]:
     cfg = value_validation_config(config)
     log = load_hash_chained_jsonl(project_path(cfg["event_path"]))
