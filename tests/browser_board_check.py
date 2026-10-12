@@ -103,6 +103,55 @@ def main() -> int:
               order_final[-1] == states["tid"] and order_final[:2] == ["task_other_a", "task_other_b"],
               "final={0}".format(order_final))
 
+        # D06: task detail drawer - real row-click wiring through the fetch
+        # path (network stubbed at window.fetch; the HTTP endpoint itself is
+        # contract-tested against a live server elsewhere), drawer content,
+        # persistence across refresh renders, Esc close, and form-click guard.
+        page.reload()
+        render(states["v1"])
+        detail_fixture = {
+            "task_id": states["tid"], "status": "awaiting_human", "is_replay": False,
+            "title": "浏览器验收任务", "input_version": 1, "row_version": 1,
+            "attempt_count": 1, "max_attempts": 2,
+            "origin": {"kind": "event", "event_key": "event:sha256:ab", "supersedes_task_id": "task_old"},
+            "research_question": "评估该公告的影响", "symbols": ["600519"],
+            "evidence_delivery": {"delivered_quotes": ["600519"], "delivered_evidence": [],
+                                   "dropped_quotes": ["000001:market_governance[stale]"], "dropped_evidence": []},
+            "research_rounds": [{"round": 1, "actual_model": "deepseek-flash", "final": False,
+                                  "intent_results": [{"action": "read_public_quote_snapshot", "status": "ok"}]}],
+            "model_call": {"request_model": "deepseek-flash", "actual_model": "deepseek-flash",
+                            "called": True, "usage": {"prompt_tokens": 10}},
+            "output": {"summary": "阶段结论：行情已确认。"},
+            "pending_human_questions": [{"question": "是否补充三季报原件？", "why_needed": "", "options": []}],
+            "last_error": "",
+            "scope_note": "personal_research_only_not_institutional",
+        }
+        page.evaluate(
+            "fixture => { window.fetch = (url) => Promise.resolve({ok: true, json: () => Promise.resolve(fixture)}); }",
+            detail_fixture)
+        page.locator('tr[data-task="{0}"]'.format(states["tid"])).first.click()
+        drawer = page.locator("#detail")
+        check("detail_drawer_opens_on_row_click", drawer.is_visible())
+        drawer_text = drawer.inner_text()
+        check("detail_shows_rounds_model_question_lineage",
+              "deepseek-flash" in drawer_text and "评估该公告的影响" in drawer_text
+              and "round 1" in drawer_text and "supersedes" in drawer_text,
+              "head={0!r}".format(drawer_text[:200]))
+        check("detail_shows_delivery_and_pending_question",
+              "600519" in drawer_text and "是否补充三季报原件" in drawer_text
+              and "market_governance" in drawer_text,
+              "delivery/pending facts missing")
+        # The drawer is an independent panel: a state refresh must not close it.
+        render(states["v2"])
+        check("detail_drawer_survives_refresh_render", drawer.is_visible())
+        page.keyboard.press("Escape")
+        check("detail_drawer_esc_closes", not drawer.is_visible())
+        # Clicking inside the feedback form must never open the drawer.
+        page.reload()
+        render(states["v1"])
+        page.locator('form[data-task="{0}"] input[name="notes"]'.format(states["tid"])).click()
+        check("form_click_does_not_open_detail", not page.locator("#detail").is_visible())
+
         browser.close()
 
     failed = [name for name, ok, _ in CHECKS if not ok]

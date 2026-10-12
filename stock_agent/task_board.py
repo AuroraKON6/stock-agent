@@ -105,6 +105,18 @@ h1{font-size:1.2rem;display:flex;align-items:center;gap:.6rem}
 p.note{color:#999;font-size:.8rem}
 #msg{font-size:.8rem;color:#ffc861;min-height:1em}
 .summary-state{display:block;color:#b5c6b8;font-size:.75rem;margin-top:.3rem}
+#detail{position:fixed;top:0;right:0;bottom:0;width:min(480px,92vw);background:#161616;
+border-left:1px solid #555;box-shadow:-4px 0 18px rgba(0,0,0,.5);padding:1rem 1.1rem;
+overflow-y:auto;z-index:30}
+#detail[hidden]{display:none}
+#detail h2{font-size:.95rem;margin:.2rem 0 .6rem;display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}
+#detail .close{margin-left:auto;cursor:pointer}
+#detail dl{margin:.4rem 0;display:grid;grid-template-columns:auto 1fr;gap:.2rem .6rem;font-size:.82rem}
+#detail dt{color:#9a9a9a}#detail dd{margin:0;word-break:break-all}
+#detail .sec{margin:.8rem 0 .2rem;font-size:.78rem;color:#ffc861;border-top:1px solid #333;padding-top:.5rem}
+#detail .round{border-left:2px solid #444;padding:.15rem .5rem;margin:.25rem 0;font-size:.78rem}
+#detail .scope{margin-top:1rem;color:#888;font-size:.72rem}
+tr[data-task]{cursor:pointer}
 </style></head><body>
 <h1>Research Task Board <span id="conn" class="down">CONNECTING</span></h1>
 <p class="note">REPLAY rows used recorded model responses, not live calls.
@@ -113,6 +125,7 @@ Personal acknowledgement is a personal research acknowledgement, not institution
 <div class="table-wrap" role="region" aria-label="Research tasks" tabindex="0"><table><thead><tr><th>task_id</th><th>mode</th><th>status</th><th>title</th><th>input_v</th><th>row_v</th><th>last error</th></tr></thead>
 <tbody id="tasks">__ROWS__
 </tbody></table></div>
+<aside id="detail" hidden aria-label="Task detail"></aside>
 <script>
 (function() {
   var CSRF = __CSRF_JSON__;
@@ -273,13 +286,77 @@ Personal acknowledgement is a personal research acknowledgement, not institution
         refresh();
       }).catch(function() { msg.textContent = 'submit failed'; });
   });
+  // ---- task detail drawer (read-only projection of /api/v1/tasks/{id}) ----
+  var detail = document.getElementById('detail');
+  function showDetail(d) {
+    if (!d || !d.task_id) { msg.textContent = 'invalid detail payload'; return; }
+    var rounds = d.research_rounds || [];
+    var delivery = d.evidence_delivery || {};
+    var model = d.model_call || {};
+    var origin = d.origin || {};
+    var html = '<h2><span class="status-' + esc(d.status) + '">' + esc(d.status) + '</span>' +
+      '<span>(' + (d.is_replay ? 'REPLAY' : 'LIVE') + ')</span><span class="close" data-detail-close title="close (Esc)">✕</span></h2>' +
+      '<dl><dt>task</dt><dd>' + esc(d.task_id) + '</dd>' +
+      '<dt>title</dt><dd>' + esc(d.title || '') + '</dd>' +
+      '<dt>versions</dt><dd>input v' + esc(d.input_version) + ' · row #' + esc(d.row_version) +
+      ' · attempts ' + esc((d.attempt_count || 0) + '/' + (d.max_attempts || 0)) + '</dd>' +
+      '<dt>origin</dt><dd>' + esc(origin.kind || 'unknown') +
+      (origin.event_key ? ' · ' + esc(origin.event_key) : '') +
+      (origin.supersedes_task_id ? ' · supersedes ' + esc(origin.supersedes_task_id) : '') + '</dd>' +
+      '<dt>question</dt><dd>' + esc(d.research_question || '') + '</dd>' +
+      '<dt>symbols</dt><dd>' + esc((d.symbols || []).join(', ')) + '</dd></dl>' +
+      '<div class="sec">evidence actually delivered</div>' +
+      '<dl><dt>quotes</dt><dd>' + esc((delivery.delivered_quotes || []).join(', ') || 'none') + '</dd>' +
+      '<dt>evidence</dt><dd>' + esc((delivery.delivered_evidence || []).join(', ') || 'none') + '</dd>' +
+      '<dt>dropped</dt><dd>' + esc(((delivery.dropped_quotes || []).concat(delivery.dropped_evidence || [])).join('; ') || 'none') + '</dd></dl>' +
+      '<div class="sec">research rounds (' + rounds.length + ')</div>' +
+      rounds.map(function(r) {
+        var intents = r.intent_results || [];
+        return '<div class="round">round ' + esc(r.round) + ' · ' + esc(r.actual_model || 'unknown') +
+          ' · ' + (r.final ? 'final' : 'provisional') +
+          (intents.length ? ' · intents ' + intents.map(function(i) {
+            return esc(i.action || '?') + ':' + esc(i.status || '?');
+          }).join(', ') : '') + '</div>';
+      }).join('') +
+      '<div class="sec">model</div>' +
+      '<dl><dt>request</dt><dd>' + esc(model.request_model || '') + '</dd>' +
+      '<dt>actual</dt><dd>' + esc(model.actual_model || '') + (model.called ? '' : ' (not called)') + '</dd>' +
+      '<dt>usage</dt><dd>' + esc(JSON.stringify(model.usage || {})) + '</dd></dl>' +
+      (d.output && d.output.summary ? '<div class="sec">AI output</div><div>' + esc(String(d.output.summary).slice(0, 400)) + '</div>' : '') +
+      ((d.pending_human_questions || []).length ? '<div class="sec">pending questions</div>' +
+        (d.pending_human_questions || []).map(function(q) {
+          return '<div class="round">' + esc(q.question || '') + '</div>';
+        }).join('') : '') +
+      (d.last_error ? '<div class="sec">error</div><div>' + esc(d.last_error) + '</div>' : '') +
+      '<p class="scope">' + esc(d.scope_note || '') + '</p>';
+    detail.innerHTML = html;
+    detail.hidden = false;
+  }
+  function closeDetail() { detail.hidden = true; detail.innerHTML = ''; }
+  function openDetail(tid) {
+    fetch('/api/v1/tasks/' + encodeURIComponent(tid))
+      .then(function(r) { if (!r.ok) throw new Error('detail request failed'); return r.json(); })
+      .then(showDetail)
+      .catch(function() { msg.textContent = 'detail fetch failed for ' + tid; });
+  }
+  tbody.addEventListener('click', function(ev) {
+    if (ev.target.closest && ev.target.closest('form')) return;  // never hijack feedback inputs
+    var tr = ev.target.closest ? ev.target.closest('tr[data-task]') : null;
+    if (tr) openDetail(tr.getAttribute('data-task'));
+  });
+  detail.addEventListener('click', function(ev) {
+    if (ev.target.closest && ev.target.closest('[data-detail-close]')) closeDetail();
+  });
+  document.addEventListener('keydown', function(ev) { if (ev.key === 'Escape') closeDetail(); });
   var es = new EventSource('/api/v1/events');
   es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); };
   es.onerror = function() { conn.textContent = 'RECONNECTING'; conn.className = 'down'; };
   es.onmessage = function(ev) { refresh(); };
   // Read-only hook for automated browser verification of the render contract
-  // (SSR keys, form preservation, focus retention). It never mutates state.
+  // (SSR keys, form preservation, focus retention) and the detail drawer.
+  // They never mutate state.
   window.__taskBoardRender = render;
+  window.__taskBoardShowDetail = showDetail;
   refresh();
 })();
 </script></body></html>"""
