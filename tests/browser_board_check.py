@@ -230,6 +230,46 @@ def main() -> int:
         open_state = page.evaluate("document.getElementById('events').open")
         check("events_section_collapsible", open_state is False, "open={0!r}".format(open_state))
 
+        # D10 todo section: awaiting questions with age badges and a
+        # hand-off button that opens the detail drawer; blocked tasks with
+        # their denial reason; summary count includes review-queue pendings.
+        page.reload()
+        render(states["v1"])
+        todo_fixture = {
+            "counts": {"awaiting_human": 1, "blocked": 1},
+            "awaiting_human": [
+                {"task_id": states["tid"], "title": "研究任务",
+                 "question": "是否补充三季报原件？", "why_needed": "缺上下文",
+                 "options": ["Q3", "年报"], "updated_at": "2026-10-12T15:00:00+08:00",
+                 "age_minutes": 125},
+            ],
+            "blocked": [
+                {"task_id": "task_blk", "title": "被阻断任务",
+                 "error": "governance denied: internal classification",
+                 "updated_at": "2026-10-12T14:00:00+08:00", "note": "CLI"},
+            ],
+            "review_queue": {"available": True, "pending_count": 3, "generated_at": "x"},
+        }
+        page.evaluate("payload => window.__taskBoardTodo(payload)", todo_fixture)
+        todo_text = page.locator("#todolist").inner_text()
+        check("todo_section_renders_question_age_blocked",
+              "是否补充三季报原件" in todo_text and "2h" in todo_text
+              and "被阻断任务" in todo_text and "governance denied" in todo_text,
+              "text={0!r}".format(todo_text[:240]))
+        check("todo_summary_counts_review_queue",
+              "（5）" in page.locator("#todo summary").inner_text()
+              and "复核队列" in todo_text and "pending 3" in todo_text,
+              "summary={0!r}".format(page.locator("#todo summary").inner_text()))
+        page.evaluate(
+            "() => { window.fetch = (url) => Promise.resolve({ok: true, json: () =>"
+            " Promise.resolve(String(url).indexOf('/tasks/') >= 0"
+            " ? {task_id: '" + states["tid"] + "', status: 'awaiting_human'}"
+            " : {})}); }")
+        page.locator('#todolist [data-tasklink="{0}"]'.format(states["tid"])).first.click()
+        drawer_todo = page.locator("#detail")
+        check("todo_handoff_button_opens_detail",
+              drawer_todo.is_visible() and states["tid"] in drawer_todo.inner_text())
+
         browser.close()
 
     failed = [name for name, ok, _ in CHECKS if not ok]

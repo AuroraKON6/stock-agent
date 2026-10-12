@@ -46,12 +46,19 @@ tr[data-task]{cursor:pointer}
 .evsec .tl.succeeded{color:#5fd35f}.evsec .tl.queued{color:#bbb}
 .evsec .tl.awaiting_human{color:#ffc861}.evsec .tl.failed,.evsec .tl.blocked{color:#ff6b6b}
 .evsec .when{color:#777;font-size:.72rem;margin-left:auto}
+.evsec .age{background:#3a2d10;color:#ffd27a;border-radius:.4rem;padding:0 .35rem;font-size:.72rem}
+.evsec .why{color:#999;font-size:.72rem}
+.evsec .blk{color:#ff9d9d}
 </style></head><body>
 <h1>Research Task Board <span id="conn" class="down">CONNECTING</span></h1>
 <p class="note">REPLAY rows used recorded model responses, not live calls.
 Personal acknowledgement is a personal research acknowledgement, not institutional approval.</p>
 <p id="msg"></p>
 <div id="overview" class="ovbar" hidden aria-label="Workbench overview"></div>
+<details id="todo" class="evsec" open>
+  <summary>待办<span id="todocount"></span></summary>
+  <div id="todolist"></div>
+</details>
 <details id="events" class="evsec" open>
   <summary>事件（去重，72h）<span id="evcount"></span></summary>
   <div id="evlist"></div>
@@ -255,6 +262,49 @@ Personal acknowledgement is a personal research acknowledgement, not institution
       .catch(function() { /* overview stays hidden; the board itself still works */ });
   }
 
+  // ---- todo section (what needs a human, from /api/v1/todo) ----
+  var todoList = document.getElementById('todolist');
+  var todoCount = document.getElementById('todocount');
+  function showTodo(view) {
+    if (!view || typeof view !== 'object') return;
+    var counts = view.counts || {};
+    var rq = view.review_queue || {};
+    var total = (counts.awaiting_human || 0) + (counts.blocked || 0) + (rq.pending_count || 0);
+    todoCount.textContent = '（' + total + '）';
+    var html = '';
+    (view.awaiting_human || []).forEach(function(item) {
+      var age = item.age_minutes >= 60
+        ? Math.floor(item.age_minutes / 60) + 'h' : item.age_minutes + 'm';
+      html += '<div class="ev">'
+        + '<span class="age">' + esc(age) + '</span>'
+        + '<span class="t" title="' + esc(item.question) + '">' + esc(item.question) + '</span>'
+        + (item.why_needed ? '<span class="why">' + esc(item.why_needed) + '</span>' : '')
+        + '<span class="tl awaiting_human" data-tasklink="' + esc(item.task_id) + '"'
+        + ' title="' + esc(item.task_id) + '">回答</span>'
+        + '<span class="when">' + esc(String(item.updated_at || '').replace('T', ' ').slice(0, 16)) + '</span>'
+        + '</div>';
+    });
+    (view.blocked || []).forEach(function(item) {
+      html += '<div class="ev">'
+        + '<span class="t blk" title="' + esc(item.error) + '">⚠ ' + esc(item.title) + '</span>'
+        + '<span class="why">' + esc(item.error) + '</span>'
+        + '<span class="tl blocked" data-tasklink="' + esc(item.task_id) + '"'
+        + ' title="' + esc(item.task_id) + '">查看</span>'
+        + '</div>';
+    });
+    if (rq.available && rq.pending_count) {
+      html += '<div class="ev"><span class="t">复核队列</span>'
+        + '<span class="why">pending ' + esc(rq.pending_count) + '（research-ops/review-queue 入口处理）</span></div>';
+    }
+    todoList.innerHTML = html;
+  }
+  function fetchTodo() {
+    fetch('/api/v1/todo')
+      .then(function(r) { if (!r.ok) throw new Error('todo request failed'); return r.json(); })
+      .then(showTodo)
+      .catch(function() { /* todo section stays empty; the board works */ });
+  }
+
   // ---- events section (deduped story events from /api/v1/events-view) ----
   var evList = document.getElementById('evlist');
   var evCount = document.getElementById('evcount');
@@ -285,6 +335,10 @@ Personal acknowledgement is a personal research acknowledgement, not institution
       .catch(function() { /* events section stays empty; the board works */ });
   }
   evList.addEventListener('click', function(ev) {
+    var link = ev.target.closest ? ev.target.closest('[data-tasklink]') : null;
+    if (link) openDetail(link.getAttribute('data-tasklink'));
+  });
+  todoList.addEventListener('click', function(ev) {
     var link = ev.target.closest ? ev.target.closest('[data-tasklink]') : null;
     if (link) openDetail(link.getAttribute('data-tasklink'));
   });
@@ -352,7 +406,7 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   });
   document.addEventListener('keydown', function(ev) { if (ev.key === 'Escape') closeDetail(); });
   var es = new EventSource('/api/v1/events');
-  es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); fetchOverview(); fetchEvents(); };
+  es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); fetchOverview(); fetchEvents(); fetchTodo(); };
   es.onerror = function() { conn.textContent = 'RECONNECTING'; conn.className = 'down'; };
   es.onmessage = function(ev) { refresh(); };
   // Read-only hook for automated browser verification of the render contract
@@ -362,8 +416,10 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   window.__taskBoardShowDetail = showDetail;
   window.__taskBoardOverview = showOverview;
   window.__taskBoardEvents = showEvents;
+  window.__taskBoardTodo = showTodo;
   fetchOverview();
   fetchEvents();
+  fetchTodo();
   refresh();
 })();
 </script></body></html>
