@@ -525,6 +525,17 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     return
             self._send_json(200, payload)
             return
+        if parsed.path == "/api/v1/todo":
+            from .todo_view import build_todo_view
+
+            with self.server.board_lock:
+                try:
+                    payload = build_todo_view(self.server.board_config, store=store)
+                except Exception as exc:  # projection; degrade honestly
+                    self._send_json(503, {"error": "todo view unavailable: {0}".format(type(exc).__name__)})
+                    return
+            self._send_json(200, payload)
+            return
         if parsed.path == "/api/v1/events-view":
             # NOT /api/v1/events: that URL is the SSE stream contract frozen
             # by ADR-001 and must keep streaming.

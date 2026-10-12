@@ -976,6 +976,10 @@ def main() -> None:
     events_view_parser.add_argument("--lookback-hours", type=int, default=72)
     events_view_parser.add_argument("--limit", type=int, default=50)
 
+    todo_view_parser = subparsers.add_parser(
+        "todo-view", help="待办视图（等待人工的问题/被阻断任务/复核队列，只读聚合）")
+    todo_view_parser.add_argument("--config", default="config/watchlist.local.json")
+
     summary_parser = subparsers.add_parser("task-summary", help="Local version-bound summary review; never publication approval")
     summary_parser.add_argument("--config", default="config/watchlist.local.json")
     summary_parser.add_argument("--task-id", required=True)
@@ -1385,6 +1389,8 @@ def main() -> None:
         _overview(args.config)
     elif args.command == "events-view":
         _events_view(args.config, args.lookback_hours, args.limit)
+    elif args.command == "todo-view":
+        _todo_view(args.config)
     elif args.command == "task-list":
         _task_list(args.config, args.status, args.json)
     elif args.command == "task-run-next":
@@ -1597,6 +1603,23 @@ def _events_view(config_path: str, lookback_hours: int, limit: int) -> None:
         payload = build_events_view(config, store=store,
                                     lookback_hours=max(1, lookback_hours),
                                     limit=max(1, limit))
+    finally:
+        if store is not None:
+            store.close()
+    print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
+
+
+def _todo_view(config_path: str) -> None:
+    from .todo_view import build_todo_view
+
+    config = load_config(config_path)
+    db_path = project_path(str((config.get("task_runtime") or {}).get("db_path")
+                               or "data/task_runtime/tasks.sqlite3"))
+    store = None
+    if db_path.is_file():
+        store, _ = _task_store(config_path)
+    try:
+        payload = build_todo_view(config, store=store)
     finally:
         if store is not None:
             store.close()
