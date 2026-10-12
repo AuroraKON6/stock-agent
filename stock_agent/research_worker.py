@@ -512,6 +512,17 @@ def run_research_task(
             if not _renew_or_fail():
                 return {"status": "failed", "model_call": model_call}
 
+            # Budget gate: the day's model attempts are counted from the audit
+            # outbox; a spent budget blocks (not retryable-fails) so retries
+            # cannot spend their way past the cap.
+            from .budget_guard import may_start_model_call
+
+            budget = may_start_model_call(store, config)
+            model_call["budget"] = budget
+            if not budget["allowed"]:
+                return _blocked(budget["reason"], {"gate": "budget", "decision": "denied",
+                                                   "budget": budget})
+
             try:
                 raw_text, round_record = _invoke_model(user_prompt, round_index)
                 model_call["called"] = True
