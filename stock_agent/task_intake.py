@@ -221,6 +221,7 @@ def run_daily_task_cycle(
         execution_mode=execution_mode)
 
     processed = succeeded = failed = blocked = awaiting_human = cancelled = 0
+    retried = 0
     while processed < max(1, int(max_tasks)):
         task = store.claim_next(worker_id, ttl_seconds=ttl_seconds)
         if task is None:
@@ -238,7 +239,14 @@ def run_daily_task_cycle(
                        fencing_token=task["fencing_token"],
                        error="cycle worker crashed: {0}: {1}".format(type(exc).__name__, str(exc)[:300]),
                        retryable=True)
-            failed += 1
+            # A crash either terminally failed the task or just consumed one
+            # attempt and requeued it; count the two outcomes separately so
+            # the report never overstates terminal failures.
+            fresh = store.get_task(task["task_id"])
+            if str(fresh.get("status")) == "failed":
+                failed += 1
+            else:
+                retried += 1
             continue
         if status == "succeeded":
             succeeded += 1
@@ -261,6 +269,7 @@ def run_daily_task_cycle(
         "processed": processed,
         "succeeded": succeeded,
         "failed": failed,
+        "retried": retried,
         "blocked": blocked,
         "awaiting_human": awaiting_human,
         "cancelled": cancelled,

@@ -256,11 +256,35 @@ class _ReviewHandler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": "not found"})
 
+    def _drain_request_body(self) -> bool:
+        """Consume the declared request body so the connection can be reused
+        or closed without Windows RST-on-unread-data aborting the client's
+        read of our rejection. Returns False when draining is impossible."""
+        sizes = self.headers.get_all("Content-Length") or []
+        if len(sizes) != 1 or not sizes[0].isascii() or not sizes[0].isdigit():
+            return False
+        remaining = int(sizes[0])
+        if remaining < 0 or remaining > 64 * 1024:
+            return False
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 4096))
+            if not chunk:
+                return False
+            remaining -= len(chunk)
+        return True
+
     def do_POST(self):
         if not self._origin_ok(post=True):
+            # Drain before rejecting: closing (or reusing) a connection with
+            # an unread body makes Windows reset the socket, racing away the
+            # 403 the client is about to read.
+            if not self._drain_request_body():
+                self.close_connection = True
             self._send(403, {"error": "origin denied"})
             return
         if self.path not in {"/session", "/close"}:
+            if not self._drain_request_body():
+                self.close_connection = True
             self._send(404, {"error": "not found"})
             return
         try:
@@ -269,10 +293,22 @@ class _ReviewHandler(BaseHTTPRequestHandler):
                 raise ValueError("invalid size")
             if self.headers.get("Transfer-Encoding") or self.headers.get("Content-Type") != "application/json":
                 raise ValueError("invalid framing")
-            body = json.loads(self.rfile.read(int(sizes[0])).decode("utf-8"))
+            body_text = self.rfile.read(int(sizes[0])).decode("utf-8")
+        except (ValueError, UnicodeError):
+            # Framing failed BEFORE the body was read: drain the declared
+            # bytes so the connection can close or be reused without an
+            # unread-data RST racing away this 400.
+            if not self._drain_request_body():
+                self.close_connection = True
+            self._send(400, {"error": "invalid request"})
+            return
+        try:
+            body = json.loads(body_text)
             if not isinstance(body, dict) or set(body) != ({"bootstrap"} if self.path == "/session" else set()):
                 raise ValueError("unexpected body")
-        except (ValueError, UnicodeError):
+        except ValueError:
+            # The declared body was fully consumed above; the connection is
+            # byte-aligned again, so a normal keep-alive response is safe.
             self._send(400, {"error": "invalid request"})
             return
         try:
