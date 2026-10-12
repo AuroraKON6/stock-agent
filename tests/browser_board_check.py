@@ -270,6 +270,55 @@ def main() -> int:
         check("todo_handoff_button_opens_detail",
               drawer_todo.is_visible() and states["tid"] in drawer_todo.inner_text())
 
+        # D10 ops section: engine counts and budget summary, registry approval
+        # states, projection freshness chips, and failure view buttons.
+        page.reload()
+        render(states["v1"])
+        ops_fixture = {
+            "engine": {"event_intake_mode": "task",
+                        "status_counts": {"queued": 1, "running": 0, "succeeded": 2,
+                                           "failed": 1, "blocked": 0, "awaiting_human": 1},
+                        "outbox_events": 12,
+                        "consumption": {"consumed_events": 3, "orphan_tasks": 0}},
+            "budget": {"calls_today": 2, "limit": 4, "enabled": True},
+            "recent_failures": [
+                {"task_id": states["tid"], "title": "失败任务", "status": "failed",
+                 "error": "round budget exhausted", "updated_at": "x"},
+            ],
+            "source_registry": {
+                "configured": True, "entry_count": 1,
+                "entries": [{"source_id": "eastmoney", "kind": "price",
+                              "approval_state": "pending_human_approval",
+                              "expired": False, "external_send_allowed": False}],
+                "note": "真实来源健康 BLOCKED"},
+            "projections": [
+                {"name": "run_coordination", "present": True,
+                 "generated_at": "x", "age_minutes": 42},
+                {"name": "evidence_vault", "present": False,
+                 "generated_at": "", "age_minutes": None},
+            ],
+            "projections_note": "只读已有投影",
+        }
+        page.evaluate("payload => window.__taskBoardOps(payload)", ops_fixture)
+        ops_section = page.locator("#ops")
+        ops_section.locator("summary").click()  # open (default collapsed)
+        ops_text = page.locator("#opslist").inner_text()
+        check("ops_renders_engine_budget_registry_projections",
+              "queued 1" in ops_text and "succeeded 2" in ops_text
+              and "今日调用" in ops_text and "4" in ops_text
+              and "pending_human_approval" in ops_text and "外发 否" in ops_text
+              and "run_coordination 42m" in ops_text and "evidence_vault 缺失" in ops_text,
+              "text={0!r}".format(ops_text[:300]))
+        page.evaluate(
+            "() => { window.fetch = (url) => Promise.resolve({ok: true, json: () =>"
+            " Promise.resolve(String(url).indexOf('/tasks/') >= 0"
+            " ? {task_id: '" + states["tid"] + "', status: 'failed'}"
+            " : {})}); }")
+        page.locator('#opslist [data-tasklink="{0}"]'.format(states["tid"])).first.click()
+        drawer_ops = page.locator("#detail")
+        check("ops_failure_view_button_opens_detail",
+              drawer_ops.is_visible() and states["tid"] in drawer_ops.inner_text())
+
         browser.close()
 
     failed = [name for name, ok, _ in CHECKS if not ok]

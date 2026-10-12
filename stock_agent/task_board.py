@@ -135,6 +135,8 @@ tr[data-task]{cursor:pointer}
 .evsec .age{background:#3a2d10;color:#ffd27a;border-radius:.4rem;padding:0 .35rem;font-size:.72rem}
 .evsec .why{color:#999;font-size:.72rem}
 .evsec .blk{color:#ff9d9d}
+.evsec .muted{color:#777}
+.evsec .stale{color:#ffd27a}
 </style></head><body>
 <h1>Research Task Board <span id="conn" class="down">CONNECTING</span></h1>
 <p class="note">REPLAY rows used recorded model responses, not live calls.
@@ -148,6 +150,10 @@ Personal acknowledgement is a personal research acknowledgement, not institution
 <details id="events" class="evsec" open>
   <summary>事件（去重，72h）<span id="evcount"></span></summary>
   <div id="evlist"></div>
+</details>
+<details id="ops" class="evsec">
+  <summary>运行（引擎/预算/登记/投影）</summary>
+  <div id="opslist"></div>
 </details>
 <div class="table-wrap" role="region" aria-label="Research tasks" tabindex="0"><table><thead><tr><th>task_id</th><th>mode</th><th>status</th><th>title</th><th>input_v</th><th>row_v</th><th>last error</th></tr></thead>
 <tbody id="tasks">__ROWS__
@@ -391,6 +397,64 @@ Personal acknowledgement is a personal research acknowledgement, not institution
       .catch(function() { /* todo section stays empty; the board works */ });
   }
 
+  // ---- ops section (run health from /api/v1/ops; projections only) ----
+  var opsList = document.getElementById('opslist');
+  function showOps(view) {
+    if (!view || typeof view !== 'object') return;
+    var engine = view.engine || {};
+    var counts = engine.status_counts || {};
+    var consumption = engine.consumption || {};
+    var budget = view.budget || {};
+    var registry = view.source_registry || {};
+    var html = '';
+    html += '<div class="ev"><span class="t">引擎 <b>' + esc(engine.event_intake_mode) + '</b></span>'
+      + '<span class="why">queued ' + esc(counts.queued || 0)
+      + ' · running ' + esc(counts.running || 0)
+      + ' · succeeded ' + esc(counts.succeeded || 0)
+      + ' · failed ' + esc(counts.failed || 0)
+      + ' · blocked ' + esc(counts.blocked || 0)
+      + ' · awaiting ' + esc(counts.awaiting_human || 0) + '</span>'
+      + '<span class="when">outbox ' + esc(engine.outbox_events || 0) + '</span></div>';
+    html += '<div class="ev"><span class="t">预算</span>'
+      + '<span class="why">今日调用 ' + esc(budget.calls_today || 0)
+      + (budget.enabled ? ' / 上限 ' + esc(budget.limit) : '（未启用）') + '</span>'
+      + (consumption.orphan_tasks ? '<span class="stale">orphan ' + esc(consumption.orphan_tasks) + '</span>' : '')
+      + '<span class="when">consumed ' + esc(consumption.consumed_events || 0) + '</span></div>';
+    (view.recent_failures || []).forEach(function(item) {
+      html += '<div class="ev">'
+        + '<span class="t blk" title="' + esc(item.error) + '">⚠ ' + esc(item.title) + '</span>'
+        + '<span class="why">' + esc(item.error) + '</span>'
+        + '<span class="tl ' + esc(item.status) + '" data-tasklink="' + esc(item.task_id) + '">查看</span>'
+        + '</div>';
+    });
+    if (registry.configured) {
+      (registry.entries || []).forEach(function(entry) {
+        html += '<div class="ev"><span class="t">' + esc(entry.source_id) + '</span>'
+          + '<span class="why">' + esc(entry.kind) + ' · ' + esc(entry.approval_state)
+          + (entry.expired ? ' · <span class="stale">已过期</span>' : '')
+          + ' · 外发 ' + (entry.external_send_allowed ? '允许' : '否') + '</span></div>';
+      });
+    } else {
+      html += '<div class="ev"><span class="t">来源登记</span><span class="muted">未配置</span></div>';
+    }
+    html += '<div class="ev"><span class="t">投影</span>'
+      + (view.projections || []).map(function(p) {
+        var text = p.present
+          ? (p.age_minutes == null ? p.name : p.name + ' ' + p.age_minutes + 'm')
+          : p.name + ' 缺失';
+        return '<span class="' + (p.present ? 'src' : 'muted') + '">' + esc(text) + '</span>';
+      }).join(' ') + '</div>';
+    html += '<div class="ev"><span class="muted">' + esc(view.projections_note || '') + '</span></div>';
+    html += '<div class="ev"><span class="muted">' + esc((view.source_registry || {}).note || '') + '</span></div>';
+    opsList.innerHTML = html;
+  }
+  function fetchOps() {
+    fetch('/api/v1/ops')
+      .then(function(r) { if (!r.ok) throw new Error('ops request failed'); return r.json(); })
+      .then(showOps)
+      .catch(function() { /* ops section stays empty; the board works */ });
+  }
+
   // ---- events section (deduped story events from /api/v1/events-view) ----
   var evList = document.getElementById('evlist');
   var evCount = document.getElementById('evcount');
@@ -425,6 +489,10 @@ Personal acknowledgement is a personal research acknowledgement, not institution
     if (link) openDetail(link.getAttribute('data-tasklink'));
   });
   todoList.addEventListener('click', function(ev) {
+    var link = ev.target.closest ? ev.target.closest('[data-tasklink]') : null;
+    if (link) openDetail(link.getAttribute('data-tasklink'));
+  });
+  opsList.addEventListener('click', function(ev) {
     var link = ev.target.closest ? ev.target.closest('[data-tasklink]') : null;
     if (link) openDetail(link.getAttribute('data-tasklink'));
   });
@@ -492,7 +560,7 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   });
   document.addEventListener('keydown', function(ev) { if (ev.key === 'Escape') closeDetail(); });
   var es = new EventSource('/api/v1/events');
-  es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); fetchOverview(); fetchEvents(); fetchTodo(); };
+  es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); fetchOverview(); fetchEvents(); fetchTodo(); fetchOps(); };
   es.onerror = function() { conn.textContent = 'RECONNECTING'; conn.className = 'down'; };
   es.onmessage = function(ev) { refresh(); };
   // Read-only hook for automated browser verification of the render contract
@@ -503,9 +571,11 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   window.__taskBoardOverview = showOverview;
   window.__taskBoardEvents = showEvents;
   window.__taskBoardTodo = showTodo;
+  window.__taskBoardOps = showOps;
   fetchOverview();
   fetchEvents();
   fetchTodo();
+  fetchOps();
   refresh();
 })();
 </script></body></html>"""
