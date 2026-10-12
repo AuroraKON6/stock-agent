@@ -966,6 +966,10 @@ def main() -> None:
     daily_cycle_parser.add_argument("--worker-id", default="w-daily-cycle")
     daily_cycle_parser.add_argument("--max-tasks", type=int, default=20)
 
+    overview_parser = subparsers.add_parser(
+        "overview", help="工作台总览（引擎/行情/事件/任务/预算的只读聚合投影）")
+    overview_parser.add_argument("--config", default="config/watchlist.local.json")
+
     summary_parser = subparsers.add_parser("task-summary", help="Local version-bound summary review; never publication approval")
     summary_parser.add_argument("--config", default="config/watchlist.local.json")
     summary_parser.add_argument("--task-id", required=True)
@@ -1371,6 +1375,8 @@ def main() -> None:
     elif args.command == "daily-task-cycle":
         _daily_task_cycle(args.config, args.purpose, args.execution_mode, args.actor,
                           args.worker_id, args.max_tasks)
+    elif args.command == "overview":
+        _overview(args.config)
     elif args.command == "task-list":
         _task_list(args.config, args.status, args.json)
     elif args.command == "task-run-next":
@@ -1549,6 +1555,25 @@ def _daily_task_cycle(config_path: str, purpose: str, execution_mode: str, actor
     finally:
         store.close()
     print(json.dumps(report, ensure_ascii=False, default=str, indent=2))
+
+
+def _overview(config_path: str) -> None:
+    from pathlib import Path as _Path
+
+    from .overview import build_overview
+
+    config = load_config(config_path)
+    db_path = project_path(str((config.get("task_runtime") or {}).get("db_path")
+                               or "data/task_runtime/tasks.sqlite3"))
+    store = None
+    if db_path.is_file():
+        store, _ = _task_store(config_path)
+    try:
+        payload = build_overview(config, store=store)
+    finally:
+        if store is not None:
+            store.close()
+    print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
 
 
 def _task_list(config_path: str, status: str, as_json: bool) -> None:

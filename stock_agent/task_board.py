@@ -421,6 +421,17 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
             with self.server.board_lock:
                 self._send_json(200, _board_state(store, self.server.board_config))
             return
+        if parsed.path == "/api/v1/overview":
+            from .overview import build_overview
+
+            with self.server.board_lock:
+                try:
+                    payload = build_overview(self.server.board_config, store=store)
+                except Exception as exc:  # overview is a projection; degrade honestly
+                    self._send_json(503, {"error": "overview unavailable: {0}".format(type(exc).__name__)})
+                    return
+            self._send_json(200, payload)
+            return
         if parsed.path.startswith("/api/v1/tasks/"):
             task_id = parsed.path[len("/api/v1/tasks/"):]
             from .task_detail import task_detail
