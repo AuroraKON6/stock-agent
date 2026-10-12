@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .event_contract import event_base_identity, event_identity
@@ -297,6 +298,13 @@ def rescan_pending_events(
         raise TaskIntakeError(str(exc)) from exc
     rows, selection = load_research_signals(
         config, symbols=symbols, lookback_hours=lookback_hours)
+    from .research_trigger import decide_trigger
+    from .models import now_iso as _now_iso
+
+    # Cross-event trigger state for this cycle: caps and cooldowns need to see
+    # what earlier rows in the same scan already opened.
+    trigger_state: Dict[str, Any] = {"symbol_cycle_counts": {}, "symbol_last_trigger": {}}
+    skipped_by_trigger = 0
     events = [event_from_signal_row(row) for row in rows]
     normalized = [normalize_event(event) for event in events]
     keys = [event_identity(
@@ -308,9 +316,14 @@ def rescan_pending_events(
     created = 0
     duplicates = 0
     skipped = 0
-    for item, key in zip(normalized, keys):
+    for row, item, key in zip(rows, normalized, keys):
         if key in consumed:
             skipped += 1
+            continue
+        decision = decide_trigger(row, config=config, state=trigger_state,
+                                  now=datetime.now().astimezone())
+        if not decision["trigger"]:
+            skipped_by_trigger += 1
             continue
         result = ensure_event_task(
             store, event=item, config=config, purpose=purpose,
@@ -318,12 +331,17 @@ def rescan_pending_events(
         if result["status"] == "RECORDED":
             created += 1
             created_signal_ids.append(item["signal_id"])
+            for symbol in decision.get("symbols") or []:
+                trigger_state["symbol_cycle_counts"][symbol] = (
+                    int(trigger_state["symbol_cycle_counts"].get(symbol, 0)) + 1)
+                trigger_state["symbol_last_trigger"][symbol] = _now_iso()
         else:
             duplicates += 1
     return {
         "created": created,
         "duplicates": duplicates,
         "skipped": skipped,
+        "skipped_by_trigger": skipped_by_trigger,
         "rejected_by_selection": int(selection.get("rejected") or 0),
         "created_signal_ids": created_signal_ids,
         "selection": selection,

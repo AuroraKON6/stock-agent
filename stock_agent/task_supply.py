@@ -101,7 +101,7 @@ def load_research_signals(config: Optional[Dict[str, Any]] = None, *,
         conditions += " AND signal_id IN ({0})".format(",".join("?" for _ in signal_ids))
         params.extend(signal_ids)
     query = ("SELECT signal_id, source, source_type, title, summary, url, published_at, "
-             "collected_at, symbols_json, payload_json FROM signals WHERE " + conditions +
+             "collected_at, priority, symbols_json, payload_json FROM signals WHERE " + conditions +
              " ORDER BY collected_at DESC, signal_id LIMIT ?")
     params.append(MAX_SIGNAL_SCAN + 1)
     try:
