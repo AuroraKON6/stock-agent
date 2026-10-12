@@ -31,11 +31,17 @@ overflow-y:auto;z-index:30}
 #detail .round{border-left:2px solid #444;padding:.15rem .5rem;margin:.25rem 0;font-size:.78rem}
 #detail .scope{margin-top:1rem;color:#888;font-size:.72rem}
 tr[data-task]{cursor:pointer}
+.ovbar{display:flex;flex-wrap:wrap;gap:.4rem;margin:.4rem 0 .8rem;font-size:.78rem}
+.ovbar .chip{border:1px solid #444;border-radius:.6rem;padding:.15rem .55rem;background:#1a1a1a}
+.ovbar .chip b{color:#ffc861;font-weight:600}
+.ovbar .chip .bad{color:#ff6b6b}
+.ovbar .chip .ok{color:#5fd35f}
 </style></head><body>
 <h1>Research Task Board <span id="conn" class="down">CONNECTING</span></h1>
 <p class="note">REPLAY rows used recorded model responses, not live calls.
 Personal acknowledgement is a personal research acknowledgement, not institutional approval.</p>
 <p id="msg"></p>
+<div id="overview" class="ovbar" hidden aria-label="Workbench overview"></div>
 <div class="table-wrap" role="region" aria-label="Research tasks" tabindex="0"><table><thead><tr><th>task_id</th><th>mode</th><th>status</th><th>title</th><th>input_v</th><th>row_v</th><th>last error</th></tr></thead>
 <tbody id="tasks"><tr data-task="task_browser_0001" data-version="1"><td>task_browser_0001</td><td>LIVE</td><td class='status-awaiting_human'>awaiting_human</td><td>浏览器验收任务<small class="summary-state">Summary: not_submitted</small></td><td>v1</td><td>#1</td><td></td></tr><tr data-taskform="task_browser_0001"><td colspan="7"><div class="feedback"><em>是否接受该研究结论？</em><form data-task="task_browser_0001" data-version="1"><input name="actor" placeholder="actor" required><select name="decision"><option>acknowledge</option><option>reject</option><option>provide_input</option></select><input name="input_patch" placeholder="JSON patch (provide_input)"><input name="notes" placeholder="notes"><button type="submit">Submit</button></form></div></td></tr>
 </tbody></table></div>
@@ -200,6 +206,41 @@ Personal acknowledgement is a personal research acknowledgement, not institution
         refresh();
       }).catch(function() { msg.textContent = 'submit failed'; });
   });
+  // ---- workbench overview bar (read-only projection of /api/v1/overview) ----
+  var overviewBar = document.getElementById('overview');
+  function showOverview(o) {
+    if (!o || typeof o !== 'object') return;
+    var engine = (o.engine || {}).event_intake_mode || '?';
+    var market = o.market || {};
+    var quotes = market.quotes || {};
+    var missing = market.quotes_missing || [];
+    var events = o.events || {};
+    var tasks = o.tasks || {};
+    var counts = tasks.status_counts || {};
+    var awaiting = tasks.awaiting_human || [];
+    var budget = o.budget || {};
+    function chip(html) { return '<span class="chip">' + html + '</span>'; }
+    var html = '';
+    html += chip('engine <b>' + esc(engine) + '</b>');
+    html += chip('quotes <b class="' + (missing.length && !Object.keys(quotes).length ? 'bad' : 'ok') + '">'
+      + Object.keys(quotes).length + '</b>' + (missing.length
+        ? ' / missing <b class="bad">' + esc(missing.length) + '</b>' : ''));
+    html += chip('events 24h <b>' + esc(events.eligible_count || 0) + '</b>');
+    html += chip('queued <b>' + esc(counts.queued || 0) + '</b>');
+    html += chip('awaiting human <b class="' + (awaiting.length ? 'bad' : 'ok') + '">'
+      + esc(awaiting.length) + '</b>');
+    html += chip('model calls today <b>' + esc(budget.calls_today || 0) + '</b>'
+      + (budget.enabled ? ' / limit ' + esc(budget.limit) : ' <span class="ok">(budget off)</span>'));
+    overviewBar.innerHTML = html;
+    overviewBar.hidden = false;
+  }
+  function fetchOverview() {
+    fetch('/api/v1/overview')
+      .then(function(r) { if (!r.ok) throw new Error('overview request failed'); return r.json(); })
+      .then(showOverview)
+      .catch(function() { /* overview stays hidden; the board itself still works */ });
+  }
+
   // ---- task detail drawer (read-only projection of /api/v1/tasks/{id}) ----
   var detail = document.getElementById('detail');
   function showDetail(d) {
@@ -263,14 +304,16 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   });
   document.addEventListener('keydown', function(ev) { if (ev.key === 'Escape') closeDetail(); });
   var es = new EventSource('/api/v1/events');
-  es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); };
+  es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); fetchOverview(); };
   es.onerror = function() { conn.textContent = 'RECONNECTING'; conn.className = 'down'; };
   es.onmessage = function(ev) { refresh(); };
   // Read-only hook for automated browser verification of the render contract
-  // (SSR keys, form preservation, focus retention) and the detail drawer.
-  // They never mutate state.
+  // (SSR keys, form preservation, focus retention), the detail drawer and the
+  // overview bar. They never mutate state.
   window.__taskBoardRender = render;
   window.__taskBoardShowDetail = showDetail;
+  window.__taskBoardOverview = showOverview;
+  fetchOverview();
   refresh();
 })();
 </script></body></html>

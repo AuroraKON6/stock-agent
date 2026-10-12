@@ -152,6 +152,38 @@ def main() -> int:
         page.locator('form[data-task="{0}"] input[name="notes"]'.format(states["tid"])).click()
         check("form_click_does_not_open_detail", not page.locator("#detail").is_visible())
 
+        # D10: workbench overview bar - fetched projection rendered as chips,
+        # real fetch path (network stubbed at window.fetch like the drawer),
+        # and state refresh renders never clear it.
+        page.reload()
+        render(states["v1"])
+        overview_fixture = {
+            "engine": {"event_intake_mode": "task"},
+            "market": {"symbols": ["600519"], "quotes": {"600519": {"price": 1500.0}},
+                        "quotes_missing": ["000001"]},
+            "events": {"eligible_count": 3},
+            "tasks": {"status_counts": {"queued": 1, "awaiting_human": 1},
+                       "awaiting_human": [{"task_id": "t_x", "question": "补充材料？"}]},
+            "budget": {"calls_today": 2, "limit": 4, "enabled": True},
+        }
+        page.evaluate(
+            "fixture => { window.fetch = (url) => Promise.resolve({ok: true, json: () => Promise.resolve(fixture)});"
+            " window.__taskBoardOverview(fixture); }",
+            overview_fixture)
+        bar = page.locator("#overview")
+        check("overview_bar_visible", bar.is_visible())
+        bar_text = bar.inner_text()
+        check("overview_chips_show_engine_quotes_events",
+              "task" in bar_text and "quotes" in bar_text and "events 24h" in bar_text
+              and "missing" in bar_text,
+              "text={0!r}".format(bar_text[:200]))
+        check("overview_chips_show_queue_awaiting_budget",
+              "queued" in bar_text and "awaiting human" in bar_text
+              and "model calls today" in bar_text and "limit" in bar_text,
+              "text={0!r}".format(bar_text[:200]))
+        render(states["v2"])
+        check("overview_bar_survives_refresh_render", bar.is_visible() and "task" in bar.inner_text())
+
         browser.close()
 
     failed = [name for name, ok, _ in CHECKS if not ok]
