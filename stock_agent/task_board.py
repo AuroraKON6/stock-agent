@@ -592,12 +592,19 @@ def _is_loopback_host(host: str) -> bool:
     return lowered in {"127.0.0.1", "localhost", "[::1]", "::1"}
 
 
-def create_task_board_server(store: TaskStore, host: str = "127.0.0.1", port: int = 8768, *, config: Optional[Dict[str, Any]] = None) -> ThreadingHTTPServer:
+def create_task_board_server(store: TaskStore, host: str = "127.0.0.1", port: int = 8768, *,
+                             config: Optional[Dict[str, Any]] = None,
+                             sse_max_seconds: Optional[int] = None,
+                             sse_keepalive_seconds: Optional[float] = None) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), _TaskBoardHandler)
     server.task_store = store
     server.csrf_token = secrets.token_urlsafe(32)
     server.board_lock = threading.Lock()
     server.board_config = config or {}
+    # Production bounds stay the module defaults; tests may tighten them to
+    # exercise the slow-consumer behavior quickly.
+    server.sse_max_seconds = int(sse_max_seconds or SSE_MAX_SECONDS)
+    server.sse_keepalive_seconds = float(sse_keepalive_seconds or SSE_KEEPALIVE_SECONDS)
     return server
 
 
@@ -729,7 +736,8 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
-        deadline = _time.monotonic() + SSE_MAX_SECONDS
+        deadline = _time.monotonic() + getattr(self.server, "sse_max_seconds", SSE_MAX_SECONDS)
+        keepalive = getattr(self.server, "sse_keepalive_seconds", SSE_KEEPALIVE_SECONDS)
         idle_since = _time.monotonic()
         try:
             while _time.monotonic() < deadline:
@@ -756,7 +764,7 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     self.wfile.write("id: {0}\ndata: {1}\n\n".format(last_id, body).encode("utf-8"))
                     self.wfile.flush()
                     idle_since = _time.monotonic()
-                if _time.monotonic() - idle_since >= SSE_KEEPALIVE_SECONDS:
+                if _time.monotonic() - idle_since >= keepalive:
                     self.wfile.write(b": keepalive\n\n")
                     self.wfile.flush()
                     idle_since = _time.monotonic()

@@ -82,6 +82,14 @@ class ResearchWorkerError(RuntimeError):
     pass
 
 
+class _BudgetExhausted(ResearchWorkerError):
+    """The atomic budget reservation was denied; carries the decision dict."""
+
+    def __init__(self, decision: Dict[str, Any]):
+        super().__init__(str(decision.get("reason") or "budget exhausted"))
+        self.decision = decision
+
+
 def assert_payload_external_safe(text: str) -> None:
     """Belt-and-braces minimization gate behind the real governance screen."""
 
@@ -433,10 +441,17 @@ def run_research_task(
             "prompt_sha256": hashlib.sha256(user_prompt.encode("utf-8")).hexdigest(),
             "started_at": now_iso(),
         }
-        # Attempt identity and input fingerprint persist BEFORE the call so an
-        # in-flight request is auditable even when the outcome stays unknown.
-        store.record_research_attempt_start(
-            task_id, worker_id=worker_id, fencing_token=task["fencing_token"], attempt=attempt)
+        # Atomic budget reservation: today's attempt events are counted and
+        # this attempt recorded in ONE transaction, so concurrent workers can
+        # never both spend the last slot. The recorded event is the audit
+        # trail even when the outcome stays unknown.
+        from .budget_guard import reserve_model_attempt
+
+        reservation = reserve_model_attempt(
+            store, config, task_id, worker_id=worker_id,
+            fencing_token=task["fencing_token"], attempt=attempt)
+        if not reservation.get("reserved"):
+            raise _BudgetExhausted(reservation)
         round_started = time.perf_counter()
         response = call_pi_agent(
             system_prompt=_SYSTEM_PROMPT,
@@ -454,6 +469,10 @@ def run_research_task(
             "usage": dict(meta.get("usage") or {}),
             "duration_seconds": round(time.perf_counter() - round_started, 3),
             "ended_at": now_iso(),
+            "budget_reservation": {
+                "calls_today": reservation.get("calls_today"),
+                "limit": reservation.get("limit"),
+            },
         }
         return str(response), record
 
@@ -512,21 +531,11 @@ def run_research_task(
             if not _renew_or_fail():
                 return {"status": "failed", "model_call": model_call}
 
-            # Budget gate: the day's model attempts are counted from the audit
-            # outbox; a spent budget blocks (not retryable-fails) so retries
-            # cannot spend their way past the cap.
-            from .budget_guard import may_start_model_call
-
-            budget = may_start_model_call(store, config)
-            model_call["budget"] = budget
-            if not budget["allowed"]:
-                return _blocked(budget["reason"], {"gate": "budget", "decision": "denied",
-                                                   "budget": budget})
-
             try:
                 raw_text, round_record = _invoke_model(user_prompt, round_index)
                 model_call["called"] = True
                 model_call["model"] = round_record["actual_model"]
+                model_call["budget"] = dict(round_record.get("budget_reservation") or {})
                 if round_record.get("request_id"):
                     model_call["request_id"] = round_record["request_id"]
                 # Top-level usage aggregates every round; per-round detail stays
@@ -537,6 +546,11 @@ def run_research_task(
                         model_call["usage"][key] = current + value
                     elif key not in model_call["usage"]:
                         model_call["usage"][key] = value
+            except _BudgetExhausted as exc:
+                model_call["budget"] = dict(exc.decision)
+                return _blocked(exc.decision.get("reason") or "budget exhausted",
+                                {"gate": "budget", "decision": "denied",
+                                 "budget": dict(exc.decision)})
             except Exception as exc:
                 model_call["error"] = "{0}: {1}".format(type(exc).__name__, str(exc)[:500])
                 return _fail(model_call["error"], retryable=not _is_auth_error(exc))

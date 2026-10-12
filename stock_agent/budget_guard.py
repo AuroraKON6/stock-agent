@@ -59,3 +59,19 @@ def may_start_model_call(store: Any, config: Dict[str, Any], *, now=None) -> Dic
             "limit": limit,
         }
     return {"allowed": True, "reason": "ok", "calls_today": calls_today, "limit": limit}
+
+
+def reserve_model_attempt(store: Any, config: Dict[str, Any], task_id: str, *,
+                          worker_id: str, fencing_token: int,
+                          attempt: Dict[str, Any]) -> Dict[str, Any]:
+    """Atomically reserve one of today's model attempts.
+
+    Read-only views use may_start_model_call; an actual call MUST go through
+    this: the store counts today's attempt events and records the new one in
+    a single write transaction, closing the check-then-act race in which two
+    concurrent workers both pass a limit-1 check.
+    """
+    limit = budget_config(config)["daily_model_call_limit"]
+    return store.reserve_model_attempt(task_id, worker_id=worker_id,
+                                       fencing_token=fencing_token,
+                                       attempt=attempt, daily_limit=limit)

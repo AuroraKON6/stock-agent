@@ -900,6 +900,43 @@ class TaskStore:
             raise
         return self.get_task(task_id)
 
+    def reserve_model_attempt(self, task_id: str, *, worker_id: str, fencing_token: int,
+                              attempt: Dict[str, Any], daily_limit: int = 0) -> Dict[str, Any]:
+        """Atomically count today's model attempts and record one if under limit.
+
+        The count and the insert share one BEGIN IMMEDIATE transaction, so
+        concurrent workers (separate connections) can never both spend the
+        last slot. The recorded event IS the reservation — no model call may
+        start without it — and a denial records nothing, so denied checks
+        never consume budget.
+        """
+        today = datetime.now().astimezone().date().isoformat()
+        self._begin()
+        try:
+            row = self._task_row(task_id)
+            self._assert_worker(row, worker_id, fencing_token)
+            count = int(self._conn.execute(
+                "SELECT COUNT(*) FROM task_outbox"
+                " WHERE event_type = 'research_attempt_started' AND created_at LIKE ?",
+                (today + "%",)).fetchone()[0])
+            if daily_limit > 0 and count >= int(daily_limit):
+                self._rollback()
+                return {
+                    "reserved": False,
+                    "reason": "daily model-call budget exhausted: {0}/{1} attempts today".format(
+                        count, daily_limit),
+                    "calls_today": count,
+                    "limit": int(daily_limit),
+                }
+            event_id = self._emit(task_id, "research_attempt_started", actor=worker_id,
+                                  payload=dict(attempt or {}))
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return {"reserved": True, "reason": "ok",
+                "calls_today": count + 1, "limit": int(daily_limit), "event_id": event_id}
+
     def record_research_round(self, task_id: str, *, worker_id: str,
                               fencing_token: int, record: Dict[str, Any]) -> Dict[str, Any]:
         """Persist one completed research round (intents, results, usage)."""
