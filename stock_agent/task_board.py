@@ -122,12 +122,26 @@ tr[data-task]{cursor:pointer}
 .ovbar .chip b{color:#ffc861;font-weight:600}
 .ovbar .chip .bad{color:#ff6b6b}
 .ovbar .chip .ok{color:#5fd35f}
+.evsec{border:1px solid #3a3a3a;border-radius:.4rem;margin:.2rem 0 .8rem;background:#141414}
+.evsec summary{cursor:pointer;padding:.4rem .6rem;font-size:.85rem;color:#cfcfcf}
+.evsec .ev{border-top:1px solid #2c2c2c;padding:.4rem .6rem;font-size:.8rem;display:flex;gap:.5rem;flex-wrap:wrap;align-items:baseline}
+.evsec .ev .t{font-weight:600;max-width:46ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.evsec .rev{background:#5a2d2d;color:#ffb3b3;border-radius:.4rem;padding:0 .35rem;font-size:.72rem}
+.evsec .src{background:#222;border-radius:.4rem;padding:0 .35rem;font-size:.72rem;color:#9fd0ff}
+.evsec .tl{cursor:pointer;border-radius:.4rem;padding:0 .35rem;font-size:.72rem;border:1px solid #444}
+.evsec .tl.succeeded{color:#5fd35f}.evsec .tl.queued{color:#bbb}
+.evsec .tl.awaiting_human{color:#ffc861}.evsec .tl.failed,.evsec .tl.blocked{color:#ff6b6b}
+.evsec .when{color:#777;font-size:.72rem;margin-left:auto}
 </style></head><body>
 <h1>Research Task Board <span id="conn" class="down">CONNECTING</span></h1>
 <p class="note">REPLAY rows used recorded model responses, not live calls.
 Personal acknowledgement is a personal research acknowledgement, not institutional approval.</p>
 <p id="msg"></p>
 <div id="overview" class="ovbar" hidden aria-label="Workbench overview"></div>
+<details id="events" class="evsec" open>
+  <summary>事件（去重，72h）<span id="evcount"></span></summary>
+  <div id="evlist"></div>
+</details>
 <div class="table-wrap" role="region" aria-label="Research tasks" tabindex="0"><table><thead><tr><th>task_id</th><th>mode</th><th>status</th><th>title</th><th>input_v</th><th>row_v</th><th>last error</th></tr></thead>
 <tbody id="tasks">__ROWS__
 </tbody></table></div>
@@ -327,6 +341,40 @@ Personal acknowledgement is a personal research acknowledgement, not institution
       .catch(function() { /* overview stays hidden; the board itself still works */ });
   }
 
+  // ---- events section (deduped story events from /api/v1/events-view) ----
+  var evList = document.getElementById('evlist');
+  var evCount = document.getElementById('evcount');
+  function showEvents(view) {
+    if (!view || !Array.isArray(view.events)) return;
+    evCount.textContent = '（' + (view.event_count || view.events.length) + '）';
+    evList.innerHTML = view.events.map(function(ev) {
+      var tasks = (ev.linked_tasks || []).map(function(t) {
+        return '<span class="tl ' + esc(t.status) + '" data-tasklink="' + esc(t.task_id) + '"'
+          + ' title="' + esc(t.task_id) + '">' + esc(t.status) + '</span>';
+      }).join(' ');
+      var sources = (ev.sources || []).map(function(s) { return '<span class="src">' + esc(s) + '</span>'; }).join(' ');
+      return '<div class="ev" data-cluster="' + esc(ev.cluster_key) + '">'
+        + '<span class="t" title="' + esc(ev.title) + '">' + esc(ev.title) + '</span>'
+        + (ev.revision ? '<span class="rev">v' + esc((ev.versions || []).join('/')) + ' 修订</span>' : '')
+        + sources
+        + '<span class="src">' + esc((ev.symbols || []).join(',')) + '</span>'
+        + '<span class="src">×' + esc(ev.report_count) + '</span>'
+        + tasks
+        + '<span class="when">' + esc(String(ev.last_published || '').replace('T', ' ').slice(0, 16)) + '</span>'
+        + '</div>';
+    }).join('');
+  }
+  function fetchEvents() {
+    fetch('/api/v1/events-view')
+      .then(function(r) { if (!r.ok) throw new Error('events request failed'); return r.json(); })
+      .then(showEvents)
+      .catch(function() { /* events section stays empty; the board works */ });
+  }
+  evList.addEventListener('click', function(ev) {
+    var link = ev.target.closest ? ev.target.closest('[data-tasklink]') : null;
+    if (link) openDetail(link.getAttribute('data-tasklink'));
+  });
+
   // ---- task detail drawer (read-only projection of /api/v1/tasks/{id}) ----
   var detail = document.getElementById('detail');
   function showDetail(d) {
@@ -390,7 +438,7 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   });
   document.addEventListener('keydown', function(ev) { if (ev.key === 'Escape') closeDetail(); });
   var es = new EventSource('/api/v1/events');
-  es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); fetchOverview(); };
+  es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); fetchOverview(); fetchEvents(); };
   es.onerror = function() { conn.textContent = 'RECONNECTING'; conn.className = 'down'; };
   es.onmessage = function(ev) { refresh(); };
   // Read-only hook for automated browser verification of the render contract
@@ -399,7 +447,9 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   window.__taskBoardRender = render;
   window.__taskBoardShowDetail = showDetail;
   window.__taskBoardOverview = showOverview;
+  window.__taskBoardEvents = showEvents;
   fetchOverview();
+  fetchEvents();
   refresh();
 })();
 </script></body></html>"""

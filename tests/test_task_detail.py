@@ -107,6 +107,7 @@ class TaskDetailTestCase(unittest.TestCase):
 
     def test_board_http_serves_detail_json(self):
         import threading
+        import time
         import urllib.request
         from stock_agent.task_board import create_task_board_server
 
@@ -117,6 +118,19 @@ class TaskDetailTestCase(unittest.TestCase):
         thread.start()
         self.addCleanup(server.shutdown)
         self.addCleanup(server.server_close)
+        # Readiness poll: connect-before-accept shows as ConnectionRefused
+        # under full-suite load on Windows.
+        deadline = time.time() + 5
+        while True:
+            try:
+                with urllib.request.urlopen(
+                        "http://127.0.0.1:{0}/health".format(port), timeout=1) as probe:
+                    if probe.status == 200:
+                        break
+            except Exception:
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.05)
         with urllib.request.urlopen(
                 "http://127.0.0.1:{0}/api/v1/tasks/{1}".format(port, task["task_id"]),
                 timeout=5) as response:

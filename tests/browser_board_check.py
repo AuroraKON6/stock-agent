@@ -184,6 +184,52 @@ def main() -> int:
         render(states["v2"])
         check("overview_bar_survives_refresh_render", bar.is_visible() and "task" in bar.inner_text())
 
+        # D10 events section: deduped stories with revision badge, sources and
+        # linked-task chips; clicking a chip opens the detail drawer (URL-aware
+        # fetch stub so the detail request returns the detail fixture).
+        page.reload()
+        render(states["v1"])
+        events_fixture = {
+            "event_count": 2,
+            "events": [
+                {"cluster_key": "cluster::甲::600519", "title": "甲公司业绩预告更正",
+                 "symbols": ["600519"], "sources": ["eastmoney", "sina"], "report_count": 3,
+                 "versions": ["1", "2"], "revision": True,
+                 "first_published": "2026-10-12T09:00:00+08:00",
+                 "last_published": "2026-10-12T15:00:00+08:00",
+                 "linked_tasks": [{"task_id": states["tid"], "status": "awaiting_human"}]},
+                {"cluster_key": "cluster::乙::000001", "title": "乙公司常规公告",
+                 "symbols": ["000001"], "sources": ["cninfo"], "report_count": 1,
+                 "versions": ["1"], "revision": False,
+                 "first_published": "2026-10-12T10:00:00+08:00",
+                 "last_published": "2026-10-12T10:00:00+08:00",
+                 "linked_tasks": []},
+            ],
+        }
+        page.evaluate(
+            "(payload) => { window.__eventsPayload = payload; window.__taskBoardEvents(payload); }",
+            events_fixture)
+        events_section = page.locator("#events")
+        events_text = page.locator("#evlist").inner_text()
+        check("events_section_renders_stories",
+              "甲公司业绩预告更正" in events_text and "乙公司常规公告" in events_text,
+              "text={0!r}".format(events_text[:200]))
+        check("events_revision_badge_and_sources",
+              "修订" in events_text and "eastmoney" in events_text and "sina" in events_text,
+              "missing revision badge or sources")
+        page.evaluate(
+            "() => { window.fetch = (url) => Promise.resolve({ok: true, json: () =>"
+            " Promise.resolve(String(url).indexOf('/tasks/') >= 0"
+            " ? {task_id: '" + states["tid"] + "', status: 'awaiting_human'}"
+            " : window.__eventsPayload)}); }")
+        page.locator('[data-tasklink="{0}"]'.format(states["tid"])).first.click()
+        drawer_after = page.locator("#detail")
+        check("events_linked_task_chip_opens_detail",
+              drawer_after.is_visible() and states["tid"] in drawer_after.inner_text())
+        events_section.locator("summary").click()
+        open_state = page.evaluate("document.getElementById('events').open")
+        check("events_section_collapsible", open_state is False, "open={0!r}".format(open_state))
+
         browser.close()
 
     failed = [name for name, ok, _ in CHECKS if not ok]

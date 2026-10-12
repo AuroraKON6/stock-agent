@@ -110,6 +110,7 @@ class LinkedTaskTests(EventsViewTestCase):
 class HttpCliTests(EventsViewTestCase):
     def test_board_serves_events_endpoint(self):
         import threading
+        import time
         import urllib.request
         from stock_agent.task_board import create_task_board_server
 
@@ -119,6 +120,19 @@ class HttpCliTests(EventsViewTestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.shutdown)
         self.addCleanup(server.server_close)
+        # Readiness poll: connect-before-accept shows as ConnectionRefused
+        # under full-suite load on Windows.
+        deadline = time.time() + 5
+        while True:
+            try:
+                with urllib.request.urlopen(
+                        "http://127.0.0.1:{0}/health".format(port), timeout=1) as probe:
+                    if probe.status == 200:
+                        break
+            except Exception:
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.05)
         with urllib.request.urlopen(
                 "http://127.0.0.1:{0}/api/v1/events-view".format(port), timeout=5) as response:
             payload = json.loads(response.read().decode("utf-8"))
