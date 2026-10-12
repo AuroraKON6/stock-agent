@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from .event_contract import event_base_identity, event_identity
@@ -298,13 +298,27 @@ def rescan_pending_events(
         raise TaskIntakeError(str(exc)) from exc
     rows, selection = load_research_signals(
         config, symbols=symbols, lookback_hours=lookback_hours)
-    from .research_trigger import decide_trigger
+    from .research_trigger import (
+        PRIORITY_RANKS as _PRIORITY_RANKS,
+        cluster_key as _cluster_key,
+        decide_trigger,
+        research_trigger_config as _trigger_config,
+    )
     from .models import now_iso as _now_iso
 
-    # Cross-event trigger state for this cycle: caps and cooldowns need to see
-    # what earlier rows in the same scan already opened.
-    trigger_state: Dict[str, Any] = {"symbol_cycle_counts": {}, "symbol_last_trigger": {}}
+    trigger_cfg = _trigger_config(config or {})
+    # Cross-event trigger state for this cycle: caps, cooldowns and story
+    # clusters must see what earlier rows — and, within the cooldown window,
+    # earlier cycles — already opened.
+    trigger_state: Dict[str, Any] = {
+        "symbol_cycle_counts": {}, "symbol_last_trigger": {}, "cluster_last_trigger": {},
+    }
+    _window_minutes = max(trigger_cfg["symbol_cooldown_minutes"],
+                          trigger_cfg["cluster_cooldown_minutes"])
+    if _window_minutes > 0:
+        _seed_cross_cycle_state(store, trigger_state, within_minutes=_window_minutes)
     skipped_by_trigger = 0
+    skipped_by_cluster = 0
     events = [event_from_signal_row(row) for row in rows]
     normalized = [normalize_event(event) for event in events]
     keys = [event_identity(
@@ -316,12 +330,62 @@ def rescan_pending_events(
     created = 0
     duplicates = 0
     skipped = 0
+    now_value = datetime.now().astimezone()
+
+    def _member_order(row: Dict[str, Any]):
+        # Story winner: official filing beats news, then higher priority,
+        # then the earlier publication.
+        return (
+            0 if str(row.get("source_type") or "") == "filing" else 1,
+            _PRIORITY_RANKS.get(str(row.get("priority") or "P3"), 3),
+            str(row.get("published_at") or ""),
+        )
+
+    pending = []
     for row, item, key in zip(rows, normalized, keys):
         if key in consumed:
             skipped += 1
             continue
+        pending.append((row, item, key))
+
+    # Same-story clustering: content revisions always reopen research; the
+    # cross-cycle window skips a whole story already covered recently;
+    # otherwise the best member of each in-cycle cluster opens the task.
+    ordered = sorted(pending, key=lambda entry: _member_order(entry[0]))
+    if trigger_cfg["cluster_within_cycle"] or trigger_cfg["cluster_cooldown_minutes"] > 0:
+        selected = []
+        seen_clusters: set = set()
+        for entry in ordered:
+            row = entry[0]
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if str(payload.get("content_version") or "1") != "1":
+                selected.append(entry)
+                continue
+            story = _cluster_key(row)
+            if trigger_cfg["cluster_cooldown_minutes"] > 0:
+                stamp = str(trigger_state["cluster_last_trigger"].get(story) or "")
+                if stamp:
+                    try:
+                        covered_at = datetime.fromisoformat(stamp)
+                        covered = (now_value - covered_at).total_seconds() \
+                            < trigger_cfg["cluster_cooldown_minutes"] * 60
+                    except ValueError:
+                        covered = False
+                    if covered:
+                        skipped_by_cluster += 1
+                        continue
+            if trigger_cfg["cluster_within_cycle"]:
+                if story in seen_clusters:
+                    skipped_by_cluster += 1
+                    continue
+                seen_clusters.add(story)
+            selected.append(entry)
+    else:
+        selected = ordered
+
+    for row, item, key in selected:
         decision = decide_trigger(row, config=config, state=trigger_state,
-                                  now=datetime.now().astimezone())
+                                  now=now_value)
         if not decision["trigger"]:
             skipped_by_trigger += 1
             continue
@@ -335,6 +399,9 @@ def rescan_pending_events(
                 trigger_state["symbol_cycle_counts"][symbol] = (
                     int(trigger_state["symbol_cycle_counts"].get(symbol, 0)) + 1)
                 trigger_state["symbol_last_trigger"][symbol] = _now_iso()
+            payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if str(payload.get("content_version") or "1") == "1":
+                trigger_state["cluster_last_trigger"][_cluster_key(row)] = _now_iso()
         else:
             duplicates += 1
     return {
@@ -342,7 +409,51 @@ def rescan_pending_events(
         "duplicates": duplicates,
         "skipped": skipped,
         "skipped_by_trigger": skipped_by_trigger,
+        "skipped_by_cluster": skipped_by_cluster,
         "rejected_by_selection": int(selection.get("rejected") or 0),
         "created_signal_ids": created_signal_ids,
         "selection": selection,
     }
+
+
+def _seed_cross_cycle_state(store: Any, state: Dict[str, Any], *, within_minutes: int) -> None:
+    """Derive cross-cycle cooldown state from recently created tasks.
+
+    Recency is each task's created_at; symbols and the story title come from
+    its input origin. Best-effort: malformed timestamps simply do not seed a
+    cooldown, and the LATEST timestamp per symbol/story wins.
+    """
+    from .research_trigger import cluster_key as _cluster_key
+
+    cutoff = datetime.now().astimezone() - timedelta(minutes=max(1, int(within_minutes)))
+
+    def _remember(target: Dict[str, str], name: str, stamp: str) -> None:
+        existing = str(target.get(name) or "")
+        if not existing or stamp > existing:
+            target[name] = stamp
+
+    try:
+        tasks = store.list_tasks()
+    except Exception:
+        return
+    for task in tasks:
+        created = str(task.get("created_at") or "")
+        try:
+            created_dt = datetime.fromisoformat(created)
+        except ValueError:
+            continue
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.astimezone()
+        if created_dt < cutoff:
+            continue
+        payload = task.get("input_payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        symbols = [str(symbol) for symbol in (payload.get("symbols") or []) if str(symbol)]
+        origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
+        title = str(origin.get("title") or "")
+        for symbol in symbols:
+            _remember(state["symbol_last_trigger"], symbol, created)
+        if title:
+            story = _cluster_key({"title": title, "symbols": symbols})
+            _remember(state["cluster_last_trigger"], story, created)

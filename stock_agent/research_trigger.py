@@ -9,12 +9,41 @@ dropped — skipped events are counted and reported.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Dict, Optional
 
 PRIORITY_RANKS = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 TRIGGER_SOURCE_TYPES = {"filing"}
-TRIGGER_CONFIG_FIELDS = {"news_min_priority", "max_per_symbol_per_cycle", "symbol_cooldown_minutes"}
+TRIGGER_CONFIG_FIELDS = {
+    "news_min_priority", "max_per_symbol_per_cycle", "symbol_cooldown_minutes",
+    "cluster_within_cycle", "cluster_cooldown_minutes",
+}
+
+# Same-story clustering: keep CJK letters/digits and ASCII alnum only, so
+# punctuation, brackets, spacing and case differences do not split a story.
+_CLUSTER_STRIP = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
+_CLUSTER_KEY_CHARS = 60
+# Leading decoration tags Chinese reposts prepend: 【快讯】、[独家]、（公告）…
+_LEADING_TAG = re.compile(r"^[^0-9A-Za-z\u4e00-\u9fff]*[【\[（(][^】\]）)]*[】\]）)]")
+_MAX_LEADING_TAGS = 2
+
+
+def _strip_leading_tags(title: str) -> str:
+    for _ in range(_MAX_LEADING_TAGS):
+        stripped = _LEADING_TAG.sub("", title, count=1)
+        if stripped == title:
+            break
+        title = stripped
+    return title
+
+
+def cluster_key(row: Dict[str, Any]) -> str:
+    """Identity of a STORY (title + symbols) across sources and rewrites."""
+    title = _strip_leading_tags(str(row.get("title") or ""))
+    symbols = sorted(str(symbol) for symbol in (row.get("symbols") or []) if str(symbol))
+    normalized = _CLUSTER_STRIP.sub("", title).lower()[:_CLUSTER_KEY_CHARS]
+    return "cluster::{0}::{1}".format(normalized, ",".join(symbols))
 
 
 def research_trigger_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -33,10 +62,18 @@ def research_trigger_config(config: Dict[str, Any]) -> Dict[str, Any]:
     cooldown = raw.get("symbol_cooldown_minutes") or 0
     if isinstance(cooldown, bool) or not isinstance(cooldown, int) or cooldown < 0:
         raise ValueError("symbol_cooldown_minutes must be a non-negative integer (0 = off)")
+    cluster_within = raw.get("cluster_within_cycle", True)
+    if not isinstance(cluster_within, bool):
+        raise ValueError("cluster_within_cycle must be boolean")
+    cluster_cooldown = raw.get("cluster_cooldown_minutes") or 0
+    if isinstance(cluster_cooldown, bool) or not isinstance(cluster_cooldown, int) or cluster_cooldown < 0:
+        raise ValueError("cluster_cooldown_minutes must be a non-negative integer (0 = off)")
     return {
         "news_min_priority": news_min,
         "max_per_symbol_per_cycle": cap,
         "symbol_cooldown_minutes": cooldown,
+        "cluster_within_cycle": cluster_within,
+        "cluster_cooldown_minutes": cluster_cooldown,
     }
 
 

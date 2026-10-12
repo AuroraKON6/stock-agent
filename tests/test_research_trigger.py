@@ -121,32 +121,33 @@ class RescanTriggerIntegrationTests(unittest.TestCase):
 
     def test_rescan_applies_trigger_policy(self):
         self.seed("sig-filing", source_type="filing", priority="P3",
-                  url="https://www.cninfo.com.cn/x/f")     # filing: triggers
+                  url="https://www.cninfo.com.cn/x/f", title="甲公司公告")   # filing: triggers
         self.seed("sig-low", source_type="news", priority="P3",
-                  url="https://www.cninfo.com.cn/x/1")      # news P3: skipped
+                  url="https://www.cninfo.com.cn/x/1", title="低优新闻")     # news P3: skipped
         self.seed("sig-high", source_type="news", priority="P1",
-                  url="https://www.cninfo.com.cn/x/2")      # news P1: triggers
+                  url="https://www.cninfo.com.cn/x/2", title="高优新闻")     # news P1: triggers
         report = rescan_pending_events(self.store, config=self.config)
         self.assertEqual(report["created"], 2)
         self.assertEqual(report["skipped_by_trigger"], 1)
+        self.assertEqual(report["skipped_by_cluster"], 0)
         tasks = self.store.list_tasks()
-        titles = sorted(t["title"] for t in tasks)
-        self.assertEqual(len(titles), 2)
+        self.assertEqual(len(tasks), 2)
 
     def test_per_symbol_cap_in_one_cycle(self):
         self.config["task_runtime"]["research_trigger"] = {"max_per_symbol_per_cycle": 1}
-        self.seed("sig-a", source_type="filing", priority="P1", url="https://x.example/a")
-        self.seed("sig-b", source_type="filing", priority="P1", url="https://x.example/b")
-        self.seed("sig-c", source_type="filing", priority="P1", url="https://x.example/c")
+        self.seed("sig-a", source_type="filing", priority="P1", url="https://x.example/a", title="甲事项公告")
+        self.seed("sig-b", source_type="filing", priority="P1", url="https://x.example/b", title="乙事项公告")
+        self.seed("sig-c", source_type="filing", priority="P1", url="https://x.example/c", title="丙事项公告")
         report = rescan_pending_events(self.store, config=self.config)
         self.assertEqual(report["created"], 1)
         self.assertGreaterEqual(report["skipped_by_trigger"], 2)
+        self.assertEqual(report["skipped_by_cluster"], 0)
 
     def test_revision_bypasses_cap(self):
         self.config["task_runtime"]["research_trigger"] = {"max_per_symbol_per_cycle": 1}
-        self.seed("sig-a", source_type="filing", priority="P1", url="https://x.example/a")
+        self.seed("sig-a", source_type="filing", priority="P1", url="https://x.example/a", title="丁事项公告")
         self.seed("sig-rev", source_type="filing", priority="P3", url="https://x.example/a",
-                  content_version="2")
+                  content_version="2", title="丁事项公告")
         report = rescan_pending_events(self.store, config=self.config)
         self.assertEqual(report["created"], 2)
 
