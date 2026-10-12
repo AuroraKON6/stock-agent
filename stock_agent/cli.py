@@ -970,6 +970,12 @@ def main() -> None:
         "overview", help="工作台总览（引擎/行情/事件/任务/预算的只读聚合投影）")
     overview_parser.add_argument("--config", default="config/watchlist.local.json")
 
+    events_view_parser = subparsers.add_parser(
+        "events-view", help="去重事件视图（聚类/来源/修订/关联研究任务，只读投影）")
+    events_view_parser.add_argument("--config", default="config/watchlist.local.json")
+    events_view_parser.add_argument("--lookback-hours", type=int, default=72)
+    events_view_parser.add_argument("--limit", type=int, default=50)
+
     summary_parser = subparsers.add_parser("task-summary", help="Local version-bound summary review; never publication approval")
     summary_parser.add_argument("--config", default="config/watchlist.local.json")
     summary_parser.add_argument("--task-id", required=True)
@@ -1377,6 +1383,8 @@ def main() -> None:
                           args.worker_id, args.max_tasks)
     elif args.command == "overview":
         _overview(args.config)
+    elif args.command == "events-view":
+        _events_view(args.config, args.lookback_hours, args.limit)
     elif args.command == "task-list":
         _task_list(args.config, args.status, args.json)
     elif args.command == "task-run-next":
@@ -1570,6 +1578,25 @@ def _overview(config_path: str) -> None:
         store, _ = _task_store(config_path)
     try:
         payload = build_overview(config, store=store)
+    finally:
+        if store is not None:
+            store.close()
+    print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
+
+
+def _events_view(config_path: str, lookback_hours: int, limit: int) -> None:
+    from .events_view import build_events_view
+
+    config = load_config(config_path)
+    db_path = project_path(str((config.get("task_runtime") or {}).get("db_path")
+                               or "data/task_runtime/tasks.sqlite3"))
+    store = None
+    if db_path.is_file():
+        store, _ = _task_store(config_path)
+    try:
+        payload = build_events_view(config, store=store,
+                                    lookback_hours=max(1, lookback_hours),
+                                    limit=max(1, limit))
     finally:
         if store is not None:
             store.close()
