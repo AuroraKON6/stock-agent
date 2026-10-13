@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.0",
+  "dify_version": "dify-1.7.2-candidate-1",
+  "deployment": {
+    "form": "docker-compose (Dify official) inside WSL2 Ubuntu",
+    "bind": "loopback-only reverse proxy; no public exposure",
+    "prerequisites_missing": [
+      "Docker Engine 未安装（WSL2 Ubuntu 在位但 docker CLI 缺失）",
+      "磁盘/内存配额未测量"
+    ],
+    "compose_profile": {
+      "note": "候选记录，不安装：services=api/worker/web/db/redis/ssl 仅标识"
+    },
+    "ports": {"host_plan": "仅 127.0.0.1 绑定，具体端口 DF-02 前定"}
+  },
+  "capabilities_required": [
+    {"capability": "workflow_api_trigger", "why": "业务入口经 API 触发流程（第一阶段 1）", "verify_how": "DF-03 用临时实例实测；未验证前不部署"},
+    {"capability": "human_input_node", "why": "等待补证/人工问题节点（第一阶段 6）", "verify_how": "DF-03 临时实例实测节点行为"},
+    {"capability": "service_credential_scoping", "why": "受限服务凭据调后端，用途不由模型参数扩大（第一阶段 2）", "verify_how": "DF-02/DF-03 验证凭据 scope 与越权拒绝"},
+    {"capability": "workflow_version_export", "why": "流程版本/制品哈希可追溯（DF-03 验收）", "verify_how": "DF-03 导出 DSL 并登记哈希"}
+  ],
+  "python_boundary": {
+    "python_owns": [
+      "TaskStore/案件状态机、预算、幂等、外发治理、证据验真、结果引用校验",
+      "案件完成/取消/等待人/签收的权威判定；Dify 节点绿色不构成批准"
+    ],
+    "dify_must_not": [
+      "直连业务数据库（SQLite 只归 Python 进程）",
+      "双执行：生产单任务只选一个执行器（过渡期 Pi，DF-04 起逐模块切换）",
+      "凭节点凭据绕过预算或外发审查",
+      "把生产提示词编辑当免审热更新（须发布候选流程版本并评测）"
+    ],
+    "id_binding": "case_id/task_id/input_version/attempt_id/dify_run_id/workflow_version"
+  },
+  "open_questions": [
+    "选定 Dify 版本与自托管许可条款逐条核对（DF-01 验收前完成）",
+    "Human Input / API 触发在选定版本与版本权益下可用性需实测确认",
+    "端口/磁盘/内存配额与备份策略（部署前由负责人确认）"
+  ],
+  "blocked_items": [
+    "安装系统组件/启动服务：BLOCKED（DF-01 只出候选矩阵，不安装）",
+    "开放公网：BLOCKED（仅 loopback 候选）",
+    "任何真实凭据/密钥：BLOCKED（候选配置零密钥）",
+    "生产流程切换/双执行：BLOCKED（DF-04 对照验收后单选）"
+  ]
+}
