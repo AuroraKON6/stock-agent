@@ -1,0 +1,94 @@
+{
+  "schema_version": "1.0",
+  "description": "K01 candidate source-registry entries for Kimi-routed data. Structure only, review candidate: every entry ships pending_human_approval with empty principal, body retention and LLM external send stay false, and nothing here is loaded unless a human copies approved entries into the real config/source_registry.json. Upstream values intentionally name the true corporate upstream (ifind / dongcai), not the transport: the kimi agent-gw route and any direct interface of the same upstream must never be counted as independent corroboration. The financial_statement kind requires the registry schema extension proposed in KIMI_K01_INVENTORY_20261012.md.",
+  "entries": [
+    {
+      "source_id": "kimi_ifind_price",
+      "kind": "price",
+      "upstream": "ifind",
+      "purpose": "Daily OHLCV background and adjustment verification for approved A-share symbols via kimi agent-gw; historical intervals only, never presented as intraday.",
+      "approval": {
+        "state": "pending_human_approval",
+        "approved_by": "",
+        "approved_at": ""
+      },
+      "body_retention_allowed": false,
+      "llm_external_send_allowed": false,
+      "timeliness": {
+        "expected_max_delay_minutes": 1440,
+        "staleness_policy": "flag"
+      },
+      "rate_limit": {
+        "max_requests_per_minute": 1,
+        "max_requests_per_day": 10
+      },
+      "expires_at": "2027-06-30"
+    },
+    {
+      "source_id": "kimi_ifind_filing",
+      "kind": "filing",
+      "upstream": "ifind",
+      "purpose": "A-share announcement metadata (date, title, PDF URL lead) via kimi agent-gw; discovery leads only, official originals still enter via evidence vault import.",
+      "approval": {
+        "state": "pending_human_approval",
+        "approved_by": "",
+        "approved_at": ""
+      },
+      "body_retention_allowed": false,
+      "llm_external_send_allowed": false,
+      "timeliness": {
+        "expected_max_delay_minutes": 1440,
+        "staleness_policy": "flag"
+      },
+      "rate_limit": {
+        "max_requests_per_minute": 1,
+        "max_requests_per_day": 10
+      },
+      "expires_at": "2027-06-30"
+    },
+    {
+      "source_id": "kimi_ifind_financials",
+      "kind": "financial_statement",
+      "upstream": "ifind",
+      "purpose": "Three-statement facts for accounting-basis cross-checks via kimi agent-gw; report period, cumulative basis and restatement version recorded as gaps when unverified.",
+      "approval": {
+        "state": "pending_human_approval",
+        "approved_by": "",
+        "approved_at": ""
+      },
+      "body_retention_allowed": false,
+      "llm_external_send_allowed": false,
+      "timeliness": {
+        "expected_max_delay_minutes": 10080,
+        "staleness_policy": "flag"
+      },
+      "rate_limit": {
+        "max_requests_per_minute": 1,
+        "max_requests_per_day": 10
+      },
+      "expires_at": "2027-06-30"
+    },
+    {
+      "source_id": "kimi_dongcai_news",
+      "kind": "news",
+      "upstream": "dongcai",
+      "purpose": "News and event-lead discovery via kimi agent-gw with minimized query text; provider analysis is never registered as official fact. Same upstream family as direct eastmoney interfaces: not independent corroboration.",
+      "approval": {
+        "state": "pending_human_approval",
+        "approved_by": "",
+        "approved_at": ""
+      },
+      "body_retention_allowed": false,
+      "llm_external_send_allowed": false,
+      "timeliness": {
+        "expected_max_delay_minutes": 60,
+        "staleness_policy": "flag"
+      },
+      "rate_limit": {
+        "max_requests_per_minute": 1,
+        "max_requests_per_day": 10
+      },
+      "expires_at": "2027-06-30"
+    }
+  ]
+}

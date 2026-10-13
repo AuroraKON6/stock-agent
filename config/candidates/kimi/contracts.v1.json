@@ -1,0 +1,159 @@
+{
+  "schema_version": "1.0",
+  "description": "K01 candidate contract snapshot for the first Kimi-routed APIs. Derived by hand from the official gateway describe documents captured locally. This file is a review candidate only: nothing loads it at runtime unless a config explicitly points kimi_integration.contract_snapshot at it, and live calls stay disabled regardless. Field-level unknowns are recorded as null with a reason instead of guessed values.",
+  "captured_from": {
+    "ifind": {
+      "document": "E:/GitHub上下载的/kimi-datasources/docs/ifind.md",
+      "sha256": "6DA217A0BC878D846D3BA02FB652234E046FF17BB7378F0D977CD6F743B49F1D",
+      "captured_at": "2026-10-12"
+    },
+    "dongcai": {
+      "document": "E:/GitHub上下载的/kimi-datasources/docs/dongcai.md",
+      "sha256": "(see docs/implementation/KIMI_K01_ASSET_HASHES_20261012.json)",
+      "captured_at": "2026-10-12"
+    }
+  },
+  "param_types": {
+    "a_share_ticker_list": "comma-separated, 1..max_items entries, each ^[0-9]{6}\\.(SH|SZ|BJ)$; first batch is A-share only",
+    "date": "YYYY-MM-DD, calendar date",
+    "enum": "exact match against options",
+    "statement_selector": "comma-separated subset of {all, balance_sheet, income_statement, cash_flow}; aliases bs/is/cf normalized before validation",
+    "report_period": "8 digits: YYYY followed by one of 0331, 0630, 0930, 1231",
+    "search_query": "natural-language query, max 200 chars, must not contain local paths or credential-like tokens",
+    "virtual_artifact_name": "host-generated only; caller input rejected; value never reflects a real local path"
+  },
+  "apis": [
+    {
+      "api_id": "ifind_get_price",
+      "source_id": "kimi_ifind_price",
+      "data_source_name": "ifind",
+      "api_name": "ifind_get_price",
+      "transport": "kimi_agent_gw",
+      "data_kind": "daily_quote",
+      "purpose": "Daily OHLCV background around a public event; adjustment-basis verification. Not an intraday stream.",
+      "params": {
+        "ticker": {"type": "a_share_ticker_list", "required": true, "max_items": 3},
+        "start_date": {"type": "date", "required": true},
+        "end_date": {"type": "date", "required": true},
+        "file_path": {"type": "virtual_artifact_name", "required": true, "host_generated": true},
+        "format": {"type": "enum", "required": false, "options": ["json", "csv"], "default": "json"},
+        "interval": {"type": "enum", "required": false, "options": ["D", "W", "M", "Q", "Y"], "default": "D"},
+        "adjust": {"type": "enum", "required": false, "options": ["forward", "backward", "none"]}
+      },
+      "constraints": {
+        "max_window_days": 1096,
+        "end_not_before_start": true,
+        "poc": {"max_tickers": 1, "max_window_days": 30, "interval_must_be": "D", "adjust_must_be_explicit": true}
+      },
+      "result_contract": {
+        "envelope": "is_success / error / result.user[].text / result.assistant[].text / files[].{name,content}",
+        "rows_field": "csv rows inside files[] content; max 1000 rows enforced by client",
+        "must_record": ["source_time_availability_unknown", "adjustment", "interval", "currency_unverified"]
+      },
+      "known_unknowns": {
+        "volume_unit": {"value": null, "reason": "contract document does not state share vs lot vs amount"},
+        "currency": {"value": null, "reason": "not stated; CNY assumed for A-shares but unverified"},
+        "source_time": {"value": null, "reason": "response envelope carries no explicit source timestamp field"},
+        "realtime_capability": {"value": false, "reason": "this API is D/W/M/Q/Y historical only; realtime is a separate API not in first batch"}
+      },
+      "notes": [
+        "Contract says omitting adjust makes A-shares forward-adjusted; client requires explicit adjust so the basis is always recorded.",
+        "Default query for 'most recent price' per contract is past 5 days; the host template must still pass explicit dates."
+      ]
+    },
+    {
+      "api_id": "ifind_get_stock_announcement",
+      "source_id": "kimi_ifind_filing",
+      "data_source_name": "ifind",
+      "api_name": "ifind_get_stock_announcement",
+      "transport": "kimi_agent_gw",
+      "data_kind": "announcement_metadata",
+      "purpose": "Announcement candidates and original-document entry points. Metadata only; official originals still enter through the evidence vault import path.",
+      "params": {
+        "ticker": {"type": "a_share_ticker_list", "required": true, "max_items": 3},
+        "start_date": {"type": "date", "required": true},
+        "end_date": {"type": "date", "required": true},
+        "file_path": {"type": "virtual_artifact_name", "required": true, "host_generated": true},
+        "format": {"type": "enum", "required": false, "options": ["json", "csv"], "default": "json"}
+      },
+      "constraints": {
+        "max_window_days": 366,
+        "end_not_before_start": true,
+        "poc": {"max_tickers": 1, "max_window_days": 31}
+      },
+      "result_contract": {
+        "envelope": "same as ifind_get_price",
+        "fields_expected": ["announcement date", "publish time", "title", "PDF URL", "unique sequence number"],
+        "must_record": ["pdf_url_is_lead_only", "no_auto_fetch"]
+      },
+      "known_unknowns": {
+        "max_rows_per_response": {"value": null, "reason": "contract does not state pagination limits"},
+        "correction_linkage": {"value": null, "reason": "whether corrections reference the original sequence number is not documented"}
+      },
+      "notes": [
+        "Returned PDF URLs are discovery leads, never proof of a downloaded or verified official original.",
+        "Default window when dates omitted is 'most recent month'; host templates must always pass explicit dates."
+      ]
+    },
+    {
+      "api_id": "ifind_get_financial_statements",
+      "source_id": "kimi_ifind_financials",
+      "data_source_name": "ifind",
+      "api_name": "ifind_get_financial_statements",
+      "transport": "kimi_agent_gw",
+      "data_kind": "financial_statement",
+      "purpose": "Three-statement facts and accounting-basis cross-checks.",
+      "params": {
+        "ticker": {"type": "a_share_ticker_list", "required": true, "max_items": 3},
+        "statement": {"type": "statement_selector", "required": true},
+        "financial_parameter": {"type": "report_period", "required": true},
+        "file_path": {"type": "virtual_artifact_name", "required": true, "host_generated": true},
+        "format": {"type": "enum", "required": false, "options": ["json", "csv"], "default": "json"}
+      },
+      "constraints": {
+        "poc": {"max_tickers": 1, "max_statements": 1}
+      },
+      "result_contract": {
+        "envelope": "same as ifind_get_price",
+        "must_record": ["report_period", "cumulative_vs_single_quarter_unverified", "restatement_version_unknown", "announcement_time_unknown"]
+      },
+      "known_unknowns": {
+        "cumulative_basis": {"value": null, "reason": "A-share statements are typically year-to-date cumulative; contract does not confirm the basis per column"},
+        "consolidation_scope": {"value": null, "reason": "consolidated vs parent not stated"},
+        "restatement_policy": {"value": null, "reason": "whether re-requesting an old period returns the restated version is undocumented"}
+      },
+      "notes": [
+        "A-share cumulative reporting differs from US single-quarter conventions; downstream must not infer quarterly deltas without an explicit basis statement.",
+        "Statement aliases bs/is/cf are normalized to canonical names before send."
+      ]
+    },
+    {
+      "api_id": "dongcai_mx_finance_search",
+      "source_id": "kimi_dongcai_news",
+      "data_source_name": "dongcai",
+      "api_name": "dongcai_mx_finance_search",
+      "transport": "kimi_agent_gw",
+      "data_kind": "news_metadata",
+      "purpose": "News and event-lead discovery. Only metadata/excerpts within granted rights enter the pipeline; no full-text scraping by default.",
+      "params": {
+        "query": {"type": "search_query", "required": true, "max_length": 200},
+        "file_path": {"type": "virtual_artifact_name", "required": false, "host_generated": true}
+      },
+      "constraints": {
+        "poc": {"max_queries_per_event": 1}
+      },
+      "result_contract": {
+        "envelope": "same as ifind_get_price",
+        "must_record": ["provider_analysis_is_not_official_fact", "url_is_lead_only"]
+      },
+      "known_unknowns": {
+        "result_row_fields": {"value": null, "reason": "contract documents no response schema"},
+        "dedup_key": {"value": null, "reason": "no documented stable event id"}
+      },
+      "notes": [
+        "Dongcai contract also offers report-generation and analysis APIs; those stay off the whitelist and are rejected as unsupported for this project.",
+        "The query text itself is external data egress: minimal symbol/topic only, never full workpapers."
+      ]
+    }
+  ]
+}

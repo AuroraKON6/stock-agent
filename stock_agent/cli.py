@@ -981,6 +981,17 @@ def main() -> None:
     events_view_parser.add_argument("--lookback-hours", type=int, default=72)
     events_view_parser.add_argument("--limit", type=int, default=50)
 
+    kimi_status_parser = subparsers.add_parser(
+        "kimi-data-status",
+        help="Kimi 数据接入分层健康状态（只读：不联网、不扣额度、不写任何文件）")
+    kimi_status_parser.add_argument("--config", default="config/watchlist.local.json")
+
+    queries_view_parser = subparsers.add_parser(
+        "queries-view", help="Kimi 数据查询账本视图（谁请求了什么/为何被拦/费用与重试，只读投影）")
+    queries_view_parser.add_argument("--config", default="config/watchlist.local.json")
+    queries_view_parser.add_argument("--limit", type=int, default=50)
+    queries_view_parser.add_argument("--purpose", default="")
+
     todo_view_parser = subparsers.add_parser(
         "todo-view", help="待办视图（等待人工的问题/被阻断任务/复核队列，只读聚合）")
     todo_view_parser.add_argument("--config", default="config/watchlist.local.json")
@@ -1400,6 +1411,10 @@ def main() -> None:
         _overview(args.config)
     elif args.command == "events-view":
         _events_view(args.config, args.lookback_hours, args.limit)
+    elif args.command == "kimi-data-status":
+        _kimi_data_status(args.config)
+    elif args.command == "queries-view":
+        _queries_view(args.config, args.limit, args.purpose)
     elif args.command == "todo-view":
         _todo_view(args.config)
     elif args.command == "ops-view":
@@ -1619,6 +1634,22 @@ def _events_view(config_path: str, lookback_hours: int, limit: int) -> None:
     finally:
         if store is not None:
             store.close()
+    print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
+
+
+def _kimi_data_status(config_path: str) -> None:
+    from .queries_view import build_kimi_data_status
+
+    config = load_config(config_path)
+    payload = build_kimi_data_status(config)
+    print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
+
+
+def _queries_view(config_path: str, limit: int, purpose: str) -> None:
+    from .queries_view import build_queries_view
+
+    config = load_config(config_path)
+    payload = build_queries_view(config, limit=max(1, limit), purpose=str(purpose or ""))
     print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
 
 

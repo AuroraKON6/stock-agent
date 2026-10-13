@@ -151,6 +151,10 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   <summary>事件（去重，72h）<span id="evcount"></span></summary>
   <div id="evlist"></div>
 </details>
+<details id="queries" class="evsec">
+  <summary>数据查询（Kimi 账本，只读）<span id="kqcount"></span></summary>
+  <div id="kqlist"></div>
+</details>
 <details id="ops" class="evsec">
   <summary>运行（引擎/预算/登记/投影）</summary>
   <div id="opslist"></div>
@@ -484,6 +488,38 @@ Personal acknowledgement is a personal research acknowledgement, not institution
       .then(showEvents)
       .catch(function() { /* events section stays empty; the board works */ });
   }
+
+  // ---- queries section (Kimi data-query ledger from /api/v1/queries-view) ----
+  var kqList = document.getElementById('kqlist');
+  var kqCount = document.getElementById('kqcount');
+  function showQueries(view) {
+    if (!view || !Array.isArray(view.queries)) return;
+    kqCount.textContent = '（' + (view.query_count || view.queries.length) + '）';
+    kqList.innerHTML = view.queries.map(function(q) {
+      var result = q.result || {};
+      var params = Object.keys(q.params || {}).map(function(k) {
+        return '<span class="src">' + esc(k) + '=' + esc(q.params[k]) + '</span>';
+      }).join(' ');
+      return '<div class="ev">'
+        + '<span class="t">' + esc(q.api_id || q.source_id) + '</span>'
+        + '<span class="src">' + esc(q.data_kind) + '</span>'
+        + (result.outcome
+            ? '<span class="tl ' + (result.outcome === 'ok' ? 'succeeded' : 'failed') + '">'
+              + esc(result.outcome_label || result.outcome) + '</span>'
+              + '<span class="src">费用:' + esc(result.cost_status || 'unknown') + '</span>'
+              + (result.attempts ? '<span class="src">×' + esc(result.attempts) + '</span>' : '')
+            : '<span class="muted">无发送（门禁拦截或未启用）</span>')
+        + params
+        + '<span class="when">' + esc(String(q.created_at || '').replace('T', ' ').slice(0, 16)) + '</span>'
+        + '</div>';
+    }).join('');
+  }
+  function fetchQueries() {
+    fetch('/api/v1/queries-view')
+      .then(function(r) { if (!r.ok) throw new Error('queries request failed'); return r.json(); })
+      .then(showQueries)
+      .catch(function() { /* queries section stays empty; the board works */ });
+  }
   evList.addEventListener('click', function(ev) {
     var link = ev.target.closest ? ev.target.closest('[data-tasklink]') : null;
     if (link) openDetail(link.getAttribute('data-tasklink'));
@@ -560,7 +596,7 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   });
   document.addEventListener('keydown', function(ev) { if (ev.key === 'Escape') closeDetail(); });
   var es = new EventSource('/api/v1/events');
-  es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); fetchOverview(); fetchEvents(); fetchTodo(); fetchOps(); };
+  es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); fetchOverview(); fetchEvents(); fetchQueries(); fetchTodo(); fetchOps(); };
   es.onerror = function() { conn.textContent = 'RECONNECTING'; conn.className = 'down'; };
   es.onmessage = function(ev) { refresh(); };
   // Read-only hook for automated browser verification of the render contract
@@ -572,8 +608,10 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   window.__taskBoardEvents = showEvents;
   window.__taskBoardTodo = showTodo;
   window.__taskBoardOps = showOps;
+  window.__taskBoardQueries = showQueries;
   fetchOverview();
   fetchEvents();
+  fetchQueries();
   fetchTodo();
   fetchOps();
   refresh();
@@ -690,6 +728,19 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     payload = build_events_view(self.server.board_config, store=store)
                 except Exception as exc:  # projection; degrade honestly
                     self._send_json(503, {"error": "events view unavailable: {0}".format(type(exc).__name__)})
+                    return
+            self._send_json(200, payload)
+            return
+        if parsed.path == "/api/v1/queries-view":
+            # Kimi data-query ledger projection: read-only, never triggers a
+            # gateway call or quota consumption.
+            from .queries_view import build_queries_view
+
+            with self.server.board_lock:
+                try:
+                    payload = build_queries_view(self.server.board_config)
+                except Exception as exc:  # projection; degrade honestly
+                    self._send_json(503, {"error": "queries view unavailable: {0}".format(type(exc).__name__)})
                     return
             self._send_json(200, payload)
             return

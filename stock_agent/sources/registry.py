@@ -17,7 +17,7 @@ from ..config import project_path
 SCHEMA_VERSION = "1.0"
 DEFAULT_REGISTRY_PATH = "config/source_registry.json"
 APPROVAL_STATES = {"pending_human_approval", "approved", "denied", "withdrawn"}
-SOURCE_KINDS = {"news", "filing", "price", "manual_intel"}
+SOURCE_KINDS = {"news", "filing", "price", "financial_statement", "manual_intel"}
 STALENESS_POLICIES = {"reject", "flag"}
 # Approval principals must look human; service/system accounts are rejected.
 _NON_HUMAN_PRINCIPAL_MARKERS = ("stock_agent_", "service", "system", "bot", "agent:", "_agent")

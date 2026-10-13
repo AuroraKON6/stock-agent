@@ -205,6 +205,87 @@ def render_market_data_governance_markdown(summary: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _assess_historical_background(
+    payload: Dict[str, Any],
+    cfg: Dict[str, Any],
+    current: datetime,
+    symbol: str,
+    provider: str,
+    origin_provider: str,
+    provider_authorized: bool,
+) -> Dict[str, Any]:
+    """Validation lane for daily-bar event background (plan section 7.3.5).
+
+    Staleness is judged against the query's own declared window, never
+    against live-quote thresholds; the gate result is explicitly marked
+    not-live so downstream UI never shows it as an intraday quote. LLM
+    eligibility still requires provider attestation like any other price
+    path; existing realtime gates are untouched.
+    """
+    quote_value = _first_value(
+        payload,
+        ("quote_timestamp", "tick_time", "trade_timestamp", "timestamp", "updated_at"),
+    )
+    quote_at = _parse_datetime(quote_value, cfg["timezone"])
+    window = payload.get("history_window") if isinstance(payload.get("history_window"), dict) else {}
+    window_start = _parse_datetime(window.get("start"), cfg["timezone"])
+    window_end = _parse_datetime(window.get("end"), cfg["timezone"])
+    frequency = str(payload.get("frequency") or "D")
+    reasons: List[str] = []
+    status = "PASS"
+    if cfg["require_authorized_provider_for_llm"] and not provider_authorized:
+        status = "BLOCKED"
+        reasons.append("provider_not_internally_attested")
+    if quote_at is None:
+        status = "BLOCKED"
+        reasons.append("missing_quote_date_for_historical_background")
+    elif _is_future_timestamp(quote_at, current):
+        status = "BLOCKED"
+        reasons.append("future_quote_timestamp")
+    else:
+        if window_start is not None and quote_at < window_start:
+            status = "BLOCKED"
+            reasons.append("quote_before_declared_window")
+        if window_end is not None and quote_at > window_end:
+            status = "BLOCKED"
+            reasons.append("quote_after_declared_window")
+    if status != "BLOCKED":
+        status = "DEGRADED"
+        reasons.append("historical_background_not_live")
+    llm_eligible = (
+        status == "DEGRADED"
+        and not (cfg["require_authorized_provider_for_llm"] and not provider_authorized)
+    )
+    return {
+        "version": MARKET_DATA_GOVERNANCE_VERSION,
+        "enabled": True,
+        "policy_type": "internal_research_operating_control_not_regulatory_deadline",
+        "data_scope": "historical_background",
+        "frequency": frequency,
+        "status": status,
+        "llm_eligible": bool(llm_eligible),
+        "human_review_required": not llm_eligible,
+        "symbol": symbol,
+        "provider": provider,
+        "origin_provider": origin_provider,
+        "provider_internally_attested": provider_authorized,
+        "provider_attestation_scope": "internal research and external-model use",
+        "is_cache": False,
+        "session": _market_session(current, cfg),
+        "quote_timestamp": quote_at.isoformat(timespec="seconds") if quote_at else "",
+        "declared_window": {
+            "start": window_start.isoformat(timespec="seconds") if window_start else "",
+            "end": window_end.isoformat(timespec="seconds") if window_end else "",
+        },
+        "reason_codes": reasons,
+        "assessed_at": current.isoformat(timespec="seconds"),
+        "summary": (
+            "daily-bar background; validated against the declared query window, "
+            "never presented as an intraday quote"
+        ),
+    }
+
+
 def _assess_one(
     signal: Any,
     cfg: Dict[str, Any],
@@ -254,6 +335,15 @@ def _assess_one(
             "reason_codes": [],
             "assessed_at": current.isoformat(timespec="seconds"),
         }
+
+    if payload.get("data_scope") == "historical_background":
+        # Daily bars delivered as event background must not be forced through
+        # live-quote staleness thresholds (a week-old daily close is the point,
+        # not a violation). They get their own validation — declared window,
+        # no future dates, provider attestation — and are explicitly labeled
+        # as not-live so they can never masquerade as realtime quotes.
+        return _assess_historical_background(
+            payload, cfg, current, symbol, provider, origin_provider, provider_authorized)
 
     if cfg["require_authorized_provider_for_llm"] and not provider_authorized:
         status = "BLOCKED"

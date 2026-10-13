@@ -1,0 +1,1296 @@
+{
+ "generated_at": "2026-10-12",
+ "roots": {
+  "kimi-finance-skills": {
+   "root": "E:\\GitHub上下载的\\kimi-finance-skills",
+   "exists": true,
+   "packages": {
+    "dynamic-finance-charts": {
+     "skill_md_count": 1,
+     "skills": [
+      {
+       "path": "skills/dynamic-finance-charts/SKILL.md",
+       "sha256": "9978A2EC7B8813F2FEE26BABB2F4C505F4135D4E7F5C6E97C87ED1637260CC23",
+       "bytes": 19800
+      }
+     ],
+     "license_files": {},
+     "manifests": {
+      "kimi.plugin.json": "CC048B4347F86BEEDE0D2D394F285558F6AFF38ADFB326C709435C323BE623FB"
+     }
+    },
+    "financial-market-terminal": {
+     "skill_md_count": 14,
+     "skills": [
+      {
+       "path": "skills/financial-market-terminal/SKILL.md",
+       "sha256": "216E73F563D713E527878C99DAE020154C71C7F71E11D4085BB50EE63F3D13B4",
+       "bytes": 16246
+      },
+      {
+       "path": "skills/financial-market-terminal-widgets/SKILL.md",
+       "sha256": "46F7C31DD4195BFD05EBBD94DC251D48267EEF9525A1FE69BCE157393C1E3E2C",
+       "bytes": 24025
+      },
+      {
+       "path": "skills/mkt-datasource-caixin/SKILL.md",
+       "sha256": "ABE78B5F844E3C062D4B3215D503510F918F97974015FB2F328D7E0042B7B9D7",
+       "bytes": 3524
+      },
+      {
+       "path": "skills/mkt-datasource-cls/SKILL.md",
+       "sha256": "7C87F8563B9FBE51185E542ECFDE6E7606E0E3A1ED43F1411CBF6F2BDDFAC080",
+       "bytes": 5127
+      },
+      {
+       "path": "skills/mkt-datasource-dongcai/SKILL.md",
+       "sha256": "874F41E4A5C93307136F3753D19AF4642A1848DC79AE1C85B25F505766475A5C",
+       "bytes": 2655
+      },
+      {
+       "path": "skills/mkt-datasource-finance-research/SKILL.md",
+       "sha256": "D73C7FF596C07BDC973B1010105EAD3D3CBB454A587E0F6A4679B6A303CE566C",
+       "bytes": 6937
+      },
+      {
+       "path": "skills/mkt-datasource-gildata/SKILL.md",
+       "sha256": "B9D984B85006C2760E48EBEE0B88EC500D4905ACDAA7ECFBB1DDFD373132526C",
+       "bytes": 7568
+      },
+      {
+       "path": "skills/mkt-datasource-ifind/SKILL.md",
+       "sha256": "8639D1276E2F8A059E1E98953030DB7A66C2BA48968498EE8087AFD659625122",
+       "bytes": 6052
+      },
+      {
+       "path": "skills/mkt-datasource-igo/SKILL.md",
+       "sha256": "241114B8F673E20530FC9B576E4C0CF54C188863CC467FD5C65AF4A814062C12",
+       "bytes": 2934
+      },
+      {
+       "path": "skills/mkt-datasource-sp/SKILL.md",
+       "sha256": "78BEA442FDAC31F824D1536B46F6AD98349196CAADB81EC6FADFC89F27309B41",
+       "bytes": 6205
+      },
+      {
+       "path": "skills/mkt-datasource-wind/SKILL.md",
+       "sha256": "4C7CA244F9360281FF6005D6858D8FDCEA947419057977DD745F11CD814CEF36",
+       "bytes": 6735
+      },
+      {
+       "path": "skills/mkt-datasource-wind-mcp/SKILL.md",
+       "sha256": "AAD1AA7C0BAAF38E6CD5A1B60ADC9842F5D72FFF34F9ACE99A107DF857150B53",
+       "bytes": 13762
+      },
+      {
+       "path": "skills/mkt-datasource-xhcj/SKILL.md",
+       "sha256": "641D1561563EBC153A98839EB2C7B4C30744B2EC4A35C5D1D9E964BFDA0182B7",
+       "bytes": 2704
+      },
+      {
+       "path": "skills/mkt-datasource-yahoo/SKILL.md",
+       "sha256": "8F3D4DC4F56C5F70B5789153A97669486CCAAFDC642EE482486F25B275FEC8D0",
+       "bytes": 5230
+      }
+     ],
+     "license_files": {},
+     "manifests": {
+      "kimi.plugin.json": "65AA9B864D5BA2FB6543CFDC7138B8A86B5A77FA44242EC1E6EC7ACFD99621A8"
+     }
+    },
+    "institutional-finance-kit": {
+     "skill_md_count": 22,
+     "skills": [
+      {
+       "path": "skills/consensus-map/SKILL.md",
+       "sha256": "97CA1F21F9B6AD45E3883BAB7597629683F98D0D22811638D72D6C4874B09DAF",
+       "bytes": 17936
+      },
+      {
+       "path": "skills/credit-report/SKILL.md",
+       "sha256": "5FCFD1EFA1AFBD1E9938B524CD07A34D00DB8FAE69A2F58A5F7B5BC753679E7E",
+       "bytes": 27082
+      },
+      {
+       "path": "skills/data-registry/SKILL.md",
+       "sha256": "D91A33A11B3F94AF8D2F3702B6D8515370BA2F059FCCD3F9BE20BA33235E00AE",
+       "bytes": 34247
+      },
+      {
+       "path": "skills/data-routing/SKILL.md",
+       "sha256": "551F7A75BDE4AED936C83535C1D555C0F5AB0F2657F4282DAF15722749AE9AF5",
+       "bytes": 20104
+      },
+      {
+       "path": "skills/earnings-review/SKILL.md",
+       "sha256": "ACBBA70CBDDDEEE5BA4C9FB21A5EE27488AF744D8BE819177590C2C6B0622753",
+       "bytes": 31835
+      },
+      {
+       "path": "skills/finance-data/SKILL.md",
+       "sha256": "E540118A8B769DE798C1299E810F3E285595172EE08795DB18076A3B009102C2",
+       "bytes": 18698
+      },
+      {
+       "path": "skills/finance-skills-set/SKILL.md",
+       "sha256": "B09FF8D277381FEA85B1C941FE16F1A3C7DB8BB6211E9AFC95A4CF51F84FF608",
+       "bytes": 7876
+      },
+      {
+       "path": "skills/hk-ipo-lens/SKILL.md",
+       "sha256": "99B497E18B6A9AF41CD7A390BA48E89B9C2DC6E39004D04357E904AB442A9BC9",
+       "bytes": 28801
+      },
+      {
+       "path": "skills/institutional-financial-modeling/call-anatomy/SKILL.md",
+       "sha256": "05A1C1EE8F74467A5AD6037610252B1425D7A8694D4ADB850EE6B6861BB676F9",
+       "bytes": 9787
+      },
+      {
+       "path": "skills/institutional-financial-modeling/comps_setter/SKILL.md",
+       "sha256": "56401D98DD01E7FCC97EBCB986F799C7A16CBDCB9E6D3D02972FC94DB312CDF7",
+       "bytes": 7717
+      },
+      {
+       "path": "skills/institutional-financial-modeling/dcf-model/SKILL.md",
+       "sha256": "9319EB95BED3F656BDBFB439A778EFC1CDAF4AEDAE1644FB686598BFA41ED859",
+       "bytes": 11428
+      },
+      {
+       "path": "skills/institutional-financial-modeling/driver_setter/SKILL.md",
+       "sha256": "CCD4F788964F0BAFD47560AA4805BE2F1D16A1A6779E84E95A8C5A30298F6E52",
+       "bytes": 16153
+      },
+      {
+       "path": "skills/institutional-financial-modeling/guidance_history/SKILL.md",
+       "sha256": "CE411C3D5B389D5CD41FD32C3ADADED972774455C49A5B43DB56E2413484EB21",
+       "bytes": 20871
+      },
+      {
+       "path": "skills/institutional-financial-modeling/model_basics/SKILL.md",
+       "sha256": "F86AABD52AD3E4FFED4CCAD04AB35FB62A4DB2DF029C607EF41E788E04378A66",
+       "bytes": 19289
+      },
+      {
+       "path": "skills/institutional-financial-modeling/SKILL.md",
+       "sha256": "98ECB0BEEDFB31B1A392BDFEBF866B7CBECC7E7C7519D033394196CD1218CDB4",
+       "bytes": 5789
+      },
+      {
+       "path": "skills/institutional-research-report/render/SKILL.md",
+       "sha256": "9364C1685360C121085AF52840FF6F4574A77AD3766ED0C129F71FCE7CA66E20",
+       "bytes": 5167
+      },
+      {
+       "path": "skills/institutional-research-report/SKILL.md",
+       "sha256": "512219B27AEDBD762B4C6501EDC8B06FF21DC146597CAC7F4EE50B4E0EB46DCF",
+       "bytes": 8460
+      },
+      {
+       "path": "skills/institutional-slides/ic-outliner/SKILL.md",
+       "sha256": "02BB6032E69D3D5D4067FEC63AE6701ABF8D7637011DD758F5388F435F49C100",
+       "bytes": 2909
+      },
+      {
+       "path": "skills/institutional-slides/SKILL.md",
+       "sha256": "83349720638AFD67545EEE8DA510954E4949CC97332AD0E03CA0671196294868",
+       "bytes": 41335
+      },
+      {
+       "path": "skills/ipo-inquiry/SKILL.md",
+       "sha256": "5BDB98F872249BE2311B5BC74A13D19F6A85DA0A8B94CA74233850AD978128EF",
+       "bytes": 28225
+      },
+      {
+       "path": "skills/morning-briefing/SKILL.md",
+       "sha256": "0C9A92CABE4FC66F72E73BE6D3572C29ABD3360241B201C564509DE564809BCD",
+       "bytes": 63387
+      },
+      {
+       "path": "skills/portfolio-review/SKILL.md",
+       "sha256": "3F16F7E624AF39B9C39C300418D58DDC184D32FEDCAF825C3F0D68A98B936192",
+       "bytes": 26178
+      }
+     ],
+     "license_files": {
+      "LICENSE": "23CC68E17992E0B512AE2E80AFC5787D7D8E0FBFBDB4FFF54EC0245508FA400E",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/jszip/lib/license_header.js": "27873ABEEC2DF3693480A8D1B8FE17DD61BEE843D1B39C1C9CFAB57FFE93099E",
+      "skills/institutional-slides/assets/icons-phosphor/LICENSE": "DDBE6082EC3CF979DB47E5AF549D2849C5D6182B3E005EF91CE1DBB9EB122F11"
+     },
+     "manifests": {
+      "skills/institutional-research-report/render/scripts/package.json": "39DE7E49C56A3D8572CCEA0EDEA8E752C9CAFCD0B10166AD6D61CC68227C5433",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/core-util-is/package.json": "0067BCD4EF1C86DA02A45AD770883B39A9D14AA0B00113071609D5FB3DCE0BC0",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/docx/package.json": "DE7F51A4CB346AAB249C2D3D37D0508531B3CBCC13B83597FE9CB1EEDE084695",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/hash.js/package.json": "B97D8C10D1ED1B3355394A6A0CF9846716E39E87D32EE13E7EDD56195B9B8950",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/immediate/package.json": "1E40D711CE5348D237F7A2093D1707CA7C34FC56369F6BE10C8E2DC9BCAE0A96",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/inherits/package.json": "BE645800BC94FD8DE29C8AE91690549B316CC437100108AEEA7B2F347693CC80",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/isarray/package.json": "93165CE56E458216C18240CD961A522AF5B18E51DA06F55D88AC552234455D95",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/jszip/package.json": "83569B5B130B5EC27AE281ED80420AD364BAF1BF64CB82E6AC8FB891E1B4EC4C",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/lie/package.json": "3FAAFB3B558146534B1849E6D2ED8A9C9C88EFF27EF868827D8DE17B979CF701",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/minimalistic-assert/package.json": "9A8E71D52EADCFAE410D56953BF873E4089903001C872F964FC529FE906B8335",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/nanoid/package.json": "07AC373149102D5A442DB2AA0FEF31C53EF5652E718FB96752000E6D99328DC4",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/pako/package.json": "0014F350A6834ED6A2D1211E0A2E3AA471CB426EDF63379C785F9647EA2B4E01",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/process-nextick-args/package.json": "6D6D93D057F39BC3173D53E694B61833FD0CE89C1D669156169136D31A968131",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/readable-stream/package.json": "67BDE829E31CBA3F50C77D14A30FA0F2295223B7FFA07F3B84606A5A79BB97F8",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/safe-buffer/package.json": "3D8B6D944BE9E931A178914AFBB3D6B79BFA199C032872B687BED41ED996C747",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/sax/package.json": "D7E5FF764B48B9532D1B9A8B481B8D54336E6309E362571E993645B790BEA657",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/setimmediate/package.json": "56C7968C8062AD56E94B8DDB477E514098E0FA34B060AA86B67232FDB12E184D",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/string_decoder/package.json": "E278CA18803862A6D1B6BEDC6A3394159AC86E5C4A162614FEF006C79DCDA3A2",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/util-deprecate/package.json": "7BBA467F049074957E693FC06672848B040C38FA071B6EED8690F5FBE090A8B2",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/xml/package.json": "5CF857A6BDDA759C053C171444F9E2AD77C8FD4F8B0007F447F210228A42241C",
+      "skills/institutional-research-report/render/scripts/vendor/node_modules/xml-js/package.json": "71B38B1B2915848C890FE8C5EFFD006B61AFF674E163FE87CF47AA0DBB2F61BA",
+      "skills/institutional-slides/assets/covers/manifest.json": "C844F40F212D3F20D2F77FB0697220376D012309AC8589AF9DC6A4978F731F13",
+      "skills/institutional-slides/reference/manifest.json": "3AFB2346B6A234A32F7C0CABCC2EE0C24D743508B7DB06210F1D2F5895CE8ACC",
+      "kimi.plugin.json": "A1D7104E78267CA8F272ED2E408210AD34A56A64C019D8B8D93CE32430121495"
+     }
+    },
+    "xtt-corporate-finance-accounting": {
+     "skill_md_count": 41,
+     "skills": [
+      {
+       "path": "skills/audit-controls/SKILL.md",
+       "sha256": "ECED6C308B769FBA1743F778E49E0B092896B2B863195C3B3AF47BC29E079E3E",
+       "bytes": 1716
+      },
+      {
+       "path": "skills/audit-controls/subskills/approval-workflow-check/SKILL.md",
+       "sha256": "8F3A0CF259D70C1B04FA87C1E5EBFD3DFE331FB49A21F98B63AF1731092AEF0D",
+       "bytes": 5500
+      },
+      {
+       "path": "skills/audit-controls/subskills/audit-workpaper-prep/SKILL.md",
+       "sha256": "E5C97A0B8B2273D83BC0CACA13C909888792BCF2C91FA37DAB3D3338947119ED",
+       "bytes": 3595
+      },
+      {
+       "path": "skills/audit-controls/subskills/sox-controls-testing/SKILL.md",
+       "sha256": "9C71E3BAF9E9BCA885864CBF51B6830D55ABC44090F32B719F983FE0F1FABE4F",
+       "bytes": 3858
+      },
+      {
+       "path": "skills/china-tax-vat/SKILL.md",
+       "sha256": "2D278138A2937695C4B7195C0CE0E458CB2326EC6A776B70799491D33D029498",
+       "bytes": 4441
+      },
+      {
+       "path": "skills/close-management/SKILL.md",
+       "sha256": "5C0DE6842A8E6F2201F069734ACA3F87DBC7719CEEE75C68BD49EB0F6A51F22E",
+       "bytes": 1882
+      },
+      {
+       "path": "skills/close-management/subskills/close-checklist/SKILL.md",
+       "sha256": "5A08649F1903483284C50F8483862BC010B75B51958CC53F90131EEFA2489CF4",
+       "bytes": 5385
+      },
+      {
+       "path": "skills/close-management/subskills/journal-entry-prep/SKILL.md",
+       "sha256": "BC8ADC150515267B77681D5B757E89DCA5099AD99F4B8DB2C986C1364C3243C6",
+       "bytes": 4023
+      },
+      {
+       "path": "skills/close-management/subskills/trial-balance-loader/SKILL.md",
+       "sha256": "D5D6FC42799CA8E2980AF35A7433C457A8EF415BB2B55D7967DB4E35A85D2876",
+       "bytes": 5125
+      },
+      {
+       "path": "skills/datasource-router/SKILL.md",
+       "sha256": "1BCBBB7BDBF22BF8E8BFEEE67E1458FA7D7C2E43B6AB9580D2853B004236EB4A",
+       "bytes": 7607
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-finance-research/SKILL.md",
+       "sha256": "F3DE7BFDF519B1AD6ED3102DF0B620977799E4CF10D81C7BEDA05971FB4F8D15",
+       "bytes": 6937
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-gildata/SKILL.md",
+       "sha256": "8E7AC3D5BBDC77C1C681851D120F1E4C299F823273ADB53D32B577011E862100",
+       "bytes": 7568
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-ifind/SKILL.md",
+       "sha256": "90F4CBB68B9E079F5FA2A9DF422BA7AB34270D834B21ADA4E3523C7AC438CD96",
+       "bytes": 6052
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-igo/SKILL.md",
+       "sha256": "A585EBFB34984FC25D38E574C32CD02B6164CEF444A8FB8B29E2B9612325D922",
+       "bytes": 2938
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-imf/SKILL.md",
+       "sha256": "326331661A1EEAD9429DF5A3D9167ABE26532951E2659EB5A5A60C5597185774",
+       "bytes": 1837
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-sec/SKILL.md",
+       "sha256": "C104564C3E5C7D9055AD95D67B76B99FA493D637E3DEB59F8864BBB362991E21",
+       "bytes": 4995
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-spglobal/SKILL.md",
+       "sha256": "A1DD32385BCA5B64F8973D07A5435BD2BC04284BA77D0185DD7CB2CD5D4514A4",
+       "bytes": 6211
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-tianyancha/SKILL.md",
+       "sha256": "C770FD99851FF78940C3C85F7D6552DB211AF25372A266937F733A151CEA7E7F",
+       "bytes": 1976
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-wind/SKILL.md",
+       "sha256": "C70A8424609AC77C592DF6E037E5BA0BB402E55C80377988BE20C2CD036E231E",
+       "bytes": 6735
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-wind/wind-mcp-skill/SKILL.md",
+       "sha256": "0167FA7B15AF84392DB49473DB21225B0D1A2C6E1C69281A5B1930C16C6D2CF4",
+       "bytes": 12812
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-worldbank/SKILL.md",
+       "sha256": "543E96A22E036E99C5DB3427F41F1EEF3E15C57B66B6C6C972C7932918BD6F7A",
+       "bytes": 1928
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-yahoo/SKILL.md",
+       "sha256": "56B06155BF5746ED7356FEF718820F75CD08CDA09426FDDC1DAE6BF49B70091E",
+       "bytes": 5230
+      },
+      {
+       "path": "skills/fund-accounting/SKILL.md",
+       "sha256": "BB0A5EDD313099B8803C87D84E10B597276C9C12A6506761BD080F74539DF3F5",
+       "bytes": 1539
+      },
+      {
+       "path": "skills/fund-accounting/subskills/fund-nav-tieout/SKILL.md",
+       "sha256": "94DDFB25AFD472ACB6B7ED030E76612172FC67154F99E3BEF317FF403191CBFF",
+       "bytes": 4552
+      },
+      {
+       "path": "skills/fund-accounting/subskills/waterfall-carry-calc/SKILL.md",
+       "sha256": "22DCE1F9EFB3FEA625253E0E7AEE6193DC3C73486125C3269FF1CB9888790FD7",
+       "bytes": 4280
+      },
+      {
+       "path": "skills/reconciliation/SKILL.md",
+       "sha256": "7E84DAE1940D53DBC9EF05E1F4F31760874AE819EAA40C48A701F980E26691DD",
+       "bytes": 1626
+      },
+      {
+       "path": "skills/reconciliation/subskills/bank-recon/SKILL.md",
+       "sha256": "654C1A6ECACF253BC02A661542C47231BB0FEC2D24379331046301E9804E18C0",
+       "bytes": 5210
+      },
+      {
+       "path": "skills/reconciliation/subskills/gl-recon/SKILL.md",
+       "sha256": "B87F2BE8A2EB5EAE1D0415637358B2DCC785E6F757A470E81E5AEB8A6A9BC9CD",
+       "bytes": 4994
+      },
+      {
+       "path": "skills/reconciliation/subskills/intercompany-recon/SKILL.md",
+       "sha256": "CE4C07BBECE739576B53D58940F72C528E8553E4D963EAA35A05C0D338E9A855",
+       "bytes": 4084
+      },
+      {
+       "path": "skills/report-production/SKILL.md",
+       "sha256": "D0CA242CC5912038BA78B0EB42E3F444BA06CFA4319B0ED98241B08DD048765B",
+       "bytes": 1228
+      },
+      {
+       "path": "skills/report-production/subskills/design-polish/SKILL.md",
+       "sha256": "C84CABE7EAFD44F666A48508D72D38543762C1127F1BFAAB8DB0892F43F0E885",
+       "bytes": 15282
+      },
+      {
+       "path": "skills/report-production/subskills/report-output-router/SKILL.md",
+       "sha256": "E288BF85D3A6DB163FA61DC364546D828649E2F6F617D274ABC705FC5C075864",
+       "bytes": 2492
+      },
+      {
+       "path": "skills/reporting-fpa/SKILL.md",
+       "sha256": "4AE4ADA97249380493DC859C147A268F8E1C8EF2C5EF129C512E044FB7F994DC",
+       "bytes": 2099
+      },
+      {
+       "path": "skills/reporting-fpa/subskills/cash-flow-forecast/SKILL.md",
+       "sha256": "E052AAC943DB141E210A47C5F6C2801351B14C18BFD6AE083EB62012358D75A6",
+       "bytes": 3862
+      },
+      {
+       "path": "skills/reporting-fpa/subskills/financial-statement-tieout/SKILL.md",
+       "sha256": "40B693D82E4A094A005D7C5433FBE44421DE40DEB4F531F4F913B5D9E56B86BD",
+       "bytes": 5315
+      },
+      {
+       "path": "skills/reporting-fpa/subskills/financial-statements/SKILL.md",
+       "sha256": "E26092BA51E2B4826878A5584C650529FE5C12E9C66B546B58FC1DC49AC42760",
+       "bytes": 4064
+      },
+      {
+       "path": "skills/reporting-fpa/subskills/management-reporting/SKILL.md",
+       "sha256": "E5A48C7485430D101F15E007758C0723E086A5298D36580FEB94D40655E727AE",
+       "bytes": 3675
+      },
+      {
+       "path": "skills/reporting-fpa/subskills/variance-commentary/SKILL.md",
+       "sha256": "F6D64192A0E3A908F31595197D9AE47129557974F911147ADA74E0D2F6377848",
+       "bytes": 5790
+      },
+      {
+       "path": "skills/working-capital/SKILL.md",
+       "sha256": "C6CD94D5A9E5009000C899AAF22B9B10DC8F6201E50756F1C90EEC3914502CC2",
+       "bytes": 1278
+      },
+      {
+       "path": "skills/working-capital/subskills/ap-aging-analysis/SKILL.md",
+       "sha256": "6692F6387A47ED0FBB47DC90A288DD33F76EE08B240F4FF8F7EFF7EFF7696EEA",
+       "bytes": 4980
+      },
+      {
+       "path": "skills/working-capital/subskills/ar-aging-collections/SKILL.md",
+       "sha256": "F52F7795314BE38377CF8B5F77C5906D6D77CD39329415619CCB38BF12BEB391",
+       "bytes": 5342
+      }
+     ],
+     "license_files": {
+      "LICENSE": "A7680F3E2058E708E84A2832780555A8297775941146CF2B4CB373C440A88196"
+     },
+     "manifests": {
+      "skills/report-production/subskills/design-polish/references/icons/manifest.json": "75E8635D72A494981C79E2C1F0048969DE623D3AF53818C1C08CAC93AC44B753",
+      "skills/report-production/subskills/design-polish/references/logos/manifest.json": "B5ADC57D03EE9857AA19B95878F97802EA03AF2C717199F5CD5F31A1400F5B9E",
+      "kimi.plugin.json": "B9D0899DBD89DD5E3C6D942D7D0CEABCECE53E051C3AE8DA58EA87C876435B7A"
+     }
+    },
+    "xtt-investment-banking-private-equity": {
+     "skill_md_count": 57,
+     "skills": [
+      {
+       "path": "skills/capital-markets/SKILL.md",
+       "sha256": "2FE2C7BBBC9C931B486F8DF4CCFA6CA24BB708A08B1DA1636A30A8635D7FDC65",
+       "bytes": 2554
+      },
+      {
+       "path": "skills/capital-markets/subskills/a-share-ipo-readiness/SKILL.md",
+       "sha256": "514FB98474249B6AFDCD71F540502B442A66CD42F258B9B4470B63D7DD31790D",
+       "bytes": 3975
+      },
+      {
+       "path": "skills/capital-markets/subskills/capital-markets-issuance/SKILL.md",
+       "sha256": "0F35F3FA17DCAFDC0761897A6544923B80684C9880EFBBCB3BFD5FDC477FD29D",
+       "bytes": 4440
+      },
+      {
+       "path": "skills/capital-markets/subskills/china-ma-restructuring/SKILL.md",
+       "sha256": "CCB716C4EBB9E19FDA92093B11D66D157F51FC8749E4902E9641F379E4CECDE3",
+       "bytes": 4033
+      },
+      {
+       "path": "skills/capital-markets/subskills/private-credit-covenant/SKILL.md",
+       "sha256": "A59D6329081B3ADA00F84F9C42E7D6BEBEB7C0BC4540748FF8F4E537494D54C2",
+       "bytes": 4460
+      },
+      {
+       "path": "skills/capital-markets/subskills/restructuring-recovery/SKILL.md",
+       "sha256": "2C0D0ACA3C940ACE4F0C507FA3AA41255A0E94DBF139AB915F9896E5F2179132",
+       "bytes": 4463
+      },
+      {
+       "path": "skills/company-analysis/SKILL.md",
+       "sha256": "A254695302D691A865FFE9FF45FB059104A4D44CBBA83CA84033DE8DA0F3B8F7",
+       "bytes": 1657
+      },
+      {
+       "path": "skills/company-analysis/subskills/company-tearsheet/SKILL.md",
+       "sha256": "4902678A39B4EEB1E2B4F83F29897BAA5D805F61B5F81338C891218DDB05DFAF",
+       "bytes": 3708
+      },
+      {
+       "path": "skills/company-analysis/subskills/financial-normalization/SKILL.md",
+       "sha256": "AD87C31EC10500868C8DFACDB38143FCD0983F2C168E764ACE53E3A9EB811CC4",
+       "bytes": 5196
+      },
+      {
+       "path": "skills/company-analysis/subskills/market-sizing/SKILL.md",
+       "sha256": "4DD605A9F61FD1D867A082EE93155F061151E4C6F47E6FF7DBE49473B533290E",
+       "bytes": 9773
+      },
+      {
+       "path": "skills/datasource-router/SKILL.md",
+       "sha256": "DD9AAF21703A5A43562D50650C3773C4335A2DAAF80096481A4EB8DA572F9EF3",
+       "bytes": 7638
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-finance-research/SKILL.md",
+       "sha256": "80F31214E20BBCC4BB4950B85543341C6E6D88F72D5FEE4C7EC35FE6559949E1",
+       "bytes": 6938
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-gildata/SKILL.md",
+       "sha256": "2D6A7A7325DAF473AF730E2AD740B4C2E5B443F1D2811077FBF033D04F06DFB3",
+       "bytes": 7569
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-ifind/SKILL.md",
+       "sha256": "67E3291EB30FD7E69635F5C7C933B7409255F6053716CD07013DC3A99049098D",
+       "bytes": 6053
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-igo/SKILL.md",
+       "sha256": "72E4614170115DC59D6A2A0DB6AE6D057F7342BC2FB297EC5E1F6288E6380C24",
+       "bytes": 2943
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-imf/SKILL.md",
+       "sha256": "E98DA7314437EC4020434B2C5B7A00EF0D3839538F6034E7D56250E5A341DAC4",
+       "bytes": 1838
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-sec/SKILL.md",
+       "sha256": "5C8123BADA97389240EAC2C7EF8B204D5840337ABF0B09AF307B199FF817AC8C",
+       "bytes": 4996
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-spglobal/SKILL.md",
+       "sha256": "5AA1ECB63C1DF6D38FD1631FB54034ED96B7993C15B25D8388222C07C292FDCF",
+       "bytes": 6212
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-tianyancha/SKILL.md",
+       "sha256": "7FD76E698B18E7D5C5358774ECC8CCE6A97C824BAE3938A0253E82DC144F627F",
+       "bytes": 1977
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-wind/SKILL.md",
+       "sha256": "C2339D33C05B628513CE610F4367E78ABD6E9F59815F88B1D70F2A5B0910D45F",
+       "bytes": 6736
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-wind/wind-mcp-skill/SKILL.md",
+       "sha256": "0167FA7B15AF84392DB49473DB21225B0D1A2C6E1C69281A5B1930C16C6D2CF4",
+       "bytes": 12812
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-worldbank/SKILL.md",
+       "sha256": "C0C5146A4040D359C5DE76409F0C01D8D81CE9AEAAEAD372457DD5CB38A6CEDD",
+       "bytes": 1929
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-yahoo/SKILL.md",
+       "sha256": "95437C0AF29745C3E81FB2889ECB8625DDF6EF0DEFF92E018F7EF448E173D696",
+       "bytes": 5231
+      },
+      {
+       "path": "skills/deal-process/SKILL.md",
+       "sha256": "9EEED7882BFC258D49606C409E70020B72E03E3667DB699F291C283DA1FFA331",
+       "bytes": 2629
+      },
+      {
+       "path": "skills/deal-process/subskills/buyer-investor-list/SKILL.md",
+       "sha256": "F46AA95D6AC0B50925CB09B69D55D228D60C8C501943CBBEBC4176247C48EA28",
+       "bytes": 4841
+      },
+      {
+       "path": "skills/deal-process/subskills/cim-builder/SKILL.md",
+       "sha256": "0A8F9A6E0AE79AF7A5C3A2E8C72B5A06AEDE540027B1C1A828B952AC83214EC2",
+       "bytes": 4219
+      },
+      {
+       "path": "skills/deal-process/subskills/cim-teardown/SKILL.md",
+       "sha256": "5D5EDBAE9146613C8E78A95DA9CFEEC47B2884F2FA03293CFAB176178FB12756",
+       "bytes": 5227
+      },
+      {
+       "path": "skills/deal-process/subskills/deal-process-tracker/SKILL.md",
+       "sha256": "D9F65BE66D3A063F9CFFD222A50737B58BE12F16FD03B6828A637ADF027DB5C2",
+       "bytes": 4457
+      },
+      {
+       "path": "skills/deal-process/subskills/deal-screening/SKILL.md",
+       "sha256": "83AB8CEDADE96EC74A3F26E378DEC1B92BE9CE45E81F5F2CF014E7156C921D3D",
+       "bytes": 3922
+      },
+      {
+       "path": "skills/deal-process/subskills/teaser/SKILL.md",
+       "sha256": "80FE3FBDC94E954C56A3D5F2DF79BDA6175704BE718A28C3E9F70391DE45FEF2",
+       "bytes": 4178
+      },
+      {
+       "path": "skills/deliverable-production/SKILL.md",
+       "sha256": "4A67BB9AB9038C6A72E155F069165A733C928AC96A7CBEAE1AD1EA3B834D4A7C",
+       "bytes": 2318
+      },
+      {
+       "path": "skills/deliverable-production/subskills/deck-qc/SKILL.md",
+       "sha256": "C6DE99C8B6FC09AD28713106B1CEA35D61143F0E9F5B17A4170FE99876367E7D",
+       "bytes": 6131
+      },
+      {
+       "path": "skills/deliverable-production/subskills/design-polish/SKILL.md",
+       "sha256": "4B6C3A3F8B3FD225B7795FA4AA6A398CD2CF2AA1D20A6FAFAADDE36D061161A9",
+       "bytes": 15284
+      },
+      {
+       "path": "skills/deliverable-production/subskills/ic-memo/SKILL.md",
+       "sha256": "326605353147C6ABAE27B4468D48521765C5CCDB712A26F4A58E05E4E67EC9C7",
+       "bytes": 5850
+      },
+      {
+       "path": "skills/deliverable-production/subskills/memo-builder/SKILL.md",
+       "sha256": "444F745F641EC16D6F11B8B84757FB3F25BA1EED26CF7BF6C6A325E7E227CF26",
+       "bytes": 4612
+      },
+      {
+       "path": "skills/deliverable-production/subskills/pitch-deck-builder/SKILL.md",
+       "sha256": "03955254DBFB55727CCDB8BAF7DE8825DF902B8EA9A45B2E2DF88938D3759724",
+       "bytes": 24843
+      },
+      {
+       "path": "skills/deliverable-production/subskills/report-output-router/SKILL.md",
+       "sha256": "D8BF5652F790074F0316E78DD73A1BC480D5A6FA34F88EE2A7B3D63861299455",
+       "bytes": 2422
+      },
+      {
+       "path": "skills/due-diligence/SKILL.md",
+       "sha256": "2C0BBA5D1D9BA488D7DF8F0E1F5169A9B68C379471CED6B8B926B3130DB1078C",
+       "bytes": 1773
+      },
+      {
+       "path": "skills/due-diligence/subskills/dd-checklist/SKILL.md",
+       "sha256": "298B9521C9FD5F96DF79C27B2260C30E3BC4049492306ED93F496AB05A4076BB",
+       "bytes": 3960
+      },
+      {
+       "path": "skills/due-diligence/subskills/kyc-aml-screen/SKILL.md",
+       "sha256": "94BD219FA6217A24EF8619F02DF0F7F011BC5EA01B6E6F23F690B2E32144EE0A",
+       "bytes": 4349
+      },
+      {
+       "path": "skills/due-diligence/subskills/source-register/SKILL.md",
+       "sha256": "12645E2BC07522E42672BF5FF8E8686D0C3C6A0591B8441ED6F8AD85133ECFFE",
+       "bytes": 4835
+      },
+      {
+       "path": "skills/fund-lifecycle/SKILL.md",
+       "sha256": "A8BC6A15A45507E592E21115533A7EF9A1FE1EA13B9B6D87EFA098ED95B6EE4B",
+       "bytes": 1681
+      },
+      {
+       "path": "skills/fund-lifecycle/subskills/fund-structuring/SKILL.md",
+       "sha256": "E8C944F5A86507A173B90DE4BBA65F1854E8FB8961C6B4E24BC793ACACF809AC",
+       "bytes": 3933
+      },
+      {
+       "path": "skills/fund-lifecycle/subskills/portfolio-monitoring/SKILL.md",
+       "sha256": "EC2E5010ED73788841569E61BCCF60DA27C9CE57897C00686DE6C69BAB5CCCAD",
+       "bytes": 3989
+      },
+      {
+       "path": "skills/fund-lifecycle/subskills/value-creation-plan/SKILL.md",
+       "sha256": "AB409D195F9AF5EE3D7C35119B13E03668043AD3FC9911FC202B9C18AE705273",
+       "bytes": 4106
+      },
+      {
+       "path": "skills/mandate-intake/SKILL.md",
+       "sha256": "EBF2B38ECA5E8B3CE7226ECC7C102DD5D4F0BA6446DB8A2ADD6FF8D7D19C52D3",
+       "bytes": 5207
+      },
+      {
+       "path": "skills/transaction-models/SKILL.md",
+       "sha256": "B376E040F568798E1A24126D5D513B164E08FF83A50753E8156A669F8B741180",
+       "bytes": 2402
+      },
+      {
+       "path": "skills/transaction-models/subskills/dcf-model/SKILL.md",
+       "sha256": "E35108B8F94F4BE85D003D894AD1FDAE09D60753DAF7C69CBAAA811BBD436603",
+       "bytes": 5018
+      },
+      {
+       "path": "skills/transaction-models/subskills/lbo-model/SKILL.md",
+       "sha256": "05B88EB29A214D832BFD727FE96BA44DEFD7CA3870515DE0C47CD0CAB36C8DDC",
+       "bytes": 5698
+      },
+      {
+       "path": "skills/transaction-models/subskills/merger-model/SKILL.md",
+       "sha256": "17DB48A32EB96297162546312F05E31C1DA379387DD749E17C53EB09C55EC72A",
+       "bytes": 3466
+      },
+      {
+       "path": "skills/transaction-models/subskills/model-audit-tieout/SKILL.md",
+       "sha256": "10B8AAD91F59A663CBAE9701A6A0B7DD6FCF43C589014510558221377CBBC963",
+       "bytes": 3149
+      },
+      {
+       "path": "skills/transaction-models/subskills/returns-analysis/SKILL.md",
+       "sha256": "134F635054EDA24C45205898C315E551D5D3D8116E1DAFBA5C74DB9D8DE0C64F",
+       "bytes": 4039
+      },
+      {
+       "path": "skills/transaction-models/subskills/scenario-sensitivity/SKILL.md",
+       "sha256": "06D36B987A8522E6A94C8E65789DD299C7DD2BA079890A6A9FDC8ECC2AD3968C",
+       "bytes": 2910
+      },
+      {
+       "path": "skills/transaction-models/subskills/three-statement-model/SKILL.md",
+       "sha256": "A7F42F482797BDAC902F593E812CB7A80CA34C29FF37CAFA27CA78B24A3A1198",
+       "bytes": 3208
+      },
+      {
+       "path": "skills/valuation/SKILL.md",
+       "sha256": "643F6BA3BB08F476E9FE00C29CCA3EACBD8481EFAEF2CF9E89E069747FB5CFF5",
+       "bytes": 1521
+      },
+      {
+       "path": "skills/valuation/subskills/precedent-transactions/SKILL.md",
+       "sha256": "6C8B90A5F4F64487A7787E4748C3891A8BCAF2B8F7CE5A3870849062F4896E88",
+       "bytes": 3392
+      },
+      {
+       "path": "skills/valuation/subskills/trading-comps/SKILL.md",
+       "sha256": "1B75BCFD112679E495487DDF5A4EEB6C8101B639D4A7CC92F762B8CD67D478D7",
+       "bytes": 4873
+      }
+     ],
+     "license_files": {
+      "LICENSE": "A7680F3E2058E708E84A2832780555A8297775941146CF2B4CB373C440A88196"
+     },
+     "manifests": {
+      "skills/deliverable-production/subskills/design-polish/references/icons/manifest.json": "75E8635D72A494981C79E2C1F0048969DE623D3AF53818C1C08CAC93AC44B753",
+      "skills/deliverable-production/subskills/design-polish/references/logos/manifest.json": "B5ADC57D03EE9857AA19B95878F97802EA03AF2C717199F5CD5F31A1400F5B9E",
+      "kimi.plugin.json": "ED2EB648418B3A1A38F37AA80D9C070A84DB2B0EB07E16BB4DD3B1E58E0C2FC8"
+     }
+    },
+    "xtt-public-markets-investing": {
+     "skill_md_count": 87,
+     "skills": [
+      {
+       "path": "skills/company-research/SKILL.md",
+       "sha256": "9BBEB37BBDD966E4A96C45557403F303FA3B7BAF095E0A05945F3F8EC63099E8",
+       "bytes": 4153
+      },
+      {
+       "path": "skills/company-research/subskills/business-model-decoder/SKILL.md",
+       "sha256": "BBC4E02128DA812E5263FCAB9A8C1EDC43B2F858C0B47D43E3C4503F65E95214",
+       "bytes": 5174
+      },
+      {
+       "path": "skills/company-research/subskills/company-tearsheet/SKILL.md",
+       "sha256": "302D5BC8A1F18480BDDB8BA3B792D935E0F1708C184961306F4886EDF7730E80",
+       "bytes": 14270
+      },
+      {
+       "path": "skills/company-research/subskills/competitive-landscape/SKILL.md",
+       "sha256": "6C3EFDB85F29857260E3715F42D524FAA5BC502EBBCDF78D2B691CCBE0CAA1C7",
+       "bytes": 5249
+      },
+      {
+       "path": "skills/company-research/subskills/conference-call-takeaways/SKILL.md",
+       "sha256": "4ACC3BADB87C5E215A97CEA760B77BEB8F9ECA636F6BC768160A002AC817523E",
+       "bytes": 5778
+      },
+      {
+       "path": "skills/company-research/subskills/core-assumption-insight/SKILL.md",
+       "sha256": "A8DC0E012F9A85670CEAE97782B2FCBC894C6F3914BC0137929230DA5BAA2503",
+       "bytes": 8790
+      },
+      {
+       "path": "skills/company-research/subskills/earnings-deep-dive/SKILL.md",
+       "sha256": "183FFFD3DAB583AD817491914F5CAF2631C405DF333E0721AB83770C93BDA44C",
+       "bytes": 4024
+      },
+      {
+       "path": "skills/company-research/subskills/earnings-forecasting/SKILL.md",
+       "sha256": "6481D150BB240185F182C0C0650A107E9FBCCC92F0B862EB53B400ED484A0A46",
+       "bytes": 9609
+      },
+      {
+       "path": "skills/company-research/subskills/earnings-preview/SKILL.md",
+       "sha256": "DAEBC30F77F6BD821FEF7B4B2E22F445EEBC6A994194CB595195F2AD142D9822",
+       "bytes": 3600
+      },
+      {
+       "path": "skills/company-research/subskills/equity-deep-dive/SKILL.md",
+       "sha256": "9B1DE44D334180F0C3052AD3F53792C8A03ABBF8D7E6951B3172C5F901431A0C",
+       "bytes": 4774
+      },
+      {
+       "path": "skills/company-research/subskills/financials-normalizer/SKILL.md",
+       "sha256": "62B87F3B5A2619E4AEE65DC066D189FE55B9E899262D88A567F8A0577CCC555A",
+       "bytes": 3836
+      },
+      {
+       "path": "skills/company-research/subskills/initiating-coverage/SKILL.md",
+       "sha256": "3D48FF31A7CBDE81E09BA36386EF486A181BCD1190FCD0C0BF43E8F77776F85D",
+       "bytes": 6459
+      },
+      {
+       "path": "skills/company-research/subskills/model-update/SKILL.md",
+       "sha256": "9E79E149916975B254DA66978BC43F95EB272993DA120A4302A08FD9880FC320",
+       "bytes": 3884
+      },
+      {
+       "path": "skills/company-research/subskills/sec-filing-deep-dive/SKILL.md",
+       "sha256": "0C9EC41F4624B2F56BA1102AE36A0D012020851E91427AFC728EDD39ADE38688",
+       "bytes": 5619
+      },
+      {
+       "path": "skills/datasource-router/SKILL.md",
+       "sha256": "E30692D6534A610D9030B2009E96D5CB26DAD88F6907FA6F3480F029B3E3E28A",
+       "bytes": 8817
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-binance/SKILL.md",
+       "sha256": "0E0F5C8700244301995CB45F5885080208350F1D1EAB3944A432B1EB142E25BE",
+       "bytes": 1805
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-caixin/SKILL.md",
+       "sha256": "FC71C15D4352B49323248AE56E67DD1853784B268A02F8AA751A2491AA317024",
+       "bytes": 3523
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-finance-research/SKILL.md",
+       "sha256": "D89DF7BB4C1B78332591AFD956590ED82C91817745E615D1D3690C0045AFE375",
+       "bytes": 6936
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-gildata/SKILL.md",
+       "sha256": "625EBB209392C700C3676F510F6AB6CFAC2AD05F4541941E6B1F2FDAB06B8836",
+       "bytes": 7567
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-ifind/SKILL.md",
+       "sha256": "B4913B272E77368899C135AB970EB564248A9FFE45AD2DB705465CB38D2AA151",
+       "bytes": 6051
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-igo/SKILL.md",
+       "sha256": "AB1B6C75DE96943A9A9AE07D741C8B3F37225C140B4DE5617551AECDF3E11D78",
+       "bytes": 2933
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-imf/SKILL.md",
+       "sha256": "5CDD77D191A93DF29FEC198A05C520165228E1823C2F2164A05AA070B9EBB76C",
+       "bytes": 1836
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-sec/SKILL.md",
+       "sha256": "58628CE4FB746C47BBBC907FF5564F43D4B9B6B2C53C67EE43452DD4A6BE3A78",
+       "bytes": 4994
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-spglobal/SKILL.md",
+       "sha256": "778D17BAC54AB198E17686E993EFF708685BAA9ED042EBF7A12743F4FC9E40FB",
+       "bytes": 6210
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-tianyancha/SKILL.md",
+       "sha256": "D733FD99BE00E422A5C68F85BD1D4D6269D5957773B71327FD7C5150605F474C",
+       "bytes": 1975
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-wind/SKILL.md",
+       "sha256": "33077D7CD2F95FDB47C175EE9952B40BA10D52F75E0440E46A086E15C3440467",
+       "bytes": 6734
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-wind/wind-mcp-skill/SKILL.md",
+       "sha256": "0167FA7B15AF84392DB49473DB21225B0D1A2C6E1C69281A5B1930C16C6D2CF4",
+       "bytes": 12812
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-worldbank/SKILL.md",
+       "sha256": "E7BD789C547646BC95DC8902CB0690B022578A48F4EB9C8244F18BE414CD5DC7",
+       "bytes": 1927
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-xhcj/SKILL.md",
+       "sha256": "FE48B1FB88DD03DC439948A4A3F13D50059A19B9D588075A030DF2EAF9473B78",
+       "bytes": 2703
+      },
+      {
+       "path": "skills/datasource-router/subskills/datasource-yahoo/SKILL.md",
+       "sha256": "A7AEBA826D2BA1208FFEC9CE04146CDC22B7632FE108A782106456DC2A58E639",
+       "bytes": 5229
+      },
+      {
+       "path": "skills/finance-dashboard/SKILL.md",
+       "sha256": "02624CF63BF2106D7BF5B1DB7CEEA6692D601A1B86BF89BFC58A57D8B731470C",
+       "bytes": 28127
+      },
+      {
+       "path": "skills/industry-research/SKILL.md",
+       "sha256": "3190042F3E535D2A3FB00B591FC6A3CDB7603ADEF83A52F07A69E328B220F109",
+       "bytes": 3267
+      },
+      {
+       "path": "skills/industry-research/subskills/ai-industry-analysis/SKILL.md",
+       "sha256": "D4261BF861C08908454CA9C8925B63D5E3DBBED1870CC951C4B410EFCFDE971C",
+       "bytes": 22014
+      },
+      {
+       "path": "skills/industry-research/subskills/industry-chain-analysis/SKILL.md",
+       "sha256": "8DCCEE112AC199C91148AFA74BD678E180F0404536AC6B35341BC2E27CC1A37D",
+       "bytes": 5604
+      },
+      {
+       "path": "skills/industry-research/subskills/industry-cycle/SKILL.md",
+       "sha256": "39FDC54CF1DD5A27A4B26FD8FB8A0F27F540BF9E00A3ABD6E7BF5DC1C38AA1E8",
+       "bytes": 9366
+      },
+      {
+       "path": "skills/industry-research/subskills/market-sizing/SKILL.md",
+       "sha256": "37354988194B826FB06674949683D421AB1CE3056350018EFBDBC29E931DA1EE",
+       "bytes": 9131
+      },
+      {
+       "path": "skills/industry-research/subskills/sector-industry-map/SKILL.md",
+       "sha256": "BF2C5B704DA22704AEEC5FC0D0BF1CBAF8E0C8AD905E70CE37B1EBAC5CFE9737",
+       "bytes": 3904
+      },
+      {
+       "path": "skills/industry-research/subskills/sector-rotation-radar/SKILL.md",
+       "sha256": "691A6730485B283B67CDD7EEDDFB17DB538DB70495D71CF3197EB825EDAEABF9",
+       "bytes": 5365
+      },
+      {
+       "path": "skills/macro-strategy/SKILL.md",
+       "sha256": "D32E69AA5D66212F29B8BE9B43DA281D5E8948FBE3F27E9F7E6C80B6D8750623",
+       "bytes": 3140
+      },
+      {
+       "path": "skills/macro-strategy/subskills/asset-allocation/SKILL.md",
+       "sha256": "72739A16DCBC3E239C79C7963EB83E22B571F0E4E0AFDA1F2D1516E7DE74CBCE",
+       "bytes": 8356
+      },
+      {
+       "path": "skills/macro-strategy/subskills/hk-overseas-strategy/SKILL.md",
+       "sha256": "68413D5CD7B6A6B5A23EBE68416707D4A000D036676DE1D8512DB4909A616351",
+       "bytes": 9326
+      },
+      {
+       "path": "skills/macro-strategy/subskills/macro-research/SKILL.md",
+       "sha256": "136699FA73F8DD89C5F934B8F85D99E38531B4AFD7D14706398D2D8DA6021E44",
+       "bytes": 9530
+      },
+      {
+       "path": "skills/market-microstructure/SKILL.md",
+       "sha256": "AF5D192F9080075CECCEB05E5EE97CB6C1091C6B8E77FF54F51BB08E39273AC8",
+       "bytes": 4020
+      },
+      {
+       "path": "skills/market-microstructure/subskills/a-share-daily-review/SKILL.md",
+       "sha256": "7E3892ED66E49B6421E4D63867CF1BB36BE7A07A0ECA1373ADD15B91573AACDB",
+       "bytes": 4227
+      },
+      {
+       "path": "skills/market-microstructure/subskills/a-share-market-leader-screener/SKILL.md",
+       "sha256": "9D416D9A97CCBD21D9986AB3116C659FBA4BAF33632742CEC3538F2A4EB47599",
+       "bytes": 3981
+      },
+      {
+       "path": "skills/market-microstructure/subskills/a-share-momentum-risk-monitor/SKILL.md",
+       "sha256": "60EFE129C156C9B5F8E534066C259B603C84B291B1D06E60D4C5E1CE4C2DD4CF",
+       "bytes": 4077
+      },
+      {
+       "path": "skills/market-microstructure/subskills/a-share-theme-identification/SKILL.md",
+       "sha256": "FED23916F4872384081AA4D350A7B97E1CF5046C42561F33DAA9A04C73254C9E",
+       "bytes": 4134
+      },
+      {
+       "path": "skills/market-microstructure/subskills/capital-flow-northbound/SKILL.md",
+       "sha256": "8BE2F473CDD146BB50933F829B4CD8F910C3D682B180933AC0C23467F826BE5D",
+       "bytes": 5072
+      },
+      {
+       "path": "skills/market-microstructure/subskills/etf-flow-review/SKILL.md",
+       "sha256": "7C1759E5D16F7E94DF6CB2CEE8329E30F88A38690459A448A14E018F7D87C5BA",
+       "bytes": 6402
+      },
+      {
+       "path": "skills/market-microstructure/subskills/etf-index-diligence/SKILL.md",
+       "sha256": "3DA8AE1F7909A71EEBDE323F0E0F696CCE19F88D9C9B9585D62CB998BAB9CB2B",
+       "bytes": 4213
+      },
+      {
+       "path": "skills/market-microstructure/subskills/institutional-ownership/SKILL.md",
+       "sha256": "9FD5F30156DEF150ED25C186F1BA2D805ECB5D934687E76FCE654CB655BA127F",
+       "bytes": 3767
+      },
+      {
+       "path": "skills/market-microstructure/subskills/limit-up-down-debrief/SKILL.md",
+       "sha256": "0140BC21767832AB9140A133C669D1CC22CD7E33BFB340DD01DCEFDD1331D2EB",
+       "bytes": 5976
+      },
+      {
+       "path": "skills/market-microstructure/subskills/options-sentiment-review/SKILL.md",
+       "sha256": "960D41777D539C79545D8C61968BB617792BE84EBA1A04D7AEBD156152122AFD",
+       "bytes": 6476
+      },
+      {
+       "path": "skills/market-microstructure/subskills/short-interest-insider-review/SKILL.md",
+       "sha256": "6FCABE12D21F62ACB668FFA55037A8C9536FB27AA0EF7363B8AAD8AE0753673D",
+       "bytes": 5106
+      },
+      {
+       "path": "skills/portfolio-management/SKILL.md",
+       "sha256": "C8C9BFBCE42E683F21185D1081855A487F57ED091BE2391CC009BF4AFFBCA12E",
+       "bytes": 3669
+      },
+      {
+       "path": "skills/portfolio-management/subskills/catalyst-calendar/SKILL.md",
+       "sha256": "EE024DAF64B104B0A7247FAC3CD802B542DDEEA34F2A08968BC938EC915EE0CE",
+       "bytes": 3542
+      },
+      {
+       "path": "skills/portfolio-management/subskills/drawdown-liquidity-stress/SKILL.md",
+       "sha256": "27E30CBF61F79C4946E1325E49830DA468ED955EB7485F10C5BEEB94FBA5A15B",
+       "bytes": 6466
+      },
+      {
+       "path": "skills/portfolio-management/subskills/idea-generation/SKILL.md",
+       "sha256": "FEF1F3F7BA5E8DECD2EAC33DB51DCC4A0DDE15FEA9C1E3525A9695982CB43D57",
+       "bytes": 3652
+      },
+      {
+       "path": "skills/portfolio-management/subskills/performance-attribution/SKILL.md",
+       "sha256": "7BEFEE2B629053F830F53FE7DFE5305D63B29F1209C467AC82E37A8A71BC02E4",
+       "bytes": 5524
+      },
+      {
+       "path": "skills/portfolio-management/subskills/portfolio-construction/SKILL.md",
+       "sha256": "D012659EAD317EF2F8F3D73A649017A5EDAC07F40243AF8CEB77FC4400B2BCCD",
+       "bytes": 4495
+      },
+      {
+       "path": "skills/portfolio-management/subskills/portfolio-risk-summary/SKILL.md",
+       "sha256": "17B3EF2EE7514A5688B6B40288216078167AEF69826446FF8242B7D89FB1A33E",
+       "bytes": 5328
+      },
+      {
+       "path": "skills/portfolio-management/subskills/position-sizing/SKILL.md",
+       "sha256": "4FAED196EFF03FFDF7C6DC60DE79E2EBBD2D6F9E4059529999A7D7AB47B76DC6",
+       "bytes": 5781
+      },
+      {
+       "path": "skills/portfolio-management/subskills/technical-analysis/SKILL.md",
+       "sha256": "715278114BF7CC98D45C39B2E49A5A72B70FA2D4421B928F3D5013E99B4BB96C",
+       "bytes": 3694
+      },
+      {
+       "path": "skills/portfolio-management/subskills/thesis-tracker/SKILL.md",
+       "sha256": "D4B3DB5BCFE93F998D88A9803B1190784A1C13AE15731A2865680336490E99D5",
+       "bytes": 6206
+      },
+      {
+       "path": "skills/quant-research/SKILL.md",
+       "sha256": "27B06E9528CDF781161F231E71653B9E49E7AAF49CAC45279C1ABB81E181BE95",
+       "bytes": 3546
+      },
+      {
+       "path": "skills/quant-research/subskills/academic-strategy-replication/SKILL.md",
+       "sha256": "DF934CAA78C582B33F4EC5EAB83F9D720242780D6C5DB90D17DB6BA77EEA024C",
+       "bytes": 11843
+      },
+      {
+       "path": "skills/quant-research/subskills/event-study-analyzer/SKILL.md",
+       "sha256": "C9638ECFFC32E6D8E09DB21A69A47C07795F80935EE1DD8FFF5CA9013410EA12",
+       "bytes": 3744
+      },
+      {
+       "path": "skills/quant-research/subskills/factor-ic-review/SKILL.md",
+       "sha256": "411B4DA1E004C3FED3FE36EAC5306128CAA435BCA20EC68D827E4D51495B0CB5",
+       "bytes": 6042
+      },
+      {
+       "path": "skills/quant-research/subskills/factor-screen/SKILL.md",
+       "sha256": "AD10ECC799D0D026AF8947271FADF40687C49CD30F7499E4336227A5F9BFEC4E",
+       "bytes": 3714
+      },
+      {
+       "path": "skills/quant-research/subskills/quick-backtest/SKILL.md",
+       "sha256": "CABD306F8E783C9C0719EB2D8B84D65470C1738EF8A1C3E202396BA6BF2868CB",
+       "bytes": 6774
+      },
+      {
+       "path": "skills/quant-research/subskills/robustness-check/SKILL.md",
+       "sha256": "36FA175A7CE9FD7153FB6C773A84CF7EDEE4B92BA39DCB3D36B82D73C9E78C78",
+       "bytes": 5713
+      },
+      {
+       "path": "skills/quant-research/subskills/self-evolve-quant/SKILL.md",
+       "sha256": "C3D90607016B4A2B4680E10344B72F8E84583D6E15FFD25F55FE4B0127543E92",
+       "bytes": 30330
+      },
+      {
+       "path": "skills/quant-research/subskills/transaction-cost-simulator/SKILL.md",
+       "sha256": "3955683039D7102AA8CBA88B012F603A7772C478A886168678B8A662F2506B7B",
+       "bytes": 6783
+      },
+      {
+       "path": "skills/quant-research/subskills/universe-builder/SKILL.md",
+       "sha256": "2A5449D8CFA36086E635DBFDA71A360B69600BC76668E75CA2DC501D30DBFCD8",
+       "bytes": 7044
+      },
+      {
+       "path": "skills/question-router/SKILL.md",
+       "sha256": "C70A97AC078B71EAC41A2A983446408279FE0A7B1E779A805ED807C779CCA01E",
+       "bytes": 9230
+      },
+      {
+       "path": "skills/report-production/SKILL.md",
+       "sha256": "9FEEDC86B28DD4AB68643703E1851B7BB96F6576361E32D1186185B0E86CC2BA",
+       "bytes": 2720
+      },
+      {
+       "path": "skills/report-production/subskills/deliverable-qc/SKILL.md",
+       "sha256": "4EED75FD9225E9D31560A878404CDC877A790955E7496B6CE0977A1D1A7AA407",
+       "bytes": 5740
+      },
+      {
+       "path": "skills/report-production/subskills/design-polish/SKILL.md",
+       "sha256": "897349D4A4A925C82CF9B599F23306A4A0F929342D578ED38C3F7BE1D59B9ABE",
+       "bytes": 15280
+      },
+      {
+       "path": "skills/report-production/subskills/institutional-equity-report/SKILL.md",
+       "sha256": "B2A9ABC4DBA833F695789CFB4202A2A02955D787B687AF95D98C3D2A7922A11E",
+       "bytes": 18200
+      },
+      {
+       "path": "skills/report-production/subskills/pitch-deck-builder/SKILL.md",
+       "sha256": "34D2F7964F213C48B45BFD0D88A7251BED57552A94820B93AE945D97FF518047",
+       "bytes": 6991
+      },
+      {
+       "path": "skills/report-production/subskills/report-output-router/SKILL.md",
+       "sha256": "1D653F9849B6CD5816C55380C19209F4D21385494C11122A471BA70841301580",
+       "bytes": 2436
+      },
+      {
+       "path": "skills/report-production/subskills/research-report-builder/SKILL.md",
+       "sha256": "178D30A9AF5C322442D62E90E976154E0141E33934C9E5613689D40E80E06CE2",
+       "bytes": 5134
+      },
+      {
+       "path": "skills/valuation/SKILL.md",
+       "sha256": "E75BFF950F2568E5A1340241FD39AB822401BA1B50DF12B1D85FB145C16B9541",
+       "bytes": 2439
+      },
+      {
+       "path": "skills/valuation/subskills/convertible-bond-analysis/SKILL.md",
+       "sha256": "49D9119A641C8DF50BFB0BB4E5A5679DEA9605F231F971E21F1AD2F4E939C0D6",
+       "bytes": 4594
+      },
+      {
+       "path": "skills/valuation/subskills/dcf-model/SKILL.md",
+       "sha256": "BF5967AC1700B55922A4CAB6F314AEC09C99E7A04633F057571B0A5C782EEAF0",
+       "bytes": 4545
+      },
+      {
+       "path": "skills/valuation/subskills/trading-comps/SKILL.md",
+       "sha256": "88E91E51720D90DA31B6822FA420E7378DC1C6C3796B1BFD689ED7900EF93ECD",
+       "bytes": 3999
+      },
+      {
+       "path": "skills/valuation/subskills/valuation-analysis/SKILL.md",
+       "sha256": "3C92BFCE980602859F494FB36DD1D235684111D393B6D4807449998FE5897121",
+       "bytes": 11185
+      }
+     ],
+     "license_files": {
+      "LICENSE": "530841D8C48F0ECE4A024F25DFEFC81413935D4D3A1DCDFB7911B6FFF6D4BBE3"
+     },
+     "manifests": {
+      "skills/report-production/subskills/design-polish/references/icons/manifest.json": "75E8635D72A494981C79E2C1F0048969DE623D3AF53818C1C08CAC93AC44B753",
+      "skills/report-production/subskills/design-polish/references/logos/manifest.json": "B11D101B30FA74199F6EB6E664B0384AB6EF5D7C4EB8F1F6D291CFE763ECBDB5",
+      "kimi.plugin.json": "D78627118C42CC35864FC2FC0F66D3C62F98E186F22B035F59B5FBA2C116C686"
+     }
+    }
+   }
+  },
+  "kimi-datasources": {
+   "root": "E:\\GitHub上下载的\\kimi-datasources",
+   "exists": true,
+   "packages": {
+    "(root)": {
+     "files": {
+      "docs/dongcai.md": {
+       "sha256": "A8F3B6E73FF3D7CB291BD6845B3C0B37247AD135F01CACEC650ECDBA8ABF58E0",
+       "bytes": 15260
+      },
+      "docs/gildata.md": {
+       "sha256": "18127DC673E7337CE6046CA40314FF516FECB1FA4311016EB7D9CA6A6715B8C1",
+       "bytes": 4165
+      },
+      "docs/ifind.md": {
+       "sha256": "6DA217A0BC878D846D3BA02FB652234E046FF17BB7378F0D977CD6F743B49F1D",
+       "bytes": 13148
+      },
+      "docs/imf.md": {
+       "sha256": "5B21BE69F63C94A0EF220B6C7273CF88E5CF0BEDA098183CAFAB7FE9F0B4BF3B",
+       "bytes": 11621
+      },
+      "docs/scholar.md": {
+       "sha256": "C982AC8B696F414B737562447C1BB37D8C9A4E9E22B86151E6550B6446BE80D6",
+       "bytes": 2494
+      },
+      "docs/sec_edgar.md": {
+       "sha256": "5FAAD531666FDF624F3BA6F4B0B4A427E79610649E19F6D3D109346B4CD715CA",
+       "bytes": 11486
+      },
+      "docs/sp_data.md": {
+       "sha256": "DC5E2FAB53269E1188258C56CBCFFDBC1447100DFF54BC7C30F3A5C9B1ECC06A",
+       "bytes": 17134
+      },
+      "docs/tianyancha.md": {
+       "sha256": "AEE5C4E9004F8B3C00DD681A0539013775D57E1474BE0EF6EF821D4B6461603A",
+       "bytes": 3899
+      },
+      "docs/wind.md": {
+       "sha256": "62B652C2CBAAE7782D4C2DC2109D8C37B0021C45CB57DE0C59A127F53D1520B1",
+       "bytes": 19996
+      },
+      "docs/world_bank_open_data.md": {
+       "sha256": "97DACFF7D67FF8634575458129BE78B58F10FCBC62DA052C518278794635FEA9",
+       "bytes": 5439
+      },
+      "docs/yahoo_finance.md": {
+       "sha256": "1C4F6F015498AA061005B1494236A2E33FD6158C195CBE825251B073F029997A",
+       "bytes": 6726
+      },
+      "docs/yuandian_law.md": {
+       "sha256": "DC614710DD11B701E7BF630C4F46006B969B55231C4DE730FCB85AEADC819C22",
+       "bytes": 11111
+      },
+      "kimi_ds_files/ifind_ifind_get_price_20261012_210613.csv": {
+       "sha256": "C12BCFE6E084868D3E7D00E397EF26E16177425038CEB9771EE1EC838C5D2AA2",
+       "bytes": 220
+      },
+      "kimi_gateway.py": {
+       "sha256": "38A28685CD30345622851C254D48C797F63E6B918DC7CA08A768555449B3FF9A",
+       "bytes": 9517
+      },
+      "mcp.json": {
+       "sha256": "8925C2D9C02A1B204FF135F89C87F1DFA5BFDF959555AE16206A22A5F8429B03",
+       "bytes": 1970
+      },
+      "mcp_server.py": {
+       "sha256": "7298AD348DDE1D9970C2064212817C9C332C97F537540C919D7B48CCEF0E8A66",
+       "bytes": 6927
+      },
+      "mcp_source_server.py": {
+       "sha256": "2F4086C35F2D5043BD108533544F3F828CE2DA10338B51ED0C13B077EAED16A7",
+       "bytes": 8496
+      },
+      "README.md": {
+       "sha256": "A96372FF19EFD04944CF70483F8C5B6A6B0F4CDEEDF42A44A8661DDC9F041330",
+       "bytes": 9707
+      }
+     }
+    }
+   }
+  }
+ }
+}
