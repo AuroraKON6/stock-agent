@@ -5,17 +5,78 @@ bytes. Every failure mode is an explicit status string so downstream code
 can never mistake a failed extraction for an empty document: scanned PDFs
 report needs_ocr, non-UTF-8 bytes report not_utf8, and unsupported formats
 report unsupported_format instead of silently returning partial text.
+HTML gets a controlled stdlib text extraction (tags/scripts/styles dropped,
+entities decoded, whitespace collapsed) - no external resources, no script
+execution, same size caps as plain text.
 """
 from __future__ import annotations
 
+import html as _html
+from html.parser import HTMLParser
+import re
 from typing import Any, Dict
 
-PARSER_VERSION = "body-extract-v1"
+PARSER_VERSION = "body-extract-v2-html"
 MAX_BODY_BYTES = 2 * 1024 * 1024
 _DECODE = "utf-8-sig"
 
 _PDF_MAGIC = b"%PDF-"
 _HTML_MARKERS = (b"<!doctype html", b"<html")
+# Any document opening like a tag (element, comment, or doctype) is HTML.
+_HTML_TAG_OPEN = re.compile(rb"\A\s*<[a-zA-Z!/]")
+
+_DROP_CONTENT_TAGS = {"script", "style", "noscript", "template"}
+_BLOCK_TAGS = {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+               "table", "thead", "tbody", "section", "article", "blockquote"}
+
+
+class _TextExtractor(HTMLParser):
+    """Collect visible text only; drops script/style content and all attributes."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._chunks: list = []
+        self._drop_depth = 0
+
+    def handle_starttag(self, tag, attrs) -> None:
+        if tag in _DROP_CONTENT_TAGS:
+            self._drop_depth += 1
+        elif tag in _BLOCK_TAGS:
+            self._chunks.append(" ")
+
+    def handle_endtag(self, tag) -> None:
+        if tag in _DROP_CONTENT_TAGS and self._drop_depth:
+            self._drop_depth -= 1
+        elif tag in _BLOCK_TAGS:
+            self._chunks.append(" ")
+
+    def handle_data(self, data) -> None:
+        if not self._drop_depth and data:
+            self._chunks.append(data)
+
+    def text(self) -> str:
+        raw = "".join(self._chunks)
+        # Collapse whitespace runs (incl. newlines/tabs) to single spaces.
+        collapsed = " ".join(raw.split())
+        return _html.unescape(collapsed)
+
+
+def _extract_html(data: bytes) -> Dict[str, Any]:
+    try:
+        source = data.decode(_DECODE, errors="strict")
+    except UnicodeError:
+        return {"status": "not_utf8"}
+    extractor = _TextExtractor()
+    try:
+        extractor.feed(source)
+        extractor.close()
+    except Exception:
+        return {"status": "unsupported_content",
+                "reason": "html parsing failed"}
+    text = extractor.text().strip()
+    if not text:
+        return {"status": "empty"}
+    return {"status": "ok", "text": text, "char_count": len(text)}
 
 
 def _detect_format(data: bytes) -> str:
@@ -23,13 +84,13 @@ def _detect_format(data: bytes) -> str:
     if head.startswith(_PDF_MAGIC):
         return "pdf"
     lowered = head[:256].lower()
-    if any(marker in lowered for marker in _HTML_MARKERS):
+    if any(marker in lowered for marker in _HTML_MARKERS) or _HTML_TAG_OPEN.match(head):
         return "html"
     return "text"
 
 
 def extract_body(data: bytes) -> Dict[str, Any]:
-    """Extract UTF-8 text from retained bytes with explicit outcome statuses.
+    """Extract UTF-8 or HTML text from retained bytes with explicit statuses.
 
     ok / empty / not_utf8 / too_large / needs_ocr / unsupported_format /
     unsupported_content. `text` is present only for status ok.
@@ -57,8 +118,8 @@ def extract_body(data: bytes) -> Dict[str, Any]:
         return {**base, "status": "unsupported_format",
                 "reason": "pdf has a text layer but local pdf text extraction is not implemented yet"}
     if detected == "html":
-        return {**base, "status": "unsupported_format",
-                "reason": "html extraction not implemented yet; retained for future parser"}
+        result = _extract_html(payload)
+        return {**base, **result}
     try:
         text = payload.decode(_DECODE, errors="strict")
     except UnicodeError:
@@ -72,3 +133,4 @@ def extract_body(data: bytes) -> Dict[str, Any]:
         "text": text,
         "char_count": len(text),
     }
+

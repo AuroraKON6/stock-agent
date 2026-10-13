@@ -47,10 +47,11 @@ class BodyExtractionTests(unittest.TestCase):
         self.assertEqual(result["detected_format"], "pdf")
         self.assertIn("text layer", result["reason"])
 
-    def test_html_is_unsupported_for_now(self):
+    def test_html_extracts_text_without_scripts_or_styles(self):
         result = extract_body(b"<!doctype html><html><body>x</body></html>")
-        self.assertEqual(result["status"], "unsupported_format")
+        self.assertEqual(result["status"], "ok")
         self.assertEqual(result["detected_format"], "html")
+        self.assertEqual(result["text"], "x")
 
     def test_control_characters_rejected(self):
         result = extract_body(b"abc\x00def")
