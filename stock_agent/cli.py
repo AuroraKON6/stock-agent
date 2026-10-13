@@ -992,6 +992,11 @@ def main() -> None:
     queries_view_parser.add_argument("--limit", type=int, default=50)
     queries_view_parser.add_argument("--purpose", default="")
 
+    dify_status_parser = subparsers.add_parser(
+        "dify-access-status",
+        help="Dify 受控接入分层状态（只读：凭据登记/流程版本/账本计数，不联网、不输出令牌哈希）")
+    dify_status_parser.add_argument("--config", default="config/watchlist.local.json")
+
     todo_view_parser = subparsers.add_parser(
         "todo-view", help="待办视图（等待人工的问题/被阻断任务/复核队列，只读聚合）")
     todo_view_parser.add_argument("--config", default="config/watchlist.local.json")
@@ -1415,6 +1420,8 @@ def main() -> None:
         _kimi_data_status(args.config)
     elif args.command == "queries-view":
         _queries_view(args.config, args.limit, args.purpose)
+    elif args.command == "dify-access-status":
+        _dify_access_status(args.config)
     elif args.command == "todo-view":
         _todo_view(args.config)
     elif args.command == "ops-view":
@@ -1650,6 +1657,14 @@ def _queries_view(config_path: str, limit: int, purpose: str) -> None:
 
     config = load_config(config_path)
     payload = build_queries_view(config, limit=max(1, limit), purpose=str(purpose or ""))
+    print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
+
+
+def _dify_access_status(config_path: str) -> None:
+    from .dify_api import build_dify_access_status
+
+    config = load_config(config_path)
+    payload = build_dify_access_status(config)
     print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
 
 

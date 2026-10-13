@@ -1,23 +1,48 @@
 {
   "schema_version": "1.0",
-  "dify_version": "dify-1.7.2-candidate-1",
+  "dify_version": "dify-1.17.1-candidate-1",
   "deployment": {
-    "form": "docker-compose (Dify official) inside WSL2 Ubuntu",
+    "form": "docker-compose (Dify official) inside WSL2 Ubuntu（Docker Engine 原生安装，非 Docker Desktop）",
     "bind": "loopback-only reverse proxy; no public exposure",
     "prerequisites_missing": [
-      "Docker Engine 未安装（WSL2 Ubuntu 在位但 docker CLI 缺失）",
-      "磁盘/内存配额未测量"
+      "Docker Engine 未安装（Windows 宿主与 WSL2 Ubuntu 内均无 docker CLI；安装需负责人授权）"
     ],
-    "compose_profile": {
-      "note": "候选记录，不安装：services=api/worker/web/db/redis/ssl 仅标识"
+    "environment_measured": {
+      "measured_at": "2026-10-13（只读探测，未启动任何服务）",
+      "wsl": "WSL2 Ubuntu 在位（Stopped），发行版内 docker 未安装",
+      "wsl_disk": "VHD 所在卷 1007G，可用 954G",
+      "wsl_memory_limit": "7.6Gi（满足 Dify 最低 4G，需与既有业务进程共存评估）",
+      "windows_c_free": "29G（89% 已用）→ 部署不落 C 盘",
+      "windows_e_free": "151G",
+      "candidate_ports_free": "80/443/3000/5001/8080/5432/6379 当前无监听",
+      "reserved_ports": "8767/8768 为本项目面板保留，Dify 不得占用"
     },
-    "ports": {"host_plan": "仅 127.0.0.1 绑定，具体端口 DF-02 前定"}
+    "compose_profile": {
+      "note": "候选记录，不安装：1.17.1 官方 compose 含 api/api_websocket/worker/worker_beat(dify-api:1.17.1)、web(dify-web:1.17.1)、postgres:15-alpine、redis:6-alpine、sandbox(dify-sandbox:0.2.15)、local_sandbox、plugin_daemon(dify-plugin-daemon:0.6.10-local)、agent_backend、ssrf_proxy 与 agent_ssrf_proxy(ubuntu/squid)、certbot、nginx、weaviate:1.39.2",
+      "host_ports": "仅 EXPOSE_NGINX_PORT(80)/SSL(443)/PLUGIN_DEBUGGING(5003) 需回环绑定；容器网内 5001/5432/6379/3128/8194 不出宿主",
+      "floating_tag_risk": "官方 compose 对 nginx/squid/certbot/postgres/redis/busybox 用浮动 tag，违反本项目固定基线规则；DF-03 安装时改为具体版本+镜像摘要（当前无 docker 无法解析，登记待办）"
+    },
+    "ports": {"host_plan": "仅 127.0.0.1 绑定（EXPOSE_NGINX_PORT 绑 127.0.0.1），具体端口 DF-03 部署前定"}
+  },
+  "capability_facts": {
+    "verified_at": "2026-10-13 在线核实（GitHub Releases + docs.dify.ai + ssrf 模板源码）；DF-03 临时实例实测前不声称可用",
+    "human_input_node": "1.13.0 引入；1.14.1 增加 Human Input API；1.17.0 支持嵌入 Iteration/Loop → 1.17.1 全部满足",
+    "human_input_limits": "邮件链接任何持有人可回复（无需账号，先到先得）；Web app 表单不适用于 Trigger 启动的流程；超时默认 3 天须显式连接超时分支 → 受保护动作必须走后端真实用户主体验证，Human Input 仅作展示引导层",
+    "workflow_dsl_export": "自托管长期内置（1.17.1 具备）",
+    "service_api": "workflow app 级 API key（1.17.1 具备）",
+    "ssrf_protection": "ssrf_proxy(Squid) 默认拒绝私网 + 兜底 deny all；经 include 片段（dify_allow_private.conf）精确放行后端 host:port，不关闭全局防护",
+    "license": "Dify Open Source License = Apache 2.0 + 两条附加条件（禁多租户 SaaS、须保留品牌）；本项目单租户自托管内部用途不触犯条件1；按项目规则登记 REVIEW_REQUIRED，不代替负责人批准"
   },
   "capabilities_required": [
-    {"capability": "workflow_api_trigger", "why": "业务入口经 API 触发流程（第一阶段 1）", "verify_how": "DF-03 用临时实例实测；未验证前不部署"},
-    {"capability": "human_input_node", "why": "等待补证/人工问题节点（第一阶段 6）", "verify_how": "DF-03 临时实例实测节点行为"},
-    {"capability": "service_credential_scoping", "why": "受限服务凭据调后端，用途不由模型参数扩大（第一阶段 2）", "verify_how": "DF-02/DF-03 验证凭据 scope 与越权拒绝"},
-    {"capability": "workflow_version_export", "why": "流程版本/制品哈希可追溯（DF-03 验收）", "verify_how": "DF-03 导出 DSL 并登记哈希"}
+    {"capability": "workflow_api_trigger", "why": "业务入口经 API 触发流程（第一阶段 1）",
+     "verify_how": "DF-03 用临时实例实测；未验证前不部署"},
+    {"capability": "human_input_node", "why": "等待补证/人工问题节点（第一阶段 6）",
+     "verify_how": "DF-03 临时实例实测节点行为",
+     "available_since": "1.13.0（API 1.14.1；Iteration/Loop 内嵌 1.17.0）——1.17.1 锚定满足"},
+    {"capability": "service_credential_scoping", "why": "受限服务凭据调后端，用途不由模型参数扩大（第一阶段 2）",
+     "verify_how": "DF-02/DF-03 验证凭据 scope 与越权拒绝"},
+    {"capability": "workflow_version_export", "why": "流程版本/制品哈希可追溯（DF-03 验收）",
+     "verify_how": "DF-03 导出 DSL 并登记哈希"}
   ],
   "python_boundary": {
     "python_owns": [
@@ -33,9 +58,11 @@
     "id_binding": "case_id/task_id/input_version/attempt_id/dify_run_id/workflow_version"
   },
   "open_questions": [
-    "选定 Dify 版本与自托管许可条款逐条核对（DF-01 验收前完成）",
-    "Human Input / API 触发在选定版本与版本权益下可用性需实测确认",
-    "端口/磁盘/内存配额与备份策略（部署前由负责人确认）"
+    "（已核实 2026-10-13）版本能力线：Human Input 1.13.0+/API 1.14.1+/循环内嵌 1.17.0+，1.17.1 满足；详见 capability_facts 与 DF-01 文档 §复核与修正",
+    "（已核实 2026-10-13）许可：Dify OSL 单租户自托管允许，登记 REVIEW_REQUIRED 待负责人",
+    "（已核实 2026-10-13）磁盘/内存/端口：见 deployment.environment_measured",
+    "部署实例的数据备份与留存上限策略（Dify 侧运行日志/文件同样纳入数据权限，部署前由负责人确认）",
+    "镜像摘要固定：需 docker 环境解析 digest（DF-03 安装时完成）"
   ],
   "blocked_items": [
     "安装系统组件/启动服务：BLOCKED（DF-01 只出候选矩阵，不安装）",
