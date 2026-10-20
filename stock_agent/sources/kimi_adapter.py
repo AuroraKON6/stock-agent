@@ -22,6 +22,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..config import project_path
+from ..connector_runtime import policy as connector_policy
+from ..connector_runtime import queries as connector_queries
+from ..connector_runtime import rights as connector_rights
 from ..integrations import kimi as kimi_integration
 from ..integrations.kimi import client as kimi_client
 from ..integrations.kimi import contracts as kimi_contracts
@@ -30,6 +33,7 @@ from .registry import load_source_registry, registry_status
 LEDGER_VERSION = "1.0"
 DEFAULT_LEDGER_PATH = "data/kimi/query_ledger.jsonl"
 DEFAULT_CACHE_DIR = "data/kimi/cache"
+DEFAULT_QUERY_STORE_PATH = "data/kimi/query_intake.sqlite3"
 
 INTENT_RECORD = "query_intent"
 RESULT_RECORD = "query_result"
@@ -207,11 +211,24 @@ def cache_key(query: kimi_client.DataQuery) -> str:
     ).hexdigest()
 
 
+def _query_store_path(config: Optional[Dict[str, Any]]) -> Path:
+    raw = ((config or {}).get("kimi_sources") or {}).get("query_store_path") \
+        or DEFAULT_QUERY_STORE_PATH
+    return project_path(str(raw))
+
+
 def read_cache(query: kimi_client.DataQuery, registry: Dict[str, Any],
                config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """Read a cached normalization. Rights are re-verified at read time: the
-    source must still be approved and unexpired, or the cache is a miss (T03
-    permission-revocation path)."""
+    """Read a cached normalization; rights are re-verified at READ time.
+
+    R04: a hit requires ALL of — source still approved and unexpired (T03),
+    the cached purpose matching this query's purpose, the cached
+    ``rights_revision`` still equal to the entry's CURRENT revision
+    (re-approval/expiry invalidates old data, A21), and the TTL not passed
+    (A22: expired means stale — the caller refreshes, never serves old rows).
+    Documents written before these fields existed have no provable rights,
+    so they are misses (fail closed).
+    """
     gate = gate_source(query.source_id, registry)
     if not gate["allowed"]:
         return None
@@ -224,28 +241,53 @@ def read_cache(query: kimi_client.DataQuery, registry: Dict[str, Any],
         return None
     if cached.get("contract_hash") != query.contract_hash:
         return None
+    entry = (registry.get("entries") or {}).get(query.source_id) or {}
+    if str(cached.get("purpose") or "") != str(query.purpose or ""):
+        return None
+    if str(cached.get("rights_revision") or "") != connector_policy.cache_rights_revision(entry):
+        return None
+    expires_at = str(cached.get("expires_at") or "")
+    try:
+        expiry = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return None
+    if expiry.tzinfo is None:
+        expiry = expiry.astimezone()
+    if expiry <= datetime.now(timezone.utc):
+        return None
     return cached
 
 
 def write_cache(query: kimi_client.DataQuery, normalized: Dict[str, Any], registry: Dict[str, Any],
                 config: Optional[Dict[str, Any]] = None) -> bool:
-    """Persist a normalization only when body retention is allowed by the
-    registry entry; otherwise only the ledger keeps the run metadata (no
-    content) — retention is not inferred from a successful query."""
+    """Persist a normalization only when the retention decision allows it;
+    otherwise only the ledger keeps the run metadata (no content) — retention
+    is not inferred from a successful query. R04: the document records the
+    purpose, rights revision, as-of moment and TTL expiry it was produced
+    under, so read-time revalidation has something to check."""
     status = registry_status(registry, query.source_id)
-    if not status.get("body_retention_allowed"):
+    retention = connector_rights.decide_retention(status)
+    if not retention.cache:
         return False
-    path = _cache_dir(config) / "{0}.json".format(cache_key(query))
-    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = (registry.get("entries") or {}).get(query.source_id) or {}
+    ttl = connector_policy.cache_ttl_seconds(config)
+    as_of = _now_iso()
     document = {
         "cache_version": LEDGER_VERSION,
-        "created_at": _now_iso(),
+        "created_at": as_of,
+        "as_of": as_of,
         "source_id": query.source_id,
         "api_id": query.api_id,
         "data_kind": query.data_kind,
         "contract_hash": query.contract_hash,
+        "purpose": str(query.purpose or ""),
+        "rights_revision": connector_policy.cache_rights_revision(entry),
+        "expires_at": connector_policy.cache_expiry(
+            datetime.now(timezone.utc), ttl_seconds=ttl),
         "normalized": normalized,
     }
+    path = _cache_dir(config) / "{0}.json".format(cache_key(query))
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(path)
@@ -447,11 +489,25 @@ def governed_execute(
     artifact_root: Optional[Path] = None,
     budget: Optional[kimi_client.ExperimentBudget] = None,
     allow_cache: bool = True,
+    refresh: bool = False,
 ) -> Dict[str, Any]:
-    """The full governed path: gate -> budget -> idempotency -> intent ->
-    execute -> normalize -> cache -> receipt. Returns a record with either
-    ``result`` (client outcome) or ``gate`` (refusal). The ledger records
-    both refusals and sends so attempts are always countable."""
+    """The full governed path: gate -> purpose -> retention -> destination ->
+    cache -> ATOMIC reserve -> execute -> normalize -> cache -> receipt.
+
+    R04 semantics on top of K03:
+
+    - Query intake (idempotency, per-source RPM/RPD, per-upstream daily quota)
+      is one SQLite transaction (``connector_runtime``): two workers racing
+      the same key get one dispatch (A18) and the last quota unit is never
+      double-spent (A19). The JSONL ledger stays as the audit projection.
+    - Retention is a host-side ``RetentionDecision``; when raw artifacts are
+      not allowed the client runs fully in memory — a caller-supplied
+      ``artifact_root`` cannot override it (A20).
+    - The requested purpose must be in the entry's machine ``purposes``
+      allowlist; unregistered purposes are refused before any send (A25).
+    - A real transport must already point at the exact approved origin+path
+      from the host integration config (A24).
+    """
     api = kimi_contracts.find_api(snapshot, api_id)
     integration = kimi_client.KimiIntegrationConfig.from_config(config)
     if not integration.enabled:
@@ -465,13 +521,49 @@ def governed_execute(
     if not gate["allowed"]:
         return {"stage": "gate", "allowed": False, "gate": gate,
                 "source_id": api["source_id"], "api_id": api_id}
-    budget_state = may_start_data_call(config)
-    if not budget_state["allowed"]:
-        return {"stage": "budget", "allowed": False, "budget": budget_state,
+    entry = (registry.get("entries") or {}).get(api["source_id"]) or {}
+    purpose_ok, purpose_reason = connector_policy.assert_purpose_registered(entry, purpose)
+    if not purpose_ok:
+        return {"stage": "gate", "allowed": False,
+                "gate": {"allowed": False, "reason": purpose_reason},
+                "source_id": api["source_id"], "api_id": api_id,
+                "detail": "purpose {0!r} is not registered for this source; refusing before any send".format(purpose)}
+    retention = connector_rights.decide_retention(gate["registry_status"])
+    destination_ok, destination_reason = connector_policy.assert_transport_destination(
+        transport, integration)
+    if not destination_ok:
+        return {"stage": "destination", "allowed": False,
+                "reason": destination_reason,
+                "source_id": api["source_id"], "api_id": api_id,
+                "detail": "transport destination does not match the approved exact origin+path"}
+    daily_limit = int(((config or {}).get("kimi_sources") or {}).get("daily_data_call_limit") or 5)
+    upstream = str(entry.get("upstream") or "")
+    quota_group = connector_policy.quota_group_for(upstream)
+    # Advisory fast-fail (read-only): an exhausted upstream quota refuses
+    # before even building the query — no request can follow. The
+    # AUTHORITATIVE check stays in the atomic reserve below the cache read.
+    with connector_queries.ConnectorQueryStore(_query_store_path(config)) as pre:
+        group_used = pre.quota_usage(quota_group)
+    if daily_limit > 0 and group_used >= daily_limit:
+        return {"stage": "budget", "allowed": False,
+                "budget": {"allowed": False,
+                           "reason": "daily data-call budget exhausted: {0}/{1}".format(group_used, daily_limit),
+                           "calls_today": group_used, "limit": daily_limit,
+                           "quota_group": quota_group},
                 "source_id": api["source_id"], "api_id": api_id}
     query = kimi_client.build_query(snapshot, api_id, raw_params, purpose=purpose,
                                     task_id=task_id, poc=integration.poc)
-    if allow_cache:
+    if refresh:
+        # An explicit refresh is a NEW billable intent (upstream data may have
+        # changed — restated statements, corrected filings). It shares nothing
+        # with the original key's never-re-bill guarantee: the wire key AND the
+        # intake key both change, and the result overwrites the cache document
+        # with a fresh as-of moment. uuid avoids same-second collisions.
+        import uuid as _uuid
+
+        query.idempotency_key = "{0}::refresh::{1}".format(
+            query.idempotency_key, _uuid.uuid4().hex[:12])
+    if allow_cache and not refresh:
         cached = read_cache(query, registry, config)
         if cached is not None:
             record_consumption("cache:{0}".format(cache_key(query)[:16]), purpose, config,
@@ -479,25 +571,65 @@ def governed_execute(
             return {"stage": "cache", "allowed": True, "cache_hit": True, "cached": cached,
                     "source_id": query.source_id, "api_id": api_id,
                     "idempotency_key": query.idempotency_key}
-    replay = find_intent(query.idempotency_key, config)
-    if replay is not None:
-        # Never re-bill an idempotent replay: return the prior intent
-        # reference; the caller can look up its result in the ledger.
-        return {"stage": "replay", "allowed": False, "prior_intent": replay,
-                "source_id": query.source_id, "api_id": api_id,
-                "idempotency_key": query.idempotency_key}
-    record_query_intent(query, config)
+    # ---- atomic intake (A18/A19/A25): one transaction in the query store ----
+    rate = gate["registry_status"].get("rate_limit") or {}
+    intake = connector_queries.ConnectorQueryStore(_query_store_path(config))
+    try:
+        verdict = intake.reserve_query(
+            query.idempotency_key, source_id=query.source_id, upstream=upstream,
+            purpose=str(purpose or ""),
+            per_source_rpm=int(rate.get("max_requests_per_minute") or 0),
+            per_source_rpd=int(rate.get("max_requests_per_day") or 0),
+            group_daily_limit=daily_limit, request_id=query.request_id)
+        if not verdict.get("reserved"):
+            reason = str(verdict.get("reason") or "quota_refused")
+            if reason == "rate_limited_minute":
+                return {"stage": "rate_limited", "allowed": False, "reason": reason,
+                        "rate": {"minute_used": verdict.get("minute_used"),
+                                 "limit": verdict.get("limit")}}
+            # Daily caps keep the historical "budget" stage shape so the board
+            # and existing callers see a familiar projection.
+            return {"stage": "budget", "allowed": False,
+                    "budget": {"allowed": False, "reason": reason,
+                               "calls_today": verdict.get("calls_today"),
+                               "limit": verdict.get("limit"),
+                               "quota_group": verdict.get("quota_group")},
+                    "source_id": query.source_id, "api_id": api_id}
+        if verdict.get("replay"):
+            # Never re-bill an idempotent replay: return the prior intent
+            # reference; the caller can look up its result in the ledger.
+            return {"stage": "replay", "allowed": False, "prior_intent": verdict["intent"],
+                    "source_id": query.source_id, "api_id": api_id,
+                    "idempotency_key": query.idempotency_key}
+        intent = verdict["intent"]
+        record_query_intent(query, config)  # JSONL stays the audit projection
+        intake.mark_dispatched(intent["intent_id"])
+    finally:
+        intake.close()
+    # Retention decides whether raw response bodies may touch disk at all:
+    # denied -> fully in-memory run regardless of the caller's artifact_root.
+    effective_artifact_root = artifact_root if retention.raw_artifacts else None
     result = kimi_client.execute_query(
         query, integration=integration, transport=transport,
         credential_provider=credential_provider,
         budget=budget or kimi_client.ExperimentBudget(),
-        artifact_root=artifact_root)
+        artifact_root=effective_artifact_root)
+    intake = connector_queries.ConnectorQueryStore(_query_store_path(config))
+    try:
+        intake.complete_query(intent["intent_id"], outcome=result.outcome)
+    finally:
+        intake.close()
     normalized = normalize_result_payload(query, result)
     if normalized is not None:
         write_cache(query, normalized, registry, config)
     record_query_result(result, config, extra={
-        "normalized_row_count": normalized.get("row_count") if normalized else None})
+        "normalized_row_count": normalized.get("row_count") if normalized else None,
+        "intent_id": intent["intent_id"],
+        "quota_group": intent.get("quota_group") or ""})
     return {"stage": "executed", "allowed": result.outcome in {"ok"},
             "result": result, "normalized": normalized,
             "source_id": query.source_id, "api_id": api_id,
-            "idempotency_key": query.idempotency_key}
+            "idempotency_key": query.idempotency_key,
+            "intent_id": intent["intent_id"],
+            "quota_group": intent.get("quota_group") or "",
+            "retention": retention.as_dict()}

@@ -34,19 +34,25 @@ PRICED_PARAMS = {"ticker": "600519.SH", "start_date": "2026-09-28",
 def registry_entry(source_id: str, kind: str, *, state: str = "approved",
                     expires: str = "2099-12-31", retention: bool = True,
                     external_send: bool = False,
-                    upstream: str = "ifind") -> Dict[str, Any]:
+                    upstream: str = "ifind",
+                    purposes: tuple = ("event price background",),
+                    rpm: int = 60) -> Dict[str, Any]:
     return {
         "source_id": source_id,
         "kind": kind,
         "upstream": upstream,
         "purpose": "test purpose",
+        # R04: machine-readable purpose allowlist — the execution gate fails
+        # closed without it; rpm headroom keeps the daily-budget tests about
+        # the DAILY cap rather than the minute window.
+        "purposes": list(purposes),
         "approval": {"state": state,
                      "approved_by": "真实负责人" if state == "approved" else "",
                      "approved_at": "2026-10-01T00:00:00" if state == "approved" else ""},
         "body_retention_allowed": retention,
         "llm_external_send_allowed": external_send,
         "timeliness": {"expected_max_delay_minutes": 1440, "staleness_policy": "flag"},
-        "rate_limit": {"max_requests_per_minute": 1, "max_requests_per_day": 10},
+        "rate_limit": {"max_requests_per_minute": rpm, "max_requests_per_day": 10},
         "expires_at": expires,
     }
 

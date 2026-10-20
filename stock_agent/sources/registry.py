@@ -27,6 +27,10 @@ ENTRY_FIELDS = {
     "body_retention_allowed", "llm_external_send_allowed",
     "timeliness", "rate_limit", "expires_at",
 }
+# R04: optional machine-readable purpose allowlist. ``purpose`` stays the
+# human description; an entry WITHOUT ``purposes`` executes nothing (the
+# execution gate fails closed on unregistered purposes).
+OPTIONAL_ENTRY_FIELDS = {"purposes"}
 TIMELINESS_FIELDS = {"expected_max_delay_minutes", "staleness_policy"}
 RATE_LIMIT_FIELDS = {"max_requests_per_minute", "max_requests_per_day"}
 APPROVAL_FIELDS = {"state", "approved_by", "approved_at"}
@@ -94,7 +98,7 @@ def validate_registry_entries(raw_entries: Any) -> List[Dict[str, Any]]:
     for raw in raw_entries:
         if not isinstance(raw, dict):
             raise SourceRegistryError("each registry entry must be an object")
-        unexpected = set(raw) - ENTRY_FIELDS
+        unexpected = set(raw) - ENTRY_FIELDS - OPTIONAL_ENTRY_FIELDS
         if unexpected:
             raise SourceRegistryError(
                 "unexpected registry fields: {0}".format(sorted(unexpected)))
@@ -102,6 +106,12 @@ def validate_registry_entries(raw_entries: Any) -> List[Dict[str, Any]]:
         if missing:
             raise SourceRegistryError(
                 "missing registry fields: {0}".format(sorted(missing)))
+        purposes = raw.get("purposes", [])
+        if not isinstance(purposes, list) or \
+                not all(isinstance(item, str) and item.strip() for item in purposes):
+            raise SourceRegistryError(
+                "source_id {0}: purposes must be a list of non-empty strings when present".format(
+                    raw.get("source_id") or "?"))
         source_id = _require_str(raw["source_id"], "source_id")
         if source_id in seen_ids:
             raise SourceRegistryError("duplicate source_id: {0}".format(source_id))

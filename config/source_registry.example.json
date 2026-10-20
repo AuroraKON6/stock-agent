@@ -22,7 +22,8 @@
         "max_requests_per_minute": 1,
         "max_requests_per_day": 100
       },
-      "expires_at": "2099-12-31"
+      "expires_at": "2099-12-31",
+      "purposes": []
     },
     {
       "source_id": "eastmoney",
@@ -44,7 +45,8 @@
         "max_requests_per_minute": 6,
         "max_requests_per_day": 500
       },
-      "expires_at": "2099-12-31"
+      "expires_at": "2099-12-31",
+      "purposes": []
     },
     {
       "source_id": "eastmoney_filing",
@@ -66,7 +68,8 @@
         "max_requests_per_minute": 6,
         "max_requests_per_day": 500
       },
-      "expires_at": "2099-12-31"
+      "expires_at": "2099-12-31",
+      "purposes": []
     }
   ]
 }

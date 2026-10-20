@@ -333,7 +333,7 @@ class DifyGateway:
         # Whether THIS run's association is new is decided against the
         # pre-create state: a fresh run id landing on an existing task is a
         # newly RECORDED association, only a re-sent run id is a DUPLICATE.
-        pre_existing_run = self.store.get_platform_run("dify", run_id)
+        pre_existing_run = workflow_service.platform_run(self._db_path, "dify", run_id)
         task, outcome = workflow_service.create_research_task(
             self._db_path,
             title=title, input_payload=input_payload, case_id=str(case_id or ""),
@@ -732,8 +732,15 @@ class DifyGateway:
             raise ValueError("ttl_seconds must be a positive integer")
         moment = now or datetime.now().astimezone()
         expires_at = (moment + timedelta(seconds=int(ttl_seconds))).isoformat()
+        # uuid in the hash material: two issuances for the same actor within
+        # one second (e.g. concurrent cancel+feedback threads) are two
+        # DISTINCT receipts — a timestamp alone collides and wrongly trips the
+        # register's same-id-different-scope conflict.
+        import uuid as _uuid
+
         verification_id = "pv-{0}".format(_canonical_sha256({
             "actor": actor, "role": str(role or ""), "issued_at": moment.isoformat(),
+            "nonce": _uuid.uuid4().hex,
         })[:16])
         with workflow_service.request_store(self._db_path) as store:
             store.register_principal_verification(

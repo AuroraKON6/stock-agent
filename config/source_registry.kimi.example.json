@@ -22,7 +22,8 @@
         "max_requests_per_minute": 1,
         "max_requests_per_day": 10
       },
-      "expires_at": "2027-06-30"
+      "expires_at": "2027-06-30",
+      "purposes": []
     },
     {
       "source_id": "kimi_ifind_filing",
@@ -44,7 +45,8 @@
         "max_requests_per_minute": 1,
         "max_requests_per_day": 10
       },
-      "expires_at": "2027-06-30"
+      "expires_at": "2027-06-30",
+      "purposes": []
     },
     {
       "source_id": "kimi_ifind_financials",
@@ -66,7 +68,8 @@
         "max_requests_per_minute": 1,
         "max_requests_per_day": 10
       },
-      "expires_at": "2027-06-30"
+      "expires_at": "2027-06-30",
+      "purposes": []
     },
     {
       "source_id": "kimi_dongcai_news",
@@ -88,7 +91,8 @@
         "max_requests_per_minute": 1,
         "max_requests_per_day": 10
       },
-      "expires_at": "2027-06-30"
+      "expires_at": "2027-06-30",
+      "purposes": []
     }
   ]
 }
