@@ -69,11 +69,22 @@ class EvidenceFactTests(unittest.TestCase):
         fact = build_fact(
             self.config, derived_selector, fact_type="amount",
             statement="营业收入（元）", value=120000000.0, unit="cny",
-            computed={"formula": "value_in_yi * 100000000", "input_fact_ids": [base["fact_id"]]},
+            computed={"operation": "convert_unit",
+                      "input_fact_ids": [base["fact_id"]],
+                      "params": {"to_unit": "cny"}},
         )
-        self.assertEqual(fact["computation"]["formula"], "value_in_yi * 100000000")
+        self.assertEqual(fact["computation"]["operation"], "convert_unit")
+        self.assertEqual(fact["computation"]["params"], {"to_unit": "cny"})
         self.assertEqual(fact["computation"]["input_fact_ids"], [base["fact_id"]])
         self.assertEqual(fact["computation"]["converted_by"], "deterministic_code")
+        # R05: free-form formula strings are prose, never executable claims.
+        with self.assertRaises(ValueError):
+            build_fact(
+                self.config, dict(self.selector), fact_type="amount",
+                statement="营业收入（元）", value=120000000.0, unit="cny",
+                computed={"formula": "value_in_yi * 100000000",
+                          "input_fact_ids": [base["fact_id"]]},
+            )
 
     def test_unknown_fact_type_rejected(self):
         with self.assertRaises(ValueError):
