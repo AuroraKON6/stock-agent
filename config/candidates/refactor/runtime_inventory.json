@@ -1,0 +1,120 @@
+{
+  "schema_version": "refactor-r00-candidate-1",
+  "generated_at": "2026-10-20T00:00:00+08:00",
+  "generated_by": "GLM R00 (增量基线；只读采集，无运行时写入)",
+  "baseline": {
+    "head": "004e4da3b698f1029c9d74f42813fbe772397fc6",
+    "head_subject": "DF-02: service credential registry, internal API v1, scoped access control",
+    "audit_report": "docs/implementation/CODEX_REAUDIT_20261020.md",
+    "worktree_at_start": "仅 5 份未跟踪交接文档（docs/GLM_*、docs/implementation/CODEX_*）；无并行源码修改",
+    "r01_batch_dirty_files": [
+      "stock_agent/task_runtime/store.py",
+      "stock_agent/dify_api.py",
+      "stock_agent/research_worker.py",
+      "stock_agent/task_intake.py",
+      "tests/test_refactor_r01.py",
+      "tests/test_research_worker_rounds.py",
+      "tests/test_acceptance_fixes_20260921.py",
+      "tests/test_review_fixes_20260921b.py",
+      "tests/test_first_product_slice.py"
+    ]
+  },
+  "code_inventory": {
+    "evidence_class": "existing (recounted this batch)",
+    "python_source_files": 104,
+    "python_test_files": 121,
+    "python_source_lines": 52869,
+    "python_test_lines": 30777,
+    "counting_method": "find stock_agent|tests -name '*.py' 内容行数（与审查报告 47,319/26,644 的口径差异来自统计方法，两处均如实记录）",
+    "cli_subcommands_declared": 135
+  },
+  "runtime_state_roots": {
+    "evidence_class": "existing",
+    "data_root": "data/",
+    "sqlite_business": ["data/stock_agent.sqlite3"],
+    "sqlite_task_runtime_dir": "data/task_runtime/",
+    "append_only_jsonl_domains": [
+      "data/events", "data/evidence_vault", "data/research_cases", "data/research_runtime",
+      "data/research_workpapers", "data/research_operations", "data/review",
+      "data/llm_governance", "data/model_operations", "data/pi_runtime",
+      "data/run_coordination", "data/business_onboarding", "data/production_pilot",
+      "data/value_validation", "data/workspace", "data/decisions", "data/remediation",
+      "data/inbox", "data/cache", "data/backup_restore", "data/uat", "data/research_git"
+    ],
+    "historical_live_test_artifacts": "data/ 下另有十余个 *_verify/live_test*.sqlite3 历史验收文件（保留为历史证据，不清理、不迁移）",
+    "writers": "run/agent-run/watch 经 stock_agent CLI 写 SQLite+JSONL；task board/dify API server 为 HTTP 线程写者；测试仅写临时目录"
+  },
+  "service_entries": {
+    "evidence_class": "existing",
+    "cli": "python -m stock_agent (run/watch/agent-run/review/dashboard 等计划模式)",
+    "http_servers": [
+      "stock_agent/task_board.py (研究面板+SSE)",
+      "stock_agent/dify_api_server.py (DF-02 内部 API v1, 回环绑定)"
+    ],
+    "worker": "stock_agent/research_worker.py (run_research_task; 经 cli task-run-next / daily-task-cycle 驱动)",
+    "powershell_scripts": [
+      "scripts/run_daily_research.ps1", "scripts/run_once.ps1", "scripts/watch.ps1",
+      "scripts/start_agent.ps1", "scripts/stop_agent.ps1",
+      "scripts/start_research_workbench.ps1", "scripts/stop_research_workbench.ps1",
+      "scripts/install_scheduled_tasks.ps1", "scripts/uninstall_scheduled_tasks.ps1",
+      "scripts/go_live_check.ps1", "scripts/migrate_to_pi_agent.ps1",
+      "scripts/rollback_pi_agent.ps1", "scripts/create_dashboard_shortcut.ps1",
+      "scripts/create_research_workbench_shortcuts.ps1",
+      "scripts/update_openclaw_stock_agent_models.ps1"
+    ],
+    "installed_scheduled_tasks": {
+      "status": "NOT_RUN",
+      "note": "未查询系统计划任务存储（schtasks）；脚本存在不等于任务已安装"
+    }
+  },
+  "platform_versions": {
+    "evidence_class": "mixed; 见各项",
+    "python_locked_interpreter": ".venv312/Scripts/python.exe (3.12.13) — existing",
+    "requirements_lock": {
+      "sha256_prefix": "41abe53a7ef268f9",
+      "target": "python 3.11 / windows (uv pip compile)",
+      "linux_lock": {"status": "gap", "note": "R08 待生成 requirements.linux-py312.lock.txt"}
+    },
+    "dify_anchor": "1.17.1 候选锚（DF-01 登记）；本地 F 盘副本工作树不完整，不可部署 — existing candidate",
+    "docker_cli_on_path": "absent（Git Bash 与标准位置未发现）— existing",
+    "wsl_distributions": {
+      "rechecked_this_batch": "2026-10-20 本批复核：Ubuntu=Stopped, docker-desktop=Running (version 2)",
+      "change_vs_audit": "审查报告未记录 docker-desktop 发行版；相对审查快照为新增事实",
+      "docker_desktop_inner_state": "UNVERIFIED — 未启动/停止任何发行版，未执行 docker 命令"
+    }
+  },
+  "config_inventory": {
+    "evidence_class": "existing",
+    "watchlist_example_top_level_keys": [
+      "agent_handoff", "backup_restore", "business_onboarding", "llm_agent",
+      "llm_governance", "market_data_governance", "market_resilience",
+      "model_operations", "multi_role_agent", "official_evidence_vault",
+      "openclaw_handoff", "output_language", "pi_agent", "priority_rules",
+      "production_pilot", "project_name", "report", "research_cases",
+      "research_framework", "research_git", "research_operations",
+      "research_runtime", "research_team", "research_workpapers", "review",
+      "review_queue", "run_coordination", "run_manifest", "run_ops", "skills",
+      "source_health", "sources", "storage", "timezone", "topics", "value_validation"
+    ],
+    "local_configs_present": [
+      "config/watchlist.local.json", "config/research_restrictions.local.json",
+      "config/research_roster.local.json"
+    ],
+    "secrets_policy": "本清单只记录文件名与键名，不含任何值/哈希/令牌；local 配置与名册不进入镜像（R08 边界）"
+  },
+  "test_baseline": {
+    "evidence_class": "existing (audit) + this-batch targeted runs",
+    "audit_full_run": "1347 tests, errors=14, skipped=2, exit 1 (378.233s)；错误集中于原生子进程守卫拒绝与后台 socket 生命周期",
+    "this_batch_targeted": "test_refactor_r01 21/21 OK；dify_api_v1/task_intake/case_budget/research_worker_rounds/first_product_slice/acceptance_fixes/review_fixes_b+c/fault_matrix/daily_task_cycle/budget_*/task_board_sse/task_detail/task_signal_binding/task_supply 全 OK；test_research_workbench_ops 维持 5 errors（均为已记录的 unguarded child process 守卫阻断）",
+    "full_suite_after_r01": "1368 tests, errors=14, skipped=2, exit 1（基线 1347/14/2 + 21 个 R01 新测试全部通过；错误构成不变，均为已记录守卫阻断）"
+  },
+  "gaps_for_migration": [
+    {"gap": "Linux 依赖锁不存在", "blocks": "R08"},
+    {"gap": "config.py 路径锚定源码根、测试 override 不跨线程（F18）", "blocks": "R07"},
+    {"gap": "本机 Windows 身份入口在非 Windows 拒绝（F17）", "blocks": "R10"},
+    {"gap": "Dify 本地收藏副本不完整，需另取干净固定 release（F23）", "blocks": "R16"},
+    {"gap": "scheduler/run_coordination 为本机文件租约，未覆盖容器生命周期（F19）", "blocks": "R09/R25"},
+    {"gap": "历史列/payload input_version 分歧需先跑 input_version_divergence_report（R01 已提供只读诊断）", "blocks": "生产数据迁移前"}
+  ],
+  "rollback": "本清单与 R00 文档为新增文件，不影响任何运行路径；删除即回退。"
+}
