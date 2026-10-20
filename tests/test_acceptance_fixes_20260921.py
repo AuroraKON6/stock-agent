@@ -271,7 +271,10 @@ class F07Tests(Workspace):
         claimed = self.store.claim_next("w1")
         with self.scoped():
             result = run_research_task(self.store, task["task_id"], worker_id="w1", config={})
-        self.assertEqual(result["status"], "failed")
+        # R01/F05: retryable with attempts left requeues; the worker reports the
+        # persisted status and the rejection stays visible in the error chain.
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(self.store.get_task(task["task_id"])["status"], "queued")
         self.assertIn("evidence", str(result.get("error") or self.store.get_task(task["task_id"])["last_error"]).lower())
 
 

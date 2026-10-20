@@ -147,42 +147,85 @@ def ensure_question_task(
     actor: str = "operator",
     execution_mode: str = "replay",
     lookback_hours: int = 48,
+    intent_id: str = "",
+    new_research: bool = False,
+    as_of: str = "",
 ) -> Dict[str, Any]:
+    """Create a question task with explicit retry/new-research semantics (R01).
+
+    Three deliberate paths:
+
+    - ``intent_id`` given: a network/submit retry of ONE business intent. The
+      same intent returns the existing task; different content under the same
+      intent is a conflict, never a silent overwrite.
+    - ``new_research=True``: the user explicitly re-researches. A FRESH intent
+      id is minted, the as-of moment is recorded, and the previous task for
+      the same question text/symbols/mode is linked as ``prior_task_id``.
+      Asking the same question tomorrow is a new research occasion, not a
+      permanent cache hit.
+    - neither (default): the legacy stable question key — same question text +
+      symbols + mode deduplicates, with the store's rebuilt-context exemption.
+    """
+
     question = str(research_question or "").strip()
     if not question:
         raise TaskIntakeError("research_question must not be empty")
     clean_symbols = [str(symbol).strip() for symbol in symbols if str(symbol).strip()]
     if not clean_symbols:
         raise TaskIntakeError("question tasks must name at least one symbol")
+    if intent_id and new_research:
+        raise TaskIntakeError("pass intent_id (retry) or new_research=True, not both")
     spec = build_task_spec(
         research_question=question, symbols=clean_symbols,
         lookback_hours=lookback_hours, execution_mode=execution_mode, config=config)
+    question_sha256 = hashlib.sha256(question.encode("utf-8")).hexdigest()
     spec["origin"] = {
         "kind": "question",
-        "question_sha256": hashlib.sha256(question.encode("utf-8")).hexdigest(),
+        "question_sha256": question_sha256,
         "symbols": clean_symbols,
     }
     # Question identity = the question text + symbol scope + mode. A rebuilt
     # public context (fresh cache/timestamps) is not a new question; the store
     # applies the same logical-request exemption as for events.
     question_key = "question::{0}::{1}::{2}".format(
-        spec["origin"]["question_sha256"],
+        question_sha256,
         ",".join(sorted(clean_symbols)),
         execution_mode,
     )
+    business_intent_id = ""
+    if intent_id:
+        business_intent_id = str(intent_id).strip()
+        idempotency_key = "question_intent::{0}".format(business_intent_id)
+    elif new_research:
+        import uuid as _uuid
+
+        from .models import now_iso as _now_iso
+
+        # Every explicit re-research is a fresh intent; a time-hash could
+        # collide within one second, a uuid cannot.
+        business_intent_id = "qi_{0}".format(_uuid.uuid4().hex[:20])
+        prior = store.find_task_by_idempotency_key(question_key)
+        spec["origin"]["as_of"] = str(as_of or "").strip() or _now_iso()
+        spec["origin"]["prior_task_id"] = str(prior["task_id"]) if prior else None
+        spec["origin"]["research_occasion"] = "explicit_new_research"
+        idempotency_key = "question_intent::{0}".format(business_intent_id)
+    else:
+        idempotency_key = question_key
     task, status = store.create_task(
         title="用户问题：{0}".format(question)[:MAX_TITLE_CHARS],
         input_payload=spec,
         execution_mode=execution_mode,
         actor=actor,
-        idempotency_key=question_key,
+        idempotency_key=idempotency_key,
+        business_intent_id=business_intent_id,
     )
     return {
         "task": task,
         "status": status,
         "event_key": None,
         "base_key": None,
-        "supersedes_task_id": None,
+        "supersedes_task_id": spec["origin"].get("prior_task_id"),
+        "business_intent_id": business_intent_id or None,
     }
 
 
@@ -258,6 +301,10 @@ def run_daily_task_cycle(
             awaiting_human += 1
         elif status == "cancelled":
             cancelled += 1
+        elif status == "queued":
+            # R01/F05: a retryable failure with attempts left persists as
+            # queued (one attempt consumed); that is a retry, not a failure.
+            retried += 1
         else:
             failed += 1
     remaining = len(store.list_tasks(status="queued"))

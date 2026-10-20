@@ -27,6 +27,15 @@ from .agent_protocol import (
     validate_model_output,
 )
 from .config import project_path
+from .invocation_runtime import (
+    ModelCallNotSent,
+    ModelKnownFailure,
+    ModelOutcomeUnknown,
+    call_deadline_seconds,
+    classify_exception,
+    classify_to_exception,
+    lease_heartbeat,
+)
 from .llm_agent import _get_llm_config, _is_auth_error, _parse_llm_json
 from .models import AnalyzedSignal, now_iso
 from .task_runtime import (
@@ -393,33 +402,57 @@ def run_research_task(
         "prompt_version": RESEARCH_PROMPT_VERSION,
         "rounds": [],
     }
+    # R02/F04: a lease renewal failure during ANY call revokes this worker's
+    # right to start NEW outbound requests, even if the between-rounds renewal
+    # would happen to succeed afterwards.
+    heartbeat_state: Dict[str, Any] = {"healthy": True, "beats": 0}
 
-    def _renew_or_fail() -> bool:
+    def _renew_or_fail() -> Optional[Dict[str, Any]]:
+        """Renew the lease; on failure record it and return the PERSISTED result.
+
+        Returns None when the renewal succeeded. The returned status comes from
+        the store (the failure may have requeued or cancelled the task, not
+        necessarily terminated it) — never a guessed terminal label.
+        """
+
         try:
             store.renew_lease(task_id, worker_id=worker_id, fencing_token=task["fencing_token"], ttl_seconds=ttl_seconds)
-            return True
+            return None
         except TaskRuntimeError as exc:
             model_call["error"] = "lease renewal failed: {0}".format(exc)
-            store.fail(task_id, worker_id=worker_id, fencing_token=task["fencing_token"],
-                      error=str(model_call["error"]), retryable=True, model_call=model_call)
-            return False
+            fresh = store.fail(task_id, worker_id=worker_id, fencing_token=task["fencing_token"],
+                               error=str(model_call["error"]), retryable=True, model_call=model_call)
+            return {"status": str(fresh.get("status") or "failed"), "model_call": model_call,
+                    "error": str(model_call["error"])}
 
     def _fail(error: str, *, retryable: bool) -> Dict[str, Any]:
         model_call["duration_seconds"] = round(time.perf_counter() - started, 3)
-        store.fail(task_id, worker_id=worker_id, fencing_token=task["fencing_token"],
-                  error=error, retryable=retryable, model_call=model_call)
-        return {"status": "failed", "model_call": model_call, "error": error}
+        fresh = store.fail(task_id, worker_id=worker_id, fencing_token=task["fencing_token"],
+                           error=error, retryable=retryable, model_call=model_call)
+        # R01/F05: report what the store actually persisted. A retryable
+        # failure with attempts left REQUEUES (queued) and a cancel that
+        # landed mid-run CANCELS; "failed" is only one of the outcomes.
+        return {"status": str(fresh.get("status") or "failed"), "model_call": model_call, "error": error}
 
     def _blocked(reason: str, governance: Dict[str, Any]) -> Dict[str, Any]:
         model_call["governance"] = governance
         model_call["error"] = reason
         model_call["duration_seconds"] = round(time.perf_counter() - started, 3)
-        store.mark_blocked(task_id, worker_id=worker_id, fencing_token=task["fencing_token"],
-                          error=reason, model_call=model_call)
-        return {"status": STATUS_BLOCKED, "model_call": model_call, "error": reason}
+        fresh = store.mark_blocked(task_id, worker_id=worker_id, fencing_token=task["fencing_token"],
+                                   error=reason, model_call=model_call)
+        return {"status": str(fresh.get("status") or STATUS_BLOCKED), "model_call": model_call, "error": reason}
 
     def _invoke_model(user_prompt: str, round_index: int) -> Tuple[str, Dict[str, Any]]:
-        """One model attempt; returns (raw_text, per_round_record_without_results)."""
+        """One model attempt; returns (raw_text, per_round_record_without_results).
+
+        R02: every call walks the outbound attempt chain — the budget is
+        reserved (existing atomic reservation), the attempt row is written
+        (prepared) and marked dispatched BEFORE the request can leave, the
+        lease is heartbeated on a separate connection during the call, and the
+        terminal attempt record captures whether the request provably never
+        left (sent=no), reached the provider (sent=yes), or may have been sent
+        with no answer (outcome_unknown — never auto-retried).
+        """
         from .pi_runtime import call_pi_agent
         from .model_operations import response_metadata
 
@@ -452,18 +485,75 @@ def run_research_task(
             fencing_token=task["fencing_token"], attempt=attempt)
         if not reservation.get("reserved"):
             raise _BudgetExhausted(reservation)
+        from .task_runtime.store import ATTEMPT_FAILED_KNOWN, ATTEMPT_OUTCOME_UNKNOWN, ATTEMPT_SUCCEEDED
+
+        provider_timeout = int(provider.get("timeout") or llm_cfg.get("timeout") or 60)
+        deadline = call_deadline_seconds(
+            provider_timeout=provider_timeout, case_time_limit=case_time_limit,
+            elapsed_seconds=time.perf_counter() - started)
+        if deadline <= 0:
+            # The case budget is exhausted before dispatch: provably not sent,
+            # so this is a safe retryable failure, not an unknown outcome.
+            raise ModelCallNotSent(
+                RuntimeError("case deadline exhausted before model dispatch"),
+                "sent=no stage=preflight")
+        invocation = store.prepare_invocation_attempt(
+            task_id, worker_id=worker_id, fencing_token=task["fencing_token"],
+            round_index=round_index, provider=provider_name,
+            request_model=request_model, prompt_sha256=attempt["prompt_sha256"],
+            budget_event_id=str(reservation.get("event_id") or ""),
+            deadline_seconds=deadline)
+        attempt_id = str(invocation["attempt_id"])
+        store.mark_invocation_dispatched(attempt_id, worker_id=worker_id,
+                                         fencing_token=task["fencing_token"])
         round_started = time.perf_counter()
-        response = call_pi_agent(
-            system_prompt=_SYSTEM_PROMPT,
-            user_content=user_prompt,
-            provider=provider,
-            config=config,
-            role_id=str(task.get("role_id") or "research_analyst"),
-            timeout=int(provider.get("timeout") or llm_cfg.get("timeout") or 60),
-        )
+        runner = None
+        try:
+            with lease_heartbeat(store.db_path, task_id, worker_id=worker_id,
+                                 fencing_token=task["fencing_token"],
+                                 ttl_seconds=ttl_seconds) as heartbeat:
+                runner = heartbeat
+                response = call_pi_agent(
+                    system_prompt=_SYSTEM_PROMPT,
+                    user_content=user_prompt,
+                    provider=provider,
+                    config=config,
+                    role_id=str(task.get("role_id") or "research_analyst"),
+                    timeout=deadline,
+                )
+        except BaseException as exc:
+            sent, stage = classify_exception(exc)
+            error_text = "{0}: {1}".format(type(exc).__name__, str(exc)[:500])
+            if runner is not None:
+                heartbeat_state["healthy"] = runner.healthy
+                heartbeat_state["beats"] = runner.beats
+            try:
+                store.complete_invocation_attempt(
+                    attempt_id, worker_id=worker_id, fencing_token=task["fencing_token"],
+                    state=(ATTEMPT_OUTCOME_UNKNOWN if sent == "unknown" else ATTEMPT_FAILED_KNOWN),
+                    sent=sent, error=error_text,
+                    heartbeat_beats=(runner.beats if runner else 0),
+                    heartbeat_healthy=(runner.healthy if runner else True))
+            except TaskRuntimeError:
+                # The lease was lost during the call: the attempt row stays
+                # dispatched and crash recovery will classify it; the typed
+                # exception below still drives the task-level outcome (whose
+                # own store write may then fail with fencing, as before).
+                pass
+            typed = classify_to_exception(exc)
+            typed.attempt_id = attempt_id
+            raise typed from exc
+        heartbeat_state["healthy"] = runner.healthy if runner else True
+        heartbeat_state["beats"] = (runner.beats if runner else 0)
+        store.complete_invocation_attempt(
+            attempt_id, worker_id=worker_id, fencing_token=task["fencing_token"],
+            state=ATTEMPT_SUCCEEDED, sent="yes",
+            heartbeat_beats=(runner.beats if runner else 0),
+            heartbeat_healthy=(runner.healthy if runner else True))
         meta = response_metadata(response)
         record = {
             **attempt,
+            "attempt_id": attempt_id,
             "actual_model": str(meta.get("model") or "unknown"),
             "request_id": str(meta.get("request_id") or ""),
             "usage": dict(meta.get("usage") or {}),
@@ -512,6 +602,18 @@ def run_research_task(
                     "case time limit exceeded after {0:.0f}s (limit {1}s); no further model rounds".format(
                         elapsed, case_time_limit),
                     retryable=False)
+            if not heartbeat_state.get("healthy", True):
+                # F04: a heartbeat renewal failed during a previous call. The
+                # in-flight outcome was already recorded; this worker must not
+                # dispatch anything new. The task requeues for a fresh lease.
+                model_call["error"] = "lease heartbeat failed during a model call; no new outbound permitted"
+                model_call["lease_heartbeat"] = dict(heartbeat_state)
+                fresh = store.fail(task_id, worker_id=worker_id,
+                                   fencing_token=task["fencing_token"],
+                                   error=str(model_call["error"]), retryable=True,
+                                   model_call=model_call)
+                return {"status": str(fresh.get("status") or "failed"),
+                        "model_call": model_call, "error": str(model_call["error"])}
 
             if round_index > 1:
                 # Governance and context verification re-run on every round
@@ -528,9 +630,9 @@ def run_research_task(
                 assert_payload_external_safe(user_prompt)
             except ResearchWorkerError as exc:
                 return _blocked(str(exc), governance)
-            if not _renew_or_fail():
-                return {"status": "failed", "model_call": model_call}
-
+            renewal_failure = _renew_or_fail()
+            if renewal_failure is not None:
+                return renewal_failure
             try:
                 raw_text, round_record = _invoke_model(user_prompt, round_index)
                 model_call["called"] = True
@@ -551,6 +653,33 @@ def run_research_task(
                 return _blocked(exc.decision.get("reason") or "budget exhausted",
                                 {"gate": "budget", "decision": "denied",
                                  "budget": dict(exc.decision)})
+            except ModelCallNotSent as exc:
+                # A06: the request provably never left this machine (pre-send
+                # failure). A bounded retry is safe; the attempt chain already
+                # records sent=no.
+                model_call["error"] = "{0}: {1}".format(type(exc.original).__name__, str(exc.original)[:500])
+                model_call["lease_heartbeat"] = dict(heartbeat_state)
+                return _fail(model_call["error"], retryable=True)
+            except ModelOutcomeUnknown as exc:
+                # A07/A08: the request may have reached the provider with no
+                # usable answer. Budget stays held, the attempt enters
+                # reconciliation, and the task blocks — NO auto re-dispatch.
+                model_call["error"] = "{0}: {1}".format(type(exc.original).__name__, str(exc.original)[:500])
+                model_call["lease_heartbeat"] = dict(heartbeat_state)
+                return _blocked(
+                    "model invocation outcome unknown (attempt {0}); manual reconciliation required before any retry".format(
+                        getattr(exc, "attempt_id", "")),
+                    {"gate": "invocation_outcome_unknown", "decision": "denied",
+                     "attempt_id": getattr(exc, "attempt_id", ""),
+                     "sent": "unknown"})
+            except ModelKnownFailure as exc:
+                # The provider answered definitively (auth/quota/rejection or
+                # an unusable response). The charge outcome is the provider's
+                # statement; retrying is a deliberate decision above this
+                # layer, so the task does not auto-requeue.
+                model_call["error"] = "{0}: {1}".format(type(exc.original).__name__, str(exc.original)[:500])
+                model_call["lease_heartbeat"] = dict(heartbeat_state)
+                return _fail(model_call["error"], retryable=False)
             except Exception as exc:
                 model_call["error"] = "{0}: {1}".format(type(exc).__name__, str(exc)[:500])
                 return _fail(model_call["error"], retryable=not _is_auth_error(exc))
@@ -663,9 +792,12 @@ def run_research_task(
             output=output,
             model_call=model_call,
         )
-        if stored["status"] == STATUS_BLOCKED or stored.get("cancel_requested"):
-            return {"status": stored["status"], "model_call": model_call, "output": output}
-        return {"status": "awaiting_human", "model_call": model_call, "output": output}
+        # R01/F05: the persisted status decides — a cancellation that landed
+        # before the handoff is 'cancelled', never 'awaiting_human'.
+        return {"status": str(stored.get("status") or "awaiting_human"),
+                "model_call": model_call, "output": output}
 
-    store.complete(task_id, worker_id=worker_id, fencing_token=task["fencing_token"], output=output, model_call=model_call)
-    return {"status": STATUS_SUCCEEDED, "model_call": model_call, "output": output}
+    stored = store.complete(task_id, worker_id=worker_id, fencing_token=task["fencing_token"], output=output, model_call=model_call)
+    # R01/F05: complete() itself may persist 'cancelled' when the user cancelled
+    # during the run; the worker must report that, not assume success.
+    return {"status": str(stored.get("status") or STATUS_SUCCEEDED), "model_call": model_call, "output": output}

@@ -309,9 +309,12 @@ class ResearchWorkerTests(unittest.TestCase):
         self.assertEqual(result["status"], STATUS_SUCCEEDED)
         self.assertEqual(self.store.get_task(claimed["task_id"])["status"], STATUS_SUCCEEDED)
 
-    def test_replay_missing_response_fails(self):
-        result, _ = self._run({"research_question": "q", "data_classification": "public", "public_context": {}})
-        self.assertEqual(result["status"], STATUS_FAILED)
+    def test_replay_missing_response_requeues(self):
+        result, claimed = self._run({"research_question": "q", "data_classification": "public", "public_context": {}})
+        # R01/F05: retryable failure with attempts left persists as queued;
+        # the replay error stays visible in the call audit.
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(self.store.get_task(claimed["task_id"])["status"], "queued")
         self.assertIn("replay", str(result["model_call"].get("error") or ""))
 
     def test_live_auth_error_fails_without_retry(self):

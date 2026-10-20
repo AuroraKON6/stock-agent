@@ -61,7 +61,42 @@ SAFE_ENV_KEYS = {
 
 
 class PiRuntimeError(RuntimeError):
-    pass
+    # R02 outbound classification tags (read by invocation_runtime.classify_exception):
+    # failure_stage = preflight | process | parse | audit; sent_hint = no|yes|unknown.
+    # Untagged errors default to the conservative 'unknown' (never auto-retry).
+    failure_stage = ""
+    sent_hint = ""
+
+
+def _tagged_error(message: str, *, stage: str, sent_hint: str) -> PiRuntimeError:
+    error = PiRuntimeError(message)
+    error.failure_stage = stage
+    error.sent_hint = sent_hint
+    return error
+
+
+# Message fragments that answer "did the request leave?" for exit-code errors
+# whose stderr we cannot otherwise interpret. Kept local so pi_runtime stays
+# import-free of the classification layer.
+_EXIT_TEXT_NOT_SENT = (
+    "connection refused", "getaddrinfo", "name or service not known",
+    "failed to resolve", "no route to host", "network is unreachable",
+)
+_EXIT_TEXT_SENT_DEFINITIVE = (
+    "http error 4", "http error 5", "status 4", "status 5", "statuscode=4",
+    "statuscode=5", "401", "403", "429", "unauthorized",
+)
+
+
+def _exit_sent_hint(error_text: str) -> str:
+    lowered = str(error_text or "").lower()
+    for marker in _EXIT_TEXT_NOT_SENT:
+        if marker in lowered:
+            return "no"
+    for marker in _EXIT_TEXT_SENT_DEFINITIVE:
+        if marker in lowered:
+            return "yes"
+    return "unknown"
 
 
 PI_UAT_SYSTEM_PROMPT = """You are executing a synthetic runtime acceptance test.
@@ -119,15 +154,15 @@ def call_pi_agent(
     provider = dict(provider or {})
     pi_cfg = get_pi_config(config)
     if not pi_cfg["enabled"]:
-        raise PiRuntimeError("Pi Agent runtime is disabled")
+        raise _tagged_error("Pi Agent runtime is disabled", stage="preflight", sent_hint="no")
 
     expected_version = str(pi_cfg["version"])
     command, package_json = resolve_pi_command(pi_cfg)
     installed_version = _installed_pi_version(package_json)
     if installed_version and installed_version != expected_version:
-        raise PiRuntimeError(
-            "Pi version mismatch: expected {0}, installed {1}".format(expected_version, installed_version)
-        )
+        raise _tagged_error(
+            "Pi version mismatch: expected {0}, installed {1}".format(expected_version, installed_version),
+            stage="preflight", sent_hint="no")
 
     pi_provider = str(provider.get("pi_provider") or pi_cfg["provider"] or "deepseek")
     model = str(provider.get("model") or pi_cfg["model"])
@@ -141,19 +176,25 @@ def call_pi_agent(
     timeout_seconds = max(1, int(timeout or provider.get("timeout") or pi_cfg["timeout"]))
     api_key_env = str(provider.get("api_key_env") or _provider_api_key_env(pi_provider))
     if not api_key_env or not os.environ.get(api_key_env, ""):
-        raise PiRuntimeError("{0} not set, skipped Pi Agent call".format(api_key_env or "provider API key"))
+        raise _tagged_error(
+            "{0} not set, skipped Pi Agent call".format(api_key_env or "provider API key"),
+            stage="preflight", sent_hint="no")
 
     workspace = project_path(str(pi_cfg["workspace"])) / _safe_segment(role_id)
     workspace.mkdir(parents=True, exist_ok=True)
     try:
         compiled_prompt, skill_bundle = compile_role_system_prompt(system_prompt, role_id, config)
     except PiSkillSupplyChainError as exc:
-        raise PiRuntimeError("Pi reviewed-method supply chain blocked: {0}".format(exc)) from exc
+        raise _tagged_error(
+            "Pi reviewed-method supply chain blocked: {0}".format(exc),
+            stage="preflight", sent_hint="no") from exc
     prompt_path = _materialize_system_prompt(compiled_prompt, role_id)
     agent_home = project_path(str(pi_cfg["agent_home"]))
     settings_path = agent_home / "settings.json"
     if not settings_path.exists():
-        raise PiRuntimeError("Pi isolated settings missing: {0}".format(settings_path))
+        raise _tagged_error(
+            "Pi isolated settings missing: {0}".format(settings_path),
+            stage="preflight", sent_hint="no")
 
     args = list(command) + [
         "--mode",
@@ -195,29 +236,37 @@ def call_pi_agent(
         _enforce_output_limit(stdout, int(pi_cfg["max_stdout_bytes"]), "stdout")
         _enforce_output_limit(stderr, int(pi_cfg["max_stderr_bytes"]), "stderr")
         if exit_code != 0:
-            raise PiRuntimeError(
-                "Pi exited with code {0}: {1}".format(exit_code, _sanitize_error(stderr or stdout))
-            )
+            raise _tagged_error(
+                "Pi exited with code {0}: {1}".format(exit_code, _sanitize_error(stderr or stdout)),
+                stage="process", sent_hint=_exit_sent_hint(stderr or stdout))
         parsed = parse_pi_json_stream(stdout)
         if parsed["tool_call_count"]:
-            raise PiRuntimeError("Pi emitted a tool call despite --no-tools")
+            raise _tagged_error("Pi emitted a tool call despite --no-tools",
+                                stage="parse", sent_hint="yes")
         if parsed["stop_reason"] not in {"", "stop"}:
-            raise PiRuntimeError(
+            raise _tagged_error(
                 "Pi returned unusable stop reason: {0}{1}".format(
                     parsed["stop_reason"],
                     " ({0})".format(parsed["error_message"]) if parsed["error_message"] else "",
-                )
-            )
+                ),
+                stage="parse", sent_hint="yes")
         if not str(parsed["content"]).strip():
-            raise PiRuntimeError("Pi response contained no assistant text")
+            raise _tagged_error("Pi response contained no assistant text",
+                                stage="parse", sent_hint="yes")
         success = True
     except Exception as exc:
         error_text = _sanitize_error(exc)
         if isinstance(exc, PiRuntimeError):
             raise
         if isinstance(exc, subprocess.TimeoutExpired):
-            raise PiRuntimeError("Pi wall-clock timeout after {0}s".format(timeout_seconds)) from exc
-        raise PiRuntimeError("Pi call failed: {0}".format(error_text)) from exc
+            # The child was running and may already have sent the request:
+            # killing it on timeout never proves the provider did not charge.
+            raise _tagged_error(
+                "Pi wall-clock timeout after {0}s".format(timeout_seconds),
+                stage="process", sent_hint="unknown") from exc
+        raise _tagged_error(
+            "Pi call failed: {0}".format(error_text),
+            stage="process", sent_hint="") from exc
     finally:
         duration_ms = int((time.perf_counter() - started) * 1000)
         audit = {
@@ -261,7 +310,9 @@ def call_pi_agent(
             audit_record = append_hash_chained_jsonl(_audit_path(pi_cfg), audit)
         except Exception as audit_exc:
             if success:
-                raise PiRuntimeError("Pi output discarded because audit append failed: {0}".format(audit_exc)) from audit_exc
+                raise _tagged_error(
+                    "Pi output discarded because audit append failed: {0}".format(audit_exc),
+                    stage="audit", sent_hint="yes") from audit_exc
             audit_record = {}
 
     usage = _normalize_usage(parsed.get("usage", {}))
@@ -282,7 +333,8 @@ def resolve_pi_command(pi_cfg: Optional[Dict[str, Any]] = None) -> Tuple[List[st
         if not path.exists():
             found = shutil.which(explicit)
             if not found:
-                raise PiRuntimeError("Pi binary not found: {0}".format(explicit))
+                raise _tagged_error("Pi binary not found: {0}".format(explicit),
+                            stage="preflight", sent_hint="no")
             path = Path(found)
         return [str(path)], _package_json_near_binary(path)
 
@@ -296,7 +348,8 @@ def resolve_pi_command(pi_cfg: Optional[Dict[str, Any]] = None) -> Tuple[List[st
     if found:
         path = Path(found)
         return [str(path)], _package_json_near_binary(path)
-    raise PiRuntimeError("Pi runtime not installed; run npm install in pi_runtime")
+    raise _tagged_error("Pi runtime not installed; run npm install in pi_runtime",
+                        stage="preflight", sent_hint="no")
 
 
 def parse_pi_json_stream(stdout: str) -> Dict[str, Any]:
@@ -314,9 +367,9 @@ def parse_pi_json_stream(stdout: str) -> Dict[str, Any]:
         if isinstance(event, dict):
             events.append(event)
     if invalid_lines:
-        raise PiRuntimeError("Pi JSON stream contained non-JSON stdout")
+        raise _tagged_error("Pi JSON stream contained non-JSON stdout", stage="parse", sent_hint="yes")
     if not events:
-        raise PiRuntimeError("Pi JSON stream was empty")
+        raise _tagged_error("Pi JSON stream was empty", stage="parse", sent_hint="yes")
 
     session = next((item for item in events if item.get("type") == "session"), {})
     tool_calls = sum(1 for item in events if item.get("type") == "tool_execution_start")
@@ -328,7 +381,7 @@ def parse_pi_json_stream(stdout: str) -> Dict[str, Any]:
         if isinstance(message, dict) and message.get("role") == "assistant":
             messages.append(message)
     if not messages:
-        raise PiRuntimeError("Pi JSON stream has no final assistant message")
+        raise _tagged_error("Pi JSON stream has no final assistant message", stage="parse", sent_hint="yes")
     message = messages[-1]
     text_parts = []
     for part in message.get("content", []) if isinstance(message.get("content"), list) else []:

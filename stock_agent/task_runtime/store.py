@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-TASK_SCHEMA_VERSION = "1.0"
+TASK_SCHEMA_VERSION = "1.2"  # R02: +task_invocation_attempts (outbound attempt chain)
 
 STATUS_QUEUED = "queued"
 STATUS_LEASED = "leased"
@@ -57,6 +57,21 @@ ALLOWED_TRANSITIONS: Dict[str, set] = {
 
 EXECUTION_MODES = {"live", "replay"}
 HUMAN_DECISIONS = {"acknowledge", "reject", "provide_input"}
+
+# R02 outbound-attempt state machine (blueprint 4.2): a model call is first
+# reserved (budget event), then PREPARED (row written), then DISPATCHED (the
+# external request is about to leave), and ends in exactly one terminal state.
+# outcome_unknown NEVER auto-transitions to a retry: only a real reconciliation
+# (provider receipt or human with reason) closes it, and the budget stays held.
+ATTEMPT_PREPARED = "prepared"
+ATTEMPT_DISPATCHED = "dispatched"
+ATTEMPT_SUCCEEDED = "succeeded"
+ATTEMPT_FAILED_KNOWN = "failed_known"
+ATTEMPT_OUTCOME_UNKNOWN = "outcome_unknown"
+ATTEMPT_RECONCILED = "reconciled"
+ATTEMPT_TERMINAL_STATES = {ATTEMPT_SUCCEEDED, ATTEMPT_FAILED_KNOWN, ATTEMPT_RECONCILED}
+ATTEMPT_SENT_VALUES = {"yes", "no", "unknown"}
+RECONCILIATION_RESOLUTIONS = {"confirmed_charged", "confirmed_not_charged"}
 
 # Human input patches may only adjust research content, never identity or
 # classification fields; the worker re-runs the egress gate on every attempt.
@@ -113,6 +128,7 @@ CREATE TABLE IF NOT EXISTS research_tasks (
     max_attempts INTEGER NOT NULL DEFAULT 2,
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     idempotency_key TEXT NOT NULL,
+    business_intent_id TEXT NOT NULL DEFAULT '',
     prompt_version TEXT NOT NULL DEFAULT '',
     model_config_hash TEXT NOT NULL DEFAULT '',
     execution_mode TEXT NOT NULL DEFAULT 'live',
@@ -143,6 +159,51 @@ CREATE TABLE IF NOT EXISTS idempotency_receipts (
     result TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS task_platform_runs (
+    run_key TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    business_intent_id TEXT NOT NULL DEFAULT '',
+    workflow_version TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_platform_runs_task ON task_platform_runs(task_id, recorded_at);
+CREATE TABLE IF NOT EXISTS task_input_snapshots (
+    task_id TEXT NOT NULL,
+    input_version INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    payload_sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (task_id, input_version)
+);
+CREATE TABLE IF NOT EXISTS task_invocation_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    worker_id TEXT NOT NULL DEFAULT '',
+    fencing_token INTEGER NOT NULL DEFAULT 0,
+    round_index INTEGER NOT NULL DEFAULT 1,
+    provider TEXT NOT NULL DEFAULT '',
+    request_model TEXT NOT NULL DEFAULT '',
+    prompt_sha256 TEXT NOT NULL DEFAULT '',
+    budget_event_id TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,
+    sent TEXT NOT NULL DEFAULT 'unknown',
+    error TEXT NOT NULL DEFAULT '',
+    deadline_seconds INTEGER NOT NULL DEFAULT 0,
+    heartbeat_beats INTEGER NOT NULL DEFAULT 0,
+    heartbeat_healthy INTEGER NOT NULL DEFAULT 1,
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL DEFAULT '',
+    reconciled_at TEXT NOT NULL DEFAULT '',
+    reconciled_by TEXT NOT NULL DEFAULT '',
+    reconciliation TEXT NOT NULL DEFAULT '',
+    reconciliation_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_invocation_attempts_task ON task_invocation_attempts(task_id, started_at);
 CREATE TABLE IF NOT EXISTS signal_consumptions (
     event_key TEXT NOT NULL,
     purpose TEXT NOT NULL,
@@ -187,6 +248,26 @@ class TaskStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.executescript(_SCHEMA)
+        self._migrate_legacy_schema()
+
+    def _migrate_legacy_schema(self) -> None:
+        """Bring pre-1.1 databases up to the R01 schema (additive only).
+
+        Existing rows keep their data: ``business_intent_id`` backfills as ''
+        and the partial unique index ignores empty values. History is never
+        rewritten here — payload/column version divergence is REPORTED via
+        ``input_version_divergence_report``, never repaired by guessing.
+        """
+
+        columns = {str(row["name"]) for row in self._conn.execute("PRAGMA table_info(research_tasks)")}
+        if "business_intent_id" not in columns:
+            self._conn.execute(
+                "ALTER TABLE research_tasks ADD COLUMN business_intent_id TEXT NOT NULL DEFAULT ''")
+        # Only non-empty intents must be unique; '' is the shared legacy default.
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_business_intent "
+            "ON research_tasks(business_intent_id) WHERE business_intent_id <> ''"
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -259,12 +340,14 @@ class TaskStore:
         role_id: str = "research_analyst",
         parent_task_id: str = "",
         idempotency_key: str = "",
+        business_intent_id: str = "",
         prompt_version: str = "research_v1",
         model_config_hash: str = "",
         max_attempts: int = 2,
         execution_mode: str = "live",
         actor: str = "operator",
         consume_event: Optional[Dict[str, Any]] = None,
+        platform_run: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], str]:
         """Create (or deduplicate) a task; optionally record its event consumption atomically.
 
@@ -274,6 +357,19 @@ class TaskStore:
         DUPLICATE path a missing consumption row converges (recorded now, bound
         to the existing task) so rescans reconcile the ledger instead of
         creating a second task or losing the event.
+
+        R01 semantics:
+
+        - The ``input_version`` COLUMN is the single authority. The payload's
+          same-name field is injected to match it at write time and is only a
+          compatibility projection — readers must use the column.
+        - ``business_intent_id`` is the stable business identity. When given,
+          dedup runs on it FIRST (platform retries reuse one task); platform
+          executions (Dify run ids, ...) are recorded as separate
+          ``task_platform_runs`` association rows instead of leaking into the
+          idempotency key or the payload fingerprint.
+        - An immutable ``task_input_snapshots`` row is written at creation and
+          at every provide_input version bump.
         """
 
         if execution_mode not in EXECUTION_MODES:
@@ -285,6 +381,34 @@ class TaskStore:
         classification = str(input_payload.get("data_classification") or "")
         if classification != "public":
             raise TaskRuntimeError("task input must be classified public for external model egress")
+        # Authoritative input version: taken from the payload once, validated,
+        # stored in the column, and mirrored into the payload projection.
+        raw_version = input_payload.get("input_version", 1)
+        if isinstance(raw_version, bool) or not isinstance(raw_version, int) or raw_version < 1:
+            raise TaskRuntimeError("input_version must be a positive integer")
+        input_version = int(raw_version)
+        payload = dict(input_payload)
+        payload["input_version"] = input_version
+        input_payload = payload
+        business_intent_id = str(business_intent_id or "").strip()
+        if business_intent_id and not idempotency_key:
+            # Intent-scoped key so two different intents with byte-identical
+            # content can never collide on the default content key.
+            idempotency_key = "intent::{0}".format(business_intent_id)
+        run_record: Optional[Dict[str, str]] = None
+        if platform_run is not None:
+            if not isinstance(platform_run, dict):
+                raise TaskRuntimeError("platform_run must be an object")
+            run_platform = str(platform_run.get("platform") or "").strip()
+            run_id = str(platform_run.get("run_id") or "").strip()
+            if not run_platform or not run_id:
+                raise TaskRuntimeError("platform_run requires platform and run_id")
+            run_record = {
+                "platform": run_platform,
+                "run_id": run_id,
+                "workflow_version": str(platform_run.get("workflow_version") or "").strip(),
+                "actor": str(platform_run.get("actor") or "").strip(),
+            }
         consumption: Optional[Dict[str, str]] = None
         if consume_event is not None:
             if not isinstance(consume_event, dict):
@@ -305,55 +429,83 @@ class TaskStore:
             # different context, different mode) must never share a key.
             content_fingerprint = self._content_fingerprint(input_payload)
             idempotency_key = "idem::{0}::{1}::{2}::{3}::{4}::{5}::{6}".format(
-                case_id, role_id, input_payload.get("input_version", 1),
+                case_id, role_id, input_version,
                 prompt_version, model_config_hash, execution_mode, content_fingerprint,
             )
         created = _now()
         self._begin()
         try:
-            existing = self._conn.execute(
-                "SELECT * FROM research_tasks WHERE idempotency_key = ?", (idempotency_key,)
-            ).fetchone()
+            existing = None
+            matched_by_intent = False
+            if business_intent_id:
+                existing = self._conn.execute(
+                    "SELECT * FROM research_tasks WHERE business_intent_id = ?", (business_intent_id,)
+                ).fetchone()
+                matched_by_intent = existing is not None
+            if existing is None:
+                existing = self._conn.execute(
+                    "SELECT * FROM research_tasks WHERE idempotency_key = ?", (idempotency_key,)
+                ).fetchone()
             if existing is not None:
                 try:
                     stored_payload = json.loads(existing["input_payload"] or "{}")
                 except json.JSONDecodeError:
                     stored_payload = None
-                same_content = (
-                    stored_payload is not None
-                    and self._content_fingerprint(stored_payload) == self._content_fingerprint(input_payload)
-                )
-                # For event- and question-derived tasks the logical request IS
-                # the stable identity (event key / question hash): a rebuilt
-                # public context (later signals, refreshed cache) is not a
-                # different request. Byte equality stays mandatory for every
-                # other key.
-                def _same_logical(payload_a: Dict[str, Any], payload_b: Dict[str, Any]) -> bool:
-                    origin_a = payload_a.get("origin") if isinstance(payload_a.get("origin"), dict) else {}
-                    origin_b = payload_b.get("origin") if isinstance(payload_b.get("origin"), dict) else {}
-                    if str(origin_a.get("event_key") or "") and \
-                            origin_a.get("event_key") == origin_b.get("event_key"):
-                        return True
-                    sha_a = str(origin_a.get("question_sha256") or "")
-                    if sha_a and sha_a == str(origin_b.get("question_sha256") or "") \
-                            and origin_a.get("kind") == origin_b.get("kind") == "question":
-                        return True
-                    return False
+                if matched_by_intent:
+                    # Intent identity: same business request must reuse this
+                    # task. Content is compared WITHOUT platform run ids (a
+                    # retried platform run is not new content); anything else
+                    # differing under the same intent is an explicit conflict.
+                    if str(existing["execution_mode"]) != execution_mode or not (
+                        isinstance(stored_payload, dict)
+                        and self._logical_content_fingerprint(stored_payload)
+                        == self._logical_content_fingerprint(input_payload)
+                    ):
+                        self._rollback()
+                        raise TaskIdempotencyConflictError(
+                            "business intent {0} already names a different request".format(business_intent_id))
+                    same_logical_request = True
+                else:
+                    same_content = (
+                        stored_payload is not None
+                        and self._content_fingerprint(stored_payload) == self._content_fingerprint(input_payload)
+                    )
+                    # For event- and question-derived tasks the logical request IS
+                    # the stable identity (event key / question hash): a rebuilt
+                    # public context (later signals, refreshed cache) is not a
+                    # different request. Byte equality stays mandatory for every
+                    # other key.
+                    def _same_logical(payload_a: Dict[str, Any], payload_b: Dict[str, Any]) -> bool:
+                        origin_a = payload_a.get("origin") if isinstance(payload_a.get("origin"), dict) else {}
+                        origin_b = payload_b.get("origin") if isinstance(payload_b.get("origin"), dict) else {}
+                        if str(origin_a.get("event_key") or "") and \
+                                origin_a.get("event_key") == origin_b.get("event_key"):
+                            return True
+                        sha_a = str(origin_a.get("question_sha256") or "")
+                        if sha_a and sha_a == str(origin_b.get("question_sha256") or "") \
+                                and origin_a.get("kind") == origin_b.get("kind") == "question":
+                            return True
+                        return False
 
-                same_logical_request = same_content or (
-                    consumption is not None
-                    and isinstance(stored_payload, dict)
-                    and str((stored_payload.get("origin") or {}).get("event_key") or "")
-                    == consumption["event_key"]
-                ) or (
-                    isinstance(stored_payload, dict)
-                    and _same_logical(stored_payload, input_payload)
-                )
-                if str(existing["execution_mode"]) != execution_mode or not same_logical_request:
+                    same_logical_request = str(existing["execution_mode"]) == execution_mode and (
+                        same_content
+                        or (
+                            consumption is not None
+                            and isinstance(stored_payload, dict)
+                            and str((stored_payload.get("origin") or {}).get("event_key") or "")
+                            == consumption["event_key"]
+                        )
+                        or (
+                            isinstance(stored_payload, dict)
+                            and _same_logical(stored_payload, input_payload)
+                        )
+                    )
+                if not same_logical_request:
                     self._rollback()
                     raise TaskIdempotencyConflictError(
                         "idempotency key {0} already names a different request".format(idempotency_key)
                     )
+                dirty = False
                 if consumption is not None:
                     row = self._conn.execute(
                         "SELECT task_id FROM signal_consumptions WHERE event_key = ? AND purpose = ?",
@@ -372,27 +524,40 @@ class TaskStore:
                             (consumption["event_key"], consumption["purpose"], consumption["base_key"],
                              consumption["signal_id"], str(existing["task_id"]), _now()),
                         )
-                        self._commit()
+                        dirty = True
+                if run_record is not None:
+                    self._record_platform_run(str(existing["task_id"]), business_intent_id, run_record)
+                    dirty = True
+                if dirty:
+                    self._commit()
                 else:
                     self._rollback()
                 return self._decode(existing), "DUPLICATE"
             task_id = _new_id("task")
             self._conn.execute(
                 """INSERT INTO research_tasks
-                   (task_id, parent_task_id, case_id, role_id, title, input_payload, idempotency_key,
+                   (task_id, parent_task_id, case_id, role_id, title, input_version, input_payload,
+                    idempotency_key, business_intent_id,
                     prompt_version, model_config_hash, max_attempts, execution_mode, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (task_id, parent_task_id, case_id, role_id, title,
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (task_id, parent_task_id, case_id, role_id, title, input_version,
                  json.dumps(input_payload, ensure_ascii=False, default=str), idempotency_key,
+                 business_intent_id,
                  prompt_version, model_config_hash, max(1, int(max_attempts)), execution_mode, created, created),
             )
+            self._write_input_snapshot(task_id, input_version, input_payload,
+                                       created_by=actor, reason="created", created_at=created)
+            if run_record is not None:
+                self._record_platform_run(task_id, business_intent_id, run_record)
             if consumption is not None:
                 self._conn.execute(
                     "INSERT INTO signal_consumptions (event_key, purpose, base_key, signal_id, task_id, consumed_at) VALUES (?,?,?,?,?,?)",
                     (consumption["event_key"], consumption["purpose"], consumption["base_key"],
                      consumption["signal_id"], task_id, created),
                 )
-            self._emit(task_id, "task_created", actor=actor, payload={"title": title, "case_id": case_id, "execution_mode": execution_mode})
+            self._emit(task_id, "task_created", actor=actor,
+                       payload={"title": title, "case_id": case_id, "execution_mode": execution_mode,
+                                "input_version": input_version, "business_intent_id": business_intent_id})
             self._commit()
         except BaseException:
             self._rollback()
@@ -455,6 +620,149 @@ class TaskStore:
     def _content_fingerprint(payload: Any) -> str:
         canonical = json.dumps(payload or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+
+    # Volatile platform execution identifiers never belong to business content:
+    # a retried platform run is the same request, not new content.
+    _PLATFORM_RUN_ORIGIN_KEYS = ("dify_run_id", "platform_run_id", "n8n_execution_id")
+
+    @classmethod
+    def _logical_content_fingerprint(cls, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return cls._content_fingerprint(payload)
+        origin = payload.get("origin")
+        if isinstance(origin, dict) and any(key in origin for key in cls._PLATFORM_RUN_ORIGIN_KEYS):
+            stripped_origin = {key: value for key, value in origin.items()
+                               if key not in cls._PLATFORM_RUN_ORIGIN_KEYS}
+            return cls._content_fingerprint(dict(payload, origin=stripped_origin))
+        return cls._content_fingerprint(payload)
+
+    def _write_input_snapshot(self, task_id: str, input_version: int, payload: Dict[str, Any],
+                              *, created_by: str, reason: str, created_at: str = "") -> str:
+        """Insert the immutable snapshot for (task, input_version). Call inside a transaction."""
+
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        payload_sha256 = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        try:
+            self._conn.execute(
+                "INSERT INTO task_input_snapshots (task_id, input_version, payload, payload_sha256, created_at, created_by, reason) VALUES (?,?,?,?,?,?,?)",
+                (task_id, int(input_version), payload_json, payload_sha256,
+                 created_at or _now(), str(created_by or ""), str(reason or "")),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise TaskRuntimeError(
+                "input snapshot for task {0} version {1} already exists; snapshots are immutable".format(
+                    task_id, input_version)) from exc
+        return payload_sha256
+
+    def _record_platform_run(self, task_id: str, business_intent_id: str, run: Dict[str, str]) -> Dict[str, Any]:
+        """Associate one platform execution with a task. Call inside a transaction.
+
+        Same run + same task is an idempotent no-op (a retried create must not
+        append a second association); the same run id naming a DIFFERENT task
+        is a conflict, because one platform execution cannot drive two tasks.
+        """
+
+        run_key = "{0}::{1}".format(run["platform"], run["run_id"])
+        row = self._conn.execute(
+            "SELECT * FROM task_platform_runs WHERE run_key = ?", (run_key,)
+        ).fetchone()
+        if row is not None:
+            if str(row["task_id"]) != str(task_id):
+                raise TaskIdempotencyConflictError(
+                    "platform run {0} already associated with task {1}".format(run_key, row["task_id"]))
+            return dict(row)
+        self._conn.execute(
+            "INSERT INTO task_platform_runs (run_key, platform, run_id, task_id, business_intent_id, workflow_version, actor, recorded_at) VALUES (?,?,?,?,?,?,?,?)",
+            (run_key, run["platform"], run["run_id"], task_id, str(business_intent_id or ""),
+             run.get("workflow_version", ""), run.get("actor", ""), _now()),
+        )
+        return {
+            "run_key": run_key, "platform": run["platform"], "run_id": run["run_id"],
+            "task_id": task_id, "business_intent_id": str(business_intent_id or ""),
+            "workflow_version": run.get("workflow_version", ""), "actor": run.get("actor", ""),
+        }
+
+    def list_platform_runs(self, task_id: str) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM task_platform_runs WHERE task_id = ? ORDER BY recorded_at, run_key", (str(task_id),)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_platform_run(self, platform: str, run_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM task_platform_runs WHERE run_key = ?",
+            ("{0}::{1}".format(str(platform), str(run_id)),),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def input_snapshots(self, task_id: str) -> List[Dict[str, Any]]:
+        """Immutable per-version input history (payload decoded, sha preserved)."""
+
+        rows = self._conn.execute(
+            "SELECT * FROM task_input_snapshots WHERE task_id = ? ORDER BY input_version", (str(task_id),)
+        ).fetchall()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.get("payload") or "{}")
+            except json.JSONDecodeError:
+                item["payload"] = {}
+            result.append(item)
+        return result
+
+    def find_task_by_idempotency_key(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM research_tasks WHERE idempotency_key = ?", (str(idempotency_key),)
+        ).fetchone()
+        return self._decode(row) if row is not None else None
+
+    def input_version_divergence_report(self) -> Dict[str, Any]:
+        """READ-ONLY diagnostic: where the payload projection disagrees with the column.
+
+        R01 makes the column authoritative; legacy rows may disagree. This
+        reports each divergence with a suggested mapping so a human can review
+        a repair plan. It never modifies history.
+        """
+
+        rows = self._conn.execute(
+            "SELECT task_id, input_version, input_payload, created_at, updated_at FROM research_tasks"
+        ).fetchall()
+        entries: List[Dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["input_payload"] or "{}")
+            except json.JSONDecodeError:
+                payload = None
+            payload_version = payload.get("input_version") if isinstance(payload, dict) else None
+            column_version = int(row["input_version"])
+            if payload_version is None and not isinstance(payload, dict):
+                entries.append({
+                    "task_id": str(row["task_id"]), "column_version": column_version,
+                    "payload_version": None, "divergence": "payload_not_valid_json",
+                    "suggested_mapping": "keep column version {0}; rebuild payload from event history".format(column_version),
+                    "updated_at": str(row["updated_at"] or ""),
+                })
+                continue
+            if payload_version != column_version:
+                suggested = column_version
+                if isinstance(payload_version, int) and not isinstance(payload_version, bool) \
+                        and payload_version > column_version:
+                    suggested = payload_version
+                entries.append({
+                    "task_id": str(row["task_id"]), "column_version": column_version,
+                    "payload_version": payload_version,
+                    "divergence": "payload_column_mismatch",
+                    "suggested_mapping": "candidate authoritative version {0}; requires human review, no auto-repair".format(suggested),
+                    "updated_at": str(row["updated_at"] or ""),
+                })
+        return {
+            "schema_version": "r01-diagnostic-1",
+            "generated_at": _now(),
+            "divergent_tasks": len(entries),
+            "note": "read-only diagnostic; repair plans require human review, history is never auto-rewritten",
+            "entries": entries,
+        }
 
     def claim_next(self, worker_id: str, ttl_seconds: int = 120) -> Optional[Dict[str, Any]]:
         if not str(worker_id or "").strip():
@@ -715,15 +1023,22 @@ class TaskStore:
                 merged.update(input_patch)
                 if str(merged.get("data_classification") or "").lower() != "public":
                     raise TaskTransitionError("patched input must remain classified public for external egress")
+                new_version = int(row["input_version"]) + 1
+                # The column is authoritative; the payload field is synced to it
+                # so no reader can ever see two different versions again.
+                merged["input_version"] = new_version
+                snapshot_sha256 = self._write_input_snapshot(
+                    task_id, new_version, merged, created_by=actor, reason="human_provide_input")
                 self._touch(
                     task_id,
                     status=STATUS_QUEUED,
-                    input_version=int(row["input_version"]) + 1,
+                    input_version=new_version,
                     input_payload=json.dumps(merged, ensure_ascii=False, default=str),
                     worker_id="",
                 )
                 self._emit(task_id, "human_response_recorded", actor=actor, command_id=command_id,
-                           payload={"decision": decision, "input_version": int(row["input_version"]) + 1})
+                           payload={"decision": decision, "input_version": new_version,
+                                    "input_snapshot_sha256": snapshot_sha256})
             elif decision == "acknowledge":
                 try:
                     current_output = json.loads(row["output"] or "{}")
@@ -801,6 +1116,21 @@ class TaskStore:
                 if not fresh_expires or fresh_expired_at > datetime.now().astimezone() - timedelta(seconds=max(0, int(ttl_grace_seconds))):
                     self._rollback()
                     continue
+                # R02: close the dead worker's attempt chain FIRST (its own
+                # transaction). A dispatched attempt becomes outcome_unknown —
+                # the request may have been sent, so the task can no longer be
+                # blindly requeued; a prepared-only attempt provably never left.
+                self._rollback()
+                attempt_recovery = self.recover_stale_invocation_attempts(
+                    task_id, error="lease expired; worker presumed dead")
+                self._begin()
+                fresh = self._task_row(task_id)
+                if fresh["status"] not in {STATUS_LEASED, STATUS_RUNNING}:
+                    # The stale worker's lease ended in a terminal state (or a
+                    # live worker won the race during attempt recovery): the
+                    # snapshot decision no longer applies.
+                    self._rollback()
+                    continue
                 if fresh["cancel_requested"]:
                     self._touch(task_id, status=STATUS_CANCELLED, worker_id="", lease_expires_at="",
                                 last_error="cancelled during abandoned-lease recovery")
@@ -809,7 +1139,15 @@ class TaskStore:
                     recovered.append(self.get_task(task_id))
                     continue
                 attempts_left = int(fresh["max_attempts"]) - int(fresh["attempt_count"])
-                if attempts_left > 0:
+                if attempt_recovery["outcome_unknown"] > 0:
+                    # At least one request may have reached the provider: no
+                    # auto re-dispatch. Manual reconciliation gates any retry.
+                    self._touch(task_id, status=STATUS_BLOCKED, worker_id="", lease_expires_at="",
+                                last_error="lease expired with a dispatched invocation of unknown outcome; manual reconciliation required (attempt chain preserved)")
+                    self._emit(task_id, "task_recovered", payload={
+                        "action": "blocked_unknown_invocation", "expired_at": fresh_expires,
+                        "attempt_recovery": attempt_recovery})
+                elif attempts_left > 0:
                     self._touch(task_id, status=STATUS_QUEUED, worker_id="", lease_expires_at="",
                                 last_error="lease expired; task requeued by recovery")
                     self._emit(task_id, "task_recovered", payload={"action": "requeued", "expired_at": fresh_expires})
@@ -950,6 +1288,229 @@ class TaskStore:
             self._rollback()
             raise
         return self.get_task(task_id)
+
+    # -------- outbound invocation attempt chain (R02) --------
+
+    def _attempt_row(self, attempt_id: str) -> sqlite3.Row:
+        row = self._conn.execute(
+            "SELECT * FROM task_invocation_attempts WHERE attempt_id = ?", (str(attempt_id),)
+        ).fetchone()
+        if row is None:
+            raise TaskRuntimeError("unknown attempt_id: {0}".format(attempt_id))
+        return row
+
+    def prepare_invocation_attempt(self, task_id: str, *, worker_id: str, fencing_token: int,
+                                   round_index: int, provider: str, request_model: str,
+                                   prompt_sha256: str, budget_event_id: str = "",
+                                   deadline_seconds: int = 0) -> Dict[str, Any]:
+        """Write the attempt row BEFORE the external request may leave.
+
+        'prepared' means reserved and about to dispatch: nothing has been sent
+        yet, so a crash between prepare and dispatch is provably charge-free.
+        The budget reservation event id is linked here, tying the attempt chain
+        to the budget ledger in one place.
+        """
+        self._begin()
+        try:
+            row = self._task_row(task_id)
+            self._assert_worker(row, worker_id, fencing_token)
+            attempt_id = _new_id("att")
+            self._conn.execute(
+                "INSERT INTO task_invocation_attempts (attempt_id, task_id, worker_id, fencing_token, round_index, provider, request_model, prompt_sha256, budget_event_id, state, sent, deadline_seconds, started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (attempt_id, task_id, str(worker_id), int(fencing_token), int(round_index),
+                 str(provider or ""), str(request_model or ""), str(prompt_sha256 or ""),
+                 str(budget_event_id or ""), ATTEMPT_PREPARED, "no", int(deadline_seconds), _now()),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return dict(self._attempt_row(attempt_id))
+
+    def mark_invocation_dispatched(self, attempt_id: str, *, worker_id: str, fencing_token: int) -> Dict[str, Any]:
+        """prepared -> dispatched: from here on, 'was it sent?' can only be answered
+        by the terminal record or a reconciliation — never assumed 'no'."""
+        self._begin()
+        try:
+            attempt = self._attempt_row(attempt_id)
+            row = self._task_row(str(attempt["task_id"]))
+            self._assert_worker(row, worker_id, fencing_token)
+            if attempt["state"] != ATTEMPT_PREPARED:
+                raise TaskTransitionError(
+                    "invocation attempt {0} is {1}, only prepared can dispatch".format(attempt_id, attempt["state"]))
+            self._conn.execute(
+                "UPDATE task_invocation_attempts SET state = ?, sent = 'unknown' WHERE attempt_id = ?",
+                (ATTEMPT_DISPATCHED, str(attempt_id)),
+            )
+            self._emit(str(attempt["task_id"]), "invocation_dispatched", actor=str(worker_id),
+                       payload={"attempt_id": str(attempt_id), "round_index": int(attempt["round_index"])})
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return dict(self._attempt_row(attempt_id))
+
+    def complete_invocation_attempt(self, attempt_id: str, *, worker_id: str, fencing_token: int,
+                                    state: str, sent: str, error: str = "",
+                                    heartbeat_beats: int = 0, heartbeat_healthy: bool = True) -> Dict[str, Any]:
+        """dispatched -> succeeded | failed_known | outcome_unknown (terminal).
+
+        ``sent`` records the delivery fact: 'no' failures are safe to retry;
+        'unknown' means the request may have reached (and been charged by) the
+        provider and must never be auto-retried.
+        """
+        if state not in {ATTEMPT_SUCCEEDED, ATTEMPT_FAILED_KNOWN, ATTEMPT_OUTCOME_UNKNOWN}:
+            raise TaskRuntimeError("attempt completion state must be succeeded, failed_known or outcome_unknown")
+        if sent not in ATTEMPT_SENT_VALUES:
+            raise TaskRuntimeError("sent must be one of {0}".format(sorted(ATTEMPT_SENT_VALUES)))
+        if state == ATTEMPT_OUTCOME_UNKNOWN and sent != "unknown":
+            raise TaskRuntimeError("outcome_unknown requires sent='unknown'")
+        self._begin()
+        try:
+            attempt = self._attempt_row(attempt_id)
+            row = self._task_row(str(attempt["task_id"]))
+            self._assert_worker(row, worker_id, fencing_token)
+            if attempt["state"] != ATTEMPT_DISPATCHED:
+                raise TaskTransitionError(
+                    "invocation attempt {0} is {1}, only dispatched can complete".format(attempt_id, attempt["state"]))
+            self._conn.execute(
+                "UPDATE task_invocation_attempts SET state = ?, sent = ?, error = ?, ended_at = ?, heartbeat_beats = ?, heartbeat_healthy = ? WHERE attempt_id = ?",
+                (state, sent, str(error or "")[:2000], _now(), int(heartbeat_beats),
+                 1 if heartbeat_healthy else 0, str(attempt_id)),
+            )
+            event_type = {
+                ATTEMPT_SUCCEEDED: "invocation_succeeded",
+                ATTEMPT_FAILED_KNOWN: "invocation_failed_known",
+                ATTEMPT_OUTCOME_UNKNOWN: "invocation_outcome_unknown",
+            }[state]
+            self._emit(str(attempt["task_id"]), event_type, actor=str(worker_id),
+                       payload={"attempt_id": str(attempt_id), "sent": sent,
+                                "error": str(error or "")[:500]})
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return dict(self._attempt_row(attempt_id))
+
+    def invocation_attempts(self, task_id: str) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM task_invocation_attempts WHERE task_id = ? ORDER BY started_at, attempt_id",
+            (str(task_id),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def outstanding_unknown_attempts(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM task_invocation_attempts WHERE state = ? ORDER BY started_at",
+            (ATTEMPT_OUTCOME_UNKNOWN,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recover_stale_invocation_attempts(self, task_id: str, *, error: str = "") -> Dict[str, int]:
+        """System-level crash recovery for a dead worker's attempts (no lease assert).
+
+        A DISPATCHED attempt whose worker died is outcome_unknown: the request
+        may have been sent, so it enters reconciliation exactly like a timeout.
+        A still-PREPARED attempt provably never left (dispatch marks the send
+        point), so it closes as failed_known sent='no' and is safe to retry.
+        """
+        counts = {"outcome_unknown": 0, "failed_known_not_sent": 0}
+        self._begin()
+        try:
+            row = self._task_row(task_id)
+            for attempt in self._conn.execute(
+                "SELECT * FROM task_invocation_attempts WHERE task_id = ? AND state IN (?, ?)",
+                (str(task_id), ATTEMPT_PREPARED, ATTEMPT_DISPATCHED),
+            ).fetchall():
+                if attempt["state"] == ATTEMPT_DISPATCHED:
+                    self._conn.execute(
+                        "UPDATE task_invocation_attempts SET state = ?, sent = 'unknown', error = ?, ended_at = ? WHERE attempt_id = ?",
+                        (ATTEMPT_OUTCOME_UNKNOWN, str(error or "worker died with request in flight")[:2000],
+                         _now(), attempt["attempt_id"]),
+                    )
+                    self._emit(task_id, "invocation_outcome_unknown", actor="system:recovery",
+                               payload={"attempt_id": attempt["attempt_id"], "sent": "unknown",
+                                        "reason": "worker_died_dispatched"})
+                    counts["outcome_unknown"] += 1
+                else:
+                    self._conn.execute(
+                        "UPDATE task_invocation_attempts SET state = ?, sent = 'no', error = ?, ended_at = ? WHERE attempt_id = ?",
+                        (ATTEMPT_FAILED_KNOWN, str(error or "worker died before dispatch")[:2000],
+                         _now(), attempt["attempt_id"]),
+                    )
+                    self._emit(task_id, "invocation_failed_known", actor="system:recovery",
+                               payload={"attempt_id": attempt["attempt_id"], "sent": "no",
+                                        "reason": "worker_died_before_dispatch"})
+                    counts["failed_known_not_sent"] += 1
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        _ = row  # task existence asserted; no task mutation happens here
+        return counts
+
+    def reconcile_invocation_attempt(self, attempt_id: str, *, actor: str, resolution: str,
+                                     reason: str, requeue_if_blocked: bool = False) -> Dict[str, Any]:
+        """Close an outcome_unknown attempt with a real receipt or a human decision.
+
+        Never invents a charge fact: the caller must bring the resolution
+        (provider receipt said charged / a human with authority said not
+        charged) and a non-empty reason; both are recorded with the actor and
+        timestamp so responsibility is auditable. ``requeue_if_blocked`` only
+        acts when the task still sits in blocked — it can never resurrect a
+        terminal task. The budget ledger is NOT refunded here: a
+        confirmed_not_charged reconciliation gates a retry; it does not erase
+        the reservation history.
+        """
+        actor = str(actor or "").strip()
+        if not actor:
+            raise TaskRuntimeError("reconciliation actor must not be empty")
+        if resolution not in RECONCILIATION_RESOLUTIONS:
+            raise TaskRuntimeError("resolution must be one of {0}".format(sorted(RECONCILIATION_RESOLUTIONS)))
+        if not str(reason or "").strip():
+            raise TaskRuntimeError("reconciliation reason must not be empty")
+        self._begin()
+        try:
+            attempt = self._attempt_row(attempt_id)
+            task_id = str(attempt["task_id"])
+            if attempt["state"] == ATTEMPT_RECONCILED:
+                if str(attempt["reconciliation"]) != resolution:
+                    self._rollback()
+                    raise TaskIdempotencyConflictError(
+                        "attempt {0} was already reconciled as {1}".format(attempt_id, attempt["reconciliation"]))
+                self._rollback()
+                result = dict(attempt)
+                result["replay"] = True
+                return result
+            if attempt["state"] != ATTEMPT_OUTCOME_UNKNOWN:
+                self._rollback()
+                raise TaskTransitionError(
+                    "only outcome_unknown attempts can be reconciled; attempt is {0}".format(attempt["state"]))
+            self._conn.execute(
+                "UPDATE task_invocation_attempts SET state = ?, reconciled_at = ?, reconciled_by = ?, reconciliation = ?, reconciliation_reason = ? WHERE attempt_id = ?",
+                (ATTEMPT_RECONCILED, _now(), actor, resolution, str(reason or "")[:2000], str(attempt_id)),
+            )
+            self._emit(task_id, "invocation_reconciled", actor=actor, command_id="",
+                       payload={"attempt_id": str(attempt_id), "resolution": resolution,
+                                "reason": str(reason or "")[:500]})
+            requeued = False
+            if requeue_if_blocked and resolution == "confirmed_not_charged":
+                task = self._task_row(task_id)
+                if task["status"] == STATUS_BLOCKED:
+                    self._check_transition(STATUS_BLOCKED, STATUS_QUEUED)
+                    self._touch(task_id, status=STATUS_QUEUED, worker_id="", lease_expires_at="",
+                                last_error="requeued after confirmed_not_charged reconciliation of {0}".format(attempt_id))
+                    self._emit(task_id, "task_requeued", actor=actor,
+                               payload={"reason": "invocation reconciled as not charged",
+                                        "attempt_id": str(attempt_id)})
+                    requeued = True
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        result = dict(self._attempt_row(attempt_id))
+        result["requeued"] = requeued
+        return result
 
     def cancel_if_requested(self, task_id: str, *, worker_id: str, fencing_token: int) -> Dict[str, Any]:
         """Worker-side cancellation point: transition to cancelled when the flag is set.

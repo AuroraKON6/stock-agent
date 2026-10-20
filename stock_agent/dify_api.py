@@ -239,7 +239,9 @@ class DifyGateway:
             "version": int(task.get("version") or 0),
             "terminal": status in TERMINAL_STATUSES,
             "cancel_requested": bool(task.get("cancel_requested")),
-            "input_version": payload.get("input_version"),
+            # R01: the column is authoritative; the payload field is a synced
+            # compatibility projection only.
+            "input_version": int(task.get("input_version") or 1),
             "draft_summary": str(output.get("summary") or "") if isinstance(output, dict) else "",
             "references": references,
             "budget": may_start_model_call(self.store, self.config, now=now),
@@ -262,6 +264,7 @@ class DifyGateway:
                         input_version: int, research_question: str,
                         public_context: str = "", dify_run_id: str,
                         workflow_version: str, idempotency_key: str = "",
+                        business_intent_id: str = "",
                         prompt_version: str = "research_v1",
                         execution_mode: str = "live", now: Optional[datetime] = None) -> Dict[str, Any]:
         identity = self._gate(token, "create_research", case_id=str(case_id or ""))
@@ -279,6 +282,20 @@ class DifyGateway:
             raise ValueError("dify_run_id must not be empty")
         if isinstance(input_version, bool) or not isinstance(input_version, int) or input_version < 1:
             raise ValueError("input_version must be a positive integer")
+        # R01: the business intent is STABLE business identity. It is derived
+        # from business content only — never from dify_run_id, which is a
+        # per-execution id: a retried platform run must land on the SAME task
+        # with a new association row, not a second task. Callers that know the
+        # intent (e.g. a backend-issued research intent id) pass it explicitly.
+        intent_id = str(business_intent_id or "").strip() or "dify-bi-{0}".format(_canonical_sha256({
+            "kind": "dify",
+            "case_id": str(case_id or ""),
+            "research_question": question,
+            "input_version": int(input_version),
+            "workflow_version": str(workflow_version or ""),
+            "prompt_version": str(prompt_version or "research_v1"),
+            "execution_mode": str(execution_mode or "live"),
+        })[:24])
         input_payload = {
             "data_classification": "public",
             "input_version": int(input_version),
@@ -290,10 +307,21 @@ class DifyGateway:
                 "workflow_version": str(workflow_version or ""),
             },
         }
+        # Whether THIS run's association is new is decided against the
+        # pre-create state: a fresh run id landing on an existing task is a
+        # newly RECORDED association, only a re-sent run id is a DUPLICATE.
+        pre_existing_run = self.store.get_platform_run("dify", run_id)
         task, outcome = self.store.create_task(
             title=title, input_payload=input_payload, case_id=str(case_id or ""),
-            idempotency_key=str(idempotency_key or ""), prompt_version=str(prompt_version or "research_v1"),
-            execution_mode=str(execution_mode or "live"), actor="dify:{0}".format(identity["credential_id"]))
+            idempotency_key=str(idempotency_key or ""), business_intent_id=intent_id,
+            prompt_version=str(prompt_version or "research_v1"),
+            execution_mode=str(execution_mode or "live"), actor="dify:{0}".format(identity["credential_id"]),
+            platform_run={
+                "platform": "dify",
+                "run_id": run_id,
+                "workflow_version": str(workflow_version or ""),
+                "actor": "dify:{0}".format(identity["credential_id"]),
+            })
         payload = task.get("input_payload") or {}
         origin = payload.get("origin") or {}
         return {
@@ -303,6 +331,13 @@ class DifyGateway:
             "version": int(task.get("version") or 0),
             "outcome": outcome,
             "idempotency_key": str(task.get("idempotency_key") or ""),
+            "business_intent_id": intent_id,
+            "platform_run": {
+                "platform": "dify",
+                "run_id": run_id,
+                "association_outcome": "DUPLICATE" if pre_existing_run else "RECORDED",
+                "task_run_count": len(self.store.list_platform_runs(str(task.get("task_id") or ""))),
+            },
             "dify": {
                 "dify_run_id": str(origin.get("dify_run_id") or ""),
                 "workflow_version": str(origin.get("workflow_version") or ""),
@@ -466,8 +501,13 @@ class DifyGateway:
                         reason="task_terminal", task_id=task_id, status=status)
             raise DifySubmissionError("task_terminal",
                                       "task {0} is terminal ({1})".format(task_id, status))
-        payload = task.get("input_payload") or {}
-        input_version = payload.get("input_version")
+        # R01: input_version is read from the authoritative column, never from
+        # the payload projection — a late candidate for an older input version
+        # must resolve against what the task CURRENTLY is.
+        try:
+            input_version = int(task.get("input_version") or 1)
+        except (TypeError, ValueError):
+            input_version = 1
         case_id = str(task.get("case_id") or "")
         bundle = self._latest_bundle(case_id, input_version)
         if bundle is None or str(bundle.get("bundle_id")) != str(bundle_id or ""):

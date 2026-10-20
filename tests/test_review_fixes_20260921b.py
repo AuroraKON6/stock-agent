@@ -274,8 +274,13 @@ class SafeResearchContextTests(unittest.TestCase):
         def _fabricate(spec):
             spec["replay_response"]["evidence_refs"] = ["ev-not-in-context"]
             spec["replay_response"]["summary"] = "引用不存在证据"
-        result, _ = self._run_worker(mutator=_fabricate)
-        self.assertEqual(result["status"], "failed", "refs must bind to the SAFE delivered evidence set")
+        result, stored = self._run_worker(mutator=_fabricate)
+        # R01/F05: refs must bind to the SAFE delivered evidence set — the
+        # rejection requeues (attempts left), and the worker reports the
+        # persisted status instead of a terminal "failed" label.
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(stored["status"], "queued")
+        self.assertIn("evidence", str(result.get("error") or stored["last_error"]).lower())
 
 
 class BoardFormPreservationTests(unittest.TestCase):

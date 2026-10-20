@@ -171,13 +171,19 @@ class MultiRoundFlowTests(MultiRoundTestCase):
              "rounds": (result.get("model_call") or {}).get("rounds")}, ensure_ascii=False, default=str)[:800])
         self.assertEqual(self.store.get_task(task["task_id"])["status"], "cancelled")
 
-    def test_illegal_json_fails_retryable_without_more_rounds(self):
+    def test_illegal_json_requeues_retryable_without_more_rounds(self):
         task = self.create_live_task()
         with patch("stock_agent.pi_runtime.call_pi_agent",
                    side_effect=[LLMResponse("not-json-at-all", {"model": "m", "usage": {}})]) as stub:
             result = _run(self.store, task, self.config)
         self.assertEqual(stub.call_count, 1)
-        self.assertEqual(result["status"], "failed")
+        # R01/F05: retryable failure with attempts left persists as queued (one
+        # attempt consumed); the worker must report the persisted state.
+        self.assertEqual(result["status"], "queued")
+        stored = self.store.get_task(task["task_id"])
+        self.assertEqual(stored["status"], "queued")
+        self.assertEqual(stored["attempt_count"], 1)
+        self.assertIn("validation", str(result.get("error") or ""))
 
     def test_forged_evidence_ref_rejected_in_intermediate_round(self):
         task = self.create_live_task()
@@ -188,7 +194,10 @@ class MultiRoundFlowTests(MultiRoundTestCase):
                    side_effect=[self.response(round1)]) as stub:
             result = _run(self.store, task, self.config)
         self.assertEqual(stub.call_count, 1)
-        self.assertEqual(result["status"], "failed")
+        # Retryable validation failure with attempts left requeues (persisted
+        # state), never masquerades as a terminal failure or success.
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(self.store.get_task(task["task_id"])["status"], "queued")
         self.assertIn("approved context", str(result.get("error") or ""))
 
     def test_actual_model_unknown_when_metadata_missing(self):
