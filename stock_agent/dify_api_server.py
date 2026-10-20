@@ -44,6 +44,9 @@ _ROUTES: Dict[str, Tuple[str, Tuple[str, ...]]] = {
     "/api/dify/v1/submit-result": (
         "submit_candidate_result",
         ("task_id", "dify_run_id", "workflow_version", "bundle_id", "citations", "result")),
+    "/api/dify/v1/adopt-result": (
+        "adopt_candidate_result",
+        ("task_id", "dispatch_id", "result_id")),
     "/api/dify/v1/submit-feedback": (
         "submit_feedback",
         ("task_id", "command_id", "expected_version", "decision")),

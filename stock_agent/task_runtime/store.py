@@ -25,7 +25,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-TASK_SCHEMA_VERSION = "1.2"  # R02: +task_invocation_attempts (outbound attempt chain)
+TASK_SCHEMA_VERSION = "1.3"  # R03: +principal_verifications (atomic claim), +workflow_dispatches
 
 STATUS_QUEUED = "queued"
 STATUS_LEASED = "leased"
@@ -102,6 +102,18 @@ class TaskFencingError(TaskRuntimeError):
 
 class TaskIdempotencyConflictError(TaskRuntimeError):
     pass
+
+
+class PrincipalVerificationError(TaskRuntimeError):
+    """Atomic claim of a one-command principal receipt failed (R03).
+
+    ``reason`` mirrors the gateway's pending-parking reasons so the JSONL
+    pre-check and the authoritative store claim can never disagree.
+    """
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(detail or reason)
+        self.reason = reason
 
 
 def _now() -> str:
@@ -204,6 +216,31 @@ CREATE TABLE IF NOT EXISTS task_invocation_attempts (
     reconciliation_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_invocation_attempts_task ON task_invocation_attempts(task_id, started_at);
+CREATE TABLE IF NOT EXISTS principal_verifications (
+    verification_id TEXT PRIMARY KEY,
+    actor TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT '',
+    task_id TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL DEFAULT '',
+    expires_at TEXT NOT NULL,
+    command_id TEXT NOT NULL DEFAULT '',
+    used_at TEXT NOT NULL DEFAULT '',
+    issued_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workflow_dispatches (
+    dispatch_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    issued_generation INTEGER NOT NULL,
+    input_version INTEGER NOT NULL,
+    bundle_id TEXT NOT NULL,
+    bundle_hash TEXT NOT NULL DEFAULT '',
+    workflow_version TEXT NOT NULL,
+    fencing_token INTEGER NOT NULL DEFAULT 0,
+    issued_at TEXT NOT NULL,
+    consumed_at TEXT NOT NULL DEFAULT '',
+    consumed_by TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_dispatches_task ON workflow_dispatches(task_id, issued_at);
 CREATE TABLE IF NOT EXISTS signal_consumptions (
     event_key TEXT NOT NULL,
     purpose TEXT NOT NULL,
@@ -946,11 +983,30 @@ class TaskStore:
             raise
         return self.get_task(task_id)
 
-    def request_cancel(self, task_id: str, *, actor: str, reason: str, expected_version: int) -> Dict[str, Any]:
+    def request_cancel(self, task_id: str, *, actor: str, reason: str, expected_version: int,
+                       principal_verification: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if not str(actor or "").strip():
             raise TaskRuntimeError("actor must not be empty")
         self._begin()
         try:
+            # R03: atomic claim in the SAME transaction as the cancellation
+            # (see record_human_response); a protected cancel without a valid
+            # one-command receipt never mutates the task.
+            if principal_verification is not None:
+                if not isinstance(principal_verification, dict):
+                    self._rollback()
+                    raise TaskRuntimeError("principal_verification must be an object")
+                verdict = self._claim_verification_in_txn(
+                    str(principal_verification.get("verification_id") or ""),
+                    actor=str(principal_verification.get("actor") or actor),
+                    command_id=str(principal_verification.get("command_id") or "cancel:{0}".format(task_id)),
+                    task_id=task_id,
+                    action="cancel",
+                    issued_fallback=principal_verification.get("issued_fallback"))
+                if not verdict.get("claimed"):
+                    self._rollback()
+                    raise PrincipalVerificationError(
+                        str(verdict.get("reason") or "principal_verification_required"))
             row = self._task_row(task_id)
             if int(row["version"]) != int(expected_version):
                 raise TaskVersionConflictError("expected_version {0} does not match current {1}".format(expected_version, row["version"]))
@@ -980,6 +1036,7 @@ class TaskStore:
         command_id: str,
         input_patch: Optional[Dict[str, Any]] = None,
         notes: str = "",
+        principal_verification: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not str(actor or "").strip():
             raise TaskRuntimeError("actor must not be empty")
@@ -1002,6 +1059,25 @@ class TaskStore:
                         raise TaskIdempotencyConflictError("command_id is not an exact replay of this human response")
                     self._rollback()
                     return self.get_task(task_id)
+            # R03: the claim runs INSIDE this transaction — verification
+            # consumption and the task state change commit or roll back
+            # together, so two concurrent commands can never both spend one
+            # receipt even when both passed the gateway's friendly pre-check.
+            if principal_verification is not None:
+                if not isinstance(principal_verification, dict):
+                    self._rollback()
+                    raise TaskRuntimeError("principal_verification must be an object")
+                verdict = self._claim_verification_in_txn(
+                    str(principal_verification.get("verification_id") or ""),
+                    actor=str(principal_verification.get("actor") or actor),
+                    command_id=str(principal_verification.get("command_id") or command_id),
+                    task_id=task_id,
+                    action=str(principal_verification.get("action") or "feedback"),
+                    issued_fallback=principal_verification.get("issued_fallback"))
+                if not verdict.get("claimed"):
+                    self._rollback()
+                    raise PrincipalVerificationError(
+                        str(verdict.get("reason") or "principal_verification_required"))
             row = self._task_row(task_id)
             if int(row["version"]) != int(expected_version):
                 raise TaskVersionConflictError("expected_version {0} does not match current {1}".format(expected_version, row["version"]))
@@ -1511,6 +1587,242 @@ class TaskStore:
         result = dict(self._attempt_row(attempt_id))
         result["requeued"] = requeued
         return result
+
+    # -------- principal verification receipts (R03: atomic consumption) ------
+
+    def register_principal_verification(self, verification_id: str, *, actor: str,
+                                        role: str = "", task_id: str = "", action: str = "",
+                                        expires_at: str) -> Dict[str, Any]:
+        """Backend-issued one-command receipt, transactionally claimable.
+
+        The JSONL ledger in data/dify keeps its audit copy; THIS row is the
+        claim authority: two concurrent commands can never both consume one
+        receipt (the UPDATE is guarded by used_at='').
+        """
+        verification_id = str(verification_id or "").strip()
+        actor = str(actor or "").strip()
+        if not verification_id or not actor:
+            raise TaskRuntimeError("principal verification requires verification_id and actor")
+        if not str(expires_at or "").strip():
+            raise TaskRuntimeError("principal verification requires expires_at")
+        record = {
+            "verification_id": verification_id, "actor": actor, "role": str(role or ""),
+            "task_id": str(task_id or ""), "action": str(action or ""),
+            "expires_at": str(expires_at), "command_id": "", "used_at": "",
+            "issued_at": _now(),
+        }
+        self._begin()
+        try:
+            existing = self._conn.execute(
+                "SELECT * FROM principal_verifications WHERE verification_id = ?",
+                (verification_id,)).fetchone()
+            if existing is not None:
+                same = all(str(existing[key]) == record[key]
+                           for key in ("actor", "role", "task_id", "action", "expires_at"))
+                if not same:
+                    self._rollback()
+                    raise TaskIdempotencyConflictError(
+                        "verification {0} was issued for a different principal/scope".format(verification_id))
+                self._rollback()
+                return dict(existing)
+            self._conn.execute(
+                "INSERT INTO principal_verifications (verification_id, actor, role, task_id, action, expires_at, command_id, used_at, issued_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (record["verification_id"], record["actor"], record["role"], record["task_id"],
+                 record["action"], record["expires_at"], "", "", record["issued_at"]),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return record
+
+    def _claim_verification_in_txn(self, verification_id: str, *, actor: str,
+                                   command_id: str, task_id: str = "", action: str = "",
+                                   issued_fallback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Claim logic for an ALREADY-OPEN transaction (no begin/commit here).
+
+        This is what makes the claim atomic with the task mutation it guards:
+        record_human_response / request_cancel call it inside their own BEGIN
+        IMMEDIATE, so consumption and the state change commit or roll back
+        together (F07)."""
+        verification_id = str(verification_id or "").strip()
+        actor = str(actor or "").strip()
+        command_id = str(command_id or "")
+        row = self._conn.execute(
+            "SELECT * FROM principal_verifications WHERE verification_id = ?",
+            (verification_id,)).fetchone()
+        if row is None and issued_fallback is not None:
+            fb = dict(issued_fallback)
+            self._conn.execute(
+                "INSERT OR IGNORE INTO principal_verifications (verification_id, actor, role, task_id, action, expires_at, command_id, used_at, issued_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (verification_id, str(fb.get("actor") or ""), str(fb.get("role") or ""),
+                 str(fb.get("task_id") or ""), str(fb.get("action") or ""),
+                 str(fb.get("expires_at") or ""), "", "", str(fb.get("issued_at") or _now())),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM principal_verifications WHERE verification_id = ?",
+                (verification_id,)).fetchone()
+        if row is None:
+            return {"claimed": False, "reason": "principal_verification_unknown"}
+        if str(row["actor"]) != actor:
+            return {"claimed": False, "reason": "principal_actor_mismatch"}
+        if str(row["task_id"]) and task_id and str(row["task_id"]) != str(task_id):
+            return {"claimed": False, "reason": "principal_task_mismatch"}
+        if str(row["action"]) and action and str(row["action"]) != str(action):
+            return {"claimed": False, "reason": "principal_action_mismatch"}
+        try:
+            expiry = datetime.fromisoformat(str(row["expires_at"]))
+        except ValueError:
+            return {"claimed": False, "reason": "principal_verification_invalid"}
+        if expiry.tzinfo is None:
+            expiry = expiry.astimezone()
+        if expiry <= datetime.now().astimezone():
+            return {"claimed": False, "reason": "principal_verification_expired"}
+        if str(row["used_at"]):
+            if str(row["command_id"]) == command_id:
+                # Idempotent re-claim for the SAME command: the task-level
+                # command receipt above this layer deduplicates the effect.
+                return {"claimed": True, "reason": "already_claimed_same_command"}
+            return {"claimed": False, "reason": "principal_verification_already_used"}
+        changed = self._conn.execute(
+            "UPDATE principal_verifications SET used_at = ?, command_id = ? "
+            "WHERE verification_id = ? AND used_at = ''",
+            (_now(), command_id, verification_id),
+        ).rowcount
+        if changed != 1:
+            # Another writer claimed it between the read and the guarded
+            # UPDATE — this is the A12 race loser.
+            return {"claimed": False, "reason": "principal_verification_already_used"}
+        return {"claimed": True, "reason": "ok",
+                "verification": {key: str(row[key]) for key in
+                                 ("verification_id", "actor", "task_id", "action", "expires_at")}}
+
+    def claim_principal_verification(self, verification_id: str, *, actor: str,
+                                     command_id: str, task_id: str = "", action: str = "",
+                                     issued_fallback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Atomically consume a receipt: exactly one command ever succeeds.
+
+        ``issued_fallback`` carries a legacy (JSONL-only) issuance so receipts
+        issued before this table existed migrate in on first use — insert then
+        claim inside ONE transaction. A stale row is never resurrected.
+        """
+        self._begin()
+        try:
+            verdict = self._claim_verification_in_txn(
+                verification_id, actor=actor, command_id=command_id,
+                task_id=task_id, action=action, issued_fallback=issued_fallback)
+            if verdict.get("claimed"):
+                self._commit()
+            else:
+                self._rollback()
+        except BaseException:
+            self._rollback()
+            raise
+        return verdict
+
+    # -------- backend-issued workflow dispatches (R03: adoption binding) -----
+
+    def issue_workflow_dispatch(self, task_id: str, *, input_version: int, bundle_id: str,
+                                bundle_hash: str, workflow_version: str,
+                                actor: str = "backend") -> Dict[str, Any]:
+        """Backend issues the ONLY credential a platform run may submit against.
+
+        The receipt freezes the full binding at issue time: task row version
+        (generation), fencing token, input_version, bundle identity and
+        workflow version. Any task mutation bumps the row version, so a late
+        submission against an old generation is detectable (A15)."""
+        self._begin()
+        try:
+            row = self._task_row(task_id)
+            dispatch_id = _new_id("wd")
+            record = {
+                "dispatch_id": dispatch_id, "task_id": task_id,
+                "issued_generation": int(row["version"]),
+                "input_version": int(input_version),
+                "bundle_id": str(bundle_id or ""), "bundle_hash": str(bundle_hash or ""),
+                "workflow_version": str(workflow_version or ""),
+                "fencing_token": int(row["fencing_token"]),
+                "issued_at": _now(), "consumed_at": "", "consumed_by": "",
+            }
+            self._conn.execute(
+                "INSERT INTO workflow_dispatches (dispatch_id, task_id, issued_generation, input_version, bundle_id, bundle_hash, workflow_version, fencing_token, issued_at, consumed_at, consumed_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (record["dispatch_id"], record["task_id"], record["issued_generation"],
+                 record["input_version"], record["bundle_id"], record["bundle_hash"],
+                 record["workflow_version"], record["fencing_token"], record["issued_at"], "", ""),
+            )
+            self._emit(task_id, "workflow_dispatch_issued", actor=str(actor or "backend"),
+                       payload={"dispatch_id": dispatch_id,
+                                "issued_generation": record["issued_generation"],
+                                "input_version": record["input_version"],
+                                "bundle_id": record["bundle_id"],
+                                "workflow_version": record["workflow_version"]})
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return record
+
+    def validate_workflow_dispatch(self, dispatch_id: str, *, task_id: str,
+                                   input_version: int, bundle_id: str,
+                                   workflow_version: str) -> Dict[str, Any]:
+        """Read-only full-binding validation; returns {ok, reason, dispatch}."""
+        row = self._conn.execute(
+            "SELECT * FROM workflow_dispatches WHERE dispatch_id = ?", (str(dispatch_id),)
+        ).fetchone()
+        if row is None:
+            return {"ok": False, "reason": "dispatch_unknown", "dispatch": None}
+        dispatch = dict(row)
+        if str(row["task_id"]) != str(task_id):
+            return {"ok": False, "reason": "dispatch_task_mismatch", "dispatch": dispatch}
+        if str(row["consumed_at"]):
+            return {"ok": False, "reason": "dispatch_already_consumed", "dispatch": dispatch}
+        task = self._task_row(str(task_id))
+        if int(task["version"]) != int(row["issued_generation"]):
+            # The task moved on (input patch, cancel request, state change):
+            # this dispatch was issued against a world that no longer exists.
+            # Generation is checked BEFORE bindings on purpose — comparing
+            # bindings against a dead generation would be meaningless.
+            return {"ok": False, "reason": "dispatch_generation_stale", "dispatch": dispatch}
+        if str(row["workflow_version"]) != str(workflow_version or "") \
+                or str(row["bundle_id"]) != str(bundle_id or "") \
+                or int(row["input_version"]) != int(input_version):
+            return {"ok": False, "reason": "dispatch_binding_mismatch", "dispatch": dispatch}
+        if str(task["status"]) == STATUS_CANCELLED or task["status"] in TERMINAL_STATUSES:
+            return {"ok": False, "reason": "dispatch_task_not_active", "dispatch": dispatch}
+        return {"ok": True, "reason": "ok", "dispatch": dispatch}
+
+    def consume_workflow_dispatch(self, dispatch_id: str, *, task_id: str,
+                                  input_version: int, bundle_id: str,
+                                  workflow_version: str, actor: str,
+                                  result_ref: str = "") -> Dict[str, Any]:
+        """Adoption step: re-validate inside the write transaction, then mark
+        consumed exactly once (a second adoption of the same dispatch fails)."""
+        self._begin()
+        try:
+            verdict = self.validate_workflow_dispatch(
+                dispatch_id, task_id=task_id, input_version=int(input_version),
+                bundle_id=str(bundle_id or ""), workflow_version=str(workflow_version or ""))
+            if not verdict["ok"]:
+                self._rollback()
+                raise TaskTransitionError(
+                    "workflow dispatch rejected: {0}".format(verdict["reason"]))
+            changed = self._conn.execute(
+                "UPDATE workflow_dispatches SET consumed_at = ?, consumed_by = ? "
+                "WHERE dispatch_id = ? AND consumed_at = ''",
+                (_now(), str(actor or ""), str(dispatch_id)),
+            ).rowcount
+            if changed != 1:
+                self._rollback()
+                raise TaskTransitionError("workflow dispatch rejected: dispatch_already_consumed")
+            self._emit(str(task_id), "workflow_dispatch_consumed", actor=str(actor or ""),
+                       payload={"dispatch_id": str(dispatch_id), "result_ref": str(result_ref or "")[:200]})
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return dict(self._conn.execute(
+            "SELECT * FROM workflow_dispatches WHERE dispatch_id = ?", (str(dispatch_id),)
+        ).fetchone())
 
     def cancel_if_requested(self, task_id: str, *, worker_id: str, fencing_token: int) -> Dict[str, Any]:
         """Worker-side cancellation point: transition to cancelled when the flag is set.

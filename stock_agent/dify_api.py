@@ -28,15 +28,17 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import dify_access
-from .budget_guard import may_start_model_call
+from . import workflow_service
 from .task_runtime.store import (
     TERMINAL_STATUSES,
     STATUS_CANCELLED,
     STATUS_SUCCEEDED,
     STATUS_AWAITING_HUMAN,
+    PrincipalVerificationError,
     TaskRuntimeError,
     TaskIdempotencyConflictError,
     TaskTransitionError,
@@ -105,8 +107,13 @@ class DifyGateway:
     def __init__(self, store: Any, config: Dict[str, Any], *,
                  credentials: Optional[Dict[str, Any]] = None):
         self.store = store
+        self._db_path = Path(getattr(store, "db_path"))
         self.config = config or {}
         self.settings = dify_access.dify_config(self.config)
+        # R03/F08: injected credentials stay a fixed test seam; otherwise the
+        # registry is RELOADED on every request so a revocation in the
+        # credentials file takes effect on the very next call.
+        self._credentials_injected = credentials is not None
         self.credentials = credentials if credentials is not None \
             else dify_access.load_service_credentials(self.config)
         # Anchor ledger paths ONCE, in the constructing thread's context:
@@ -120,6 +127,22 @@ class DifyGateway:
             LEDGER_ACCESS_LOG, LEDGER_FACT_BUNDLES, LEDGER_CANDIDATE_RESULTS,
             LEDGER_PENDING_FEEDBACK, LEDGER_PRINCIPAL_VERIFICATIONS,
         )}
+        # Anchor the credential registry path in THIS thread too: per-request
+        # reloads run on HTTP handler threads where the project-path
+        # contextvar is absent (same lesson as the ledger paths above). An
+        # absolute path bypasses the override entirely.
+        import copy
+
+        self._reload_config = copy.deepcopy(self.config)
+        reload_dify = dict(self._reload_config.get("dify") or {})
+        reload_dify["service_credentials_path"] = str(
+            project_path(self.settings["service_credentials_path"]))
+        self._reload_config["dify"] = reload_dify
+
+    def _credential_registry(self) -> Dict[str, Any]:
+        if self._credentials_injected:
+            return self.credentials
+        return dify_access.load_service_credentials(self._reload_config)
 
     # ------------------------------------------------------------------ #
     # ledger plumbing (append-only JSONL under data/dify/)               #
@@ -174,7 +197,7 @@ class DifyGateway:
             self._audit("", operation, allowed=False, reason="dify_disabled", case_id=case_id)
             raise dify_access.DifyAccessError("dify_disabled", "dify integration is not enabled")
         try:
-            identity = dify_access.verify_service_credential(self.credentials, token)
+            identity = dify_access.verify_service_credential(self._credential_registry(), token)
         except dify_access.DifyAccessError as exc:
             self._audit("", operation, allowed=False, reason=exc.reason, case_id=case_id)
             raise
@@ -195,7 +218,7 @@ class DifyGateway:
         reason so task ids cannot be enumerated through the API."""
         identity = self._gate(token, scope, operation=scope)
         try:
-            task = self.store.get_task(str(task_id or ""))
+            task = workflow_service.get_task(self._db_path, str(task_id or ""))
         except TaskRuntimeError:
             raise dify_access.DifyAccessError("task_not_found_or_out_of_scope", str(task_id))
         case_id = str(task.get("case_id") or "")
@@ -244,7 +267,7 @@ class DifyGateway:
             "input_version": int(task.get("input_version") or 1),
             "draft_summary": str(output.get("summary") or "") if isinstance(output, dict) else "",
             "references": references,
-            "budget": may_start_model_call(self.store, self.config, now=now),
+            "budget": self._budget_view(now=now),
             "poll": dict(self.settings.get("poll") or {}),
         }
         if origin.get("kind") == "dify":
@@ -311,17 +334,21 @@ class DifyGateway:
         # pre-create state: a fresh run id landing on an existing task is a
         # newly RECORDED association, only a re-sent run id is a DUPLICATE.
         pre_existing_run = self.store.get_platform_run("dify", run_id)
-        task, outcome = self.store.create_task(
+        task, outcome = workflow_service.create_research_task(
+            self._db_path,
             title=title, input_payload=input_payload, case_id=str(case_id or ""),
-            idempotency_key=str(idempotency_key or ""), business_intent_id=intent_id,
+            business_intent_id=intent_id,
+            idempotency_key=str(idempotency_key or ""),
             prompt_version=str(prompt_version or "research_v1"),
-            execution_mode=str(execution_mode or "live"), actor="dify:{0}".format(identity["credential_id"]),
+            execution_mode=str(execution_mode or "live"),
+            actor="dify:{0}".format(identity["credential_id"]),
             platform_run={
                 "platform": "dify",
                 "run_id": run_id,
                 "workflow_version": str(workflow_version or ""),
                 "actor": "dify:{0}".format(identity["credential_id"]),
             })
+        run_association = workflow_service.platform_run(self._db_path, "dify", run_id) or {}
         payload = task.get("input_payload") or {}
         origin = payload.get("origin") or {}
         return {
@@ -336,14 +363,17 @@ class DifyGateway:
                 "platform": "dify",
                 "run_id": run_id,
                 "association_outcome": "DUPLICATE" if pre_existing_run else "RECORDED",
-                "task_run_count": len(self.store.list_platform_runs(str(task.get("task_id") or ""))),
+                "task_run_count": len(workflow_service.platform_runs(self._db_path, str(task.get("task_id") or ""))),
             },
             "dify": {
                 "dify_run_id": str(origin.get("dify_run_id") or ""),
                 "workflow_version": str(origin.get("workflow_version") or ""),
             },
-            "budget": may_start_model_call(self.store, self.config, now=now),
+            "budget": self._budget_view(now=now),
         }
+
+    def _budget_view(self, *, now: Optional[datetime] = None) -> Dict[str, Any]:
+        return workflow_service.budget_view(self._db_path, self.config, now=now)
 
     # ------------------------------------------------------------------ #
     # contract: research status                                          #
@@ -484,6 +514,7 @@ class DifyGateway:
                                 workflow_version: str, bundle_id: str,
                                 citations: List[str], result: Dict[str, Any],
                                 attempt_receipt: Optional[Dict[str, Any]] = None,
+                                dispatch_id: str = "",
                                 now: Optional[datetime] = None) -> Dict[str, Any]:
         identity, task = self._gate_task(token, "submit_result", str(task_id or ""))
         task_id = str(task.get("task_id") or "")
@@ -509,6 +540,24 @@ class DifyGateway:
         except (TypeError, ValueError):
             input_version = 1
         case_id = str(task.get("case_id") or "")
+        # R03: a backend-issued dispatch_id is the ONLY execution credential
+        # this gateway trusts. When present it must validate against the
+        # CURRENT task state (generation, bindings, activity); when absent the
+        # receipt is recorded as caller-self-reported and can never be adopted.
+        dispatch_binding = "caller_self_reported_unverified"
+        if str(dispatch_id or "").strip():
+            verdict = workflow_service.validate_workflow_dispatch(
+                self._db_path, str(dispatch_id), task_id=task_id,
+                input_version=input_version, bundle_id=str(bundle_id or ""),
+                workflow_version=str(workflow_version or ""))
+            if not verdict.get("ok"):
+                reason = str(verdict.get("reason") or "dispatch_unknown")
+                self._audit(identity["credential_id"], "submit_result", allowed=False,
+                            reason=reason, task_id=task_id, dispatch_id=str(dispatch_id))
+                raise DifySubmissionError(
+                    reason,
+                    "workflow dispatch {0} rejected: {1}".format(dispatch_id, reason))
+            dispatch_binding = "backend_dispatch_validated"
         bundle = self._latest_bundle(case_id, input_version)
         if bundle is None or str(bundle.get("bundle_id")) != str(bundle_id or ""):
             raise DifySubmissionError(
@@ -583,6 +632,8 @@ class DifyGateway:
             "result_sha256": result_sha256,
             "result": result,
             "attempt_receipt": dict(attempt_receipt or {}),
+            "attempt_binding": dispatch_binding,
+            "dispatch_id": str(dispatch_id or ""),
             "status": "recorded",
             "recorded_at": _now_iso(now),
         }
@@ -592,18 +643,87 @@ class DifyGateway:
         return receipt
 
     # ------------------------------------------------------------------ #
+    # contract: candidate ADOPTION (reception != adoption, R03)          #
+    # ------------------------------------------------------------------ #
+
+    def adopt_candidate_result(self, token: str, *, task_id: str, dispatch_id: str,
+                               result_id: str, now: Optional[datetime] = None) -> Dict[str, Any]:
+        """Separate, explicit adoption of an already-received candidate.
+
+        Reception (``submit_candidate_result``) only records; adoption is the
+        step that consumes the backend-issued dispatch exactly once. Only
+        dispatch-BOUND receipts (``attempt_binding == backend_dispatch_validated``)
+        are adoptable — a caller-self-reported receipt is data, never proof.
+        """
+        identity, task = self._gate_task(token, "submit_result", str(task_id or ""))
+        task_id = str(task.get("task_id") or "")
+        dispatch_id = str(dispatch_id or "").strip()
+        result_id = str(result_id or "").strip()
+        if not dispatch_id or not result_id:
+            raise ValueError("dispatch_id and result_id are required")
+        receipt = None
+        adoption = None
+        for event in self._read_ledger(LEDGER_CANDIDATE_RESULTS):
+            if event.get("record_type") == "dify_candidate_result" \
+                    and str(event.get("result_id")) == result_id:
+                receipt = event
+            if event.get("event") == "adopted" and str(event.get("result_id")) == result_id:
+                adoption = event
+        if receipt is None or str(receipt.get("task_id")) != task_id:
+            raise DifySubmissionError(
+                "candidate_result_unknown",
+                "no candidate result {0} for task {1}".format(result_id, task_id))
+        if adoption is not None:
+            return {"status": "already_adopted", "result_id": result_id,
+                    "adopted_at": adoption.get("adopted_at"), "executed": False}
+        if str(receipt.get("attempt_binding")) != "backend_dispatch_validated" \
+                or str(receipt.get("dispatch_id")) != dispatch_id:
+            raise DifySubmissionError(
+                "candidate_not_dispatch_bound",
+                "only a backend-validated dispatch receipt can be adopted; "
+                "caller-self-reported receipts are data, not proof")
+        try:
+            consumed = workflow_service.consume_workflow_dispatch(
+                self._db_path, dispatch_id, task_id=task_id,
+                input_version=int(receipt.get("input_version") or 0),
+                bundle_id=str(receipt.get("bundle_id") or ""),
+                workflow_version=str(receipt.get("workflow_version") or ""),
+                actor="dify:{0}".format(identity["credential_id"]),
+                result_ref=result_id)
+        except TaskTransitionError as exc:
+            reason = "dispatch_already_consumed" if "already_consumed" in str(exc) \
+                else "dispatch_generation_stale"
+            self._audit(identity["credential_id"], "adopt_result", allowed=False,
+                        reason=reason, task_id=task_id, dispatch_id=dispatch_id)
+            raise DifySubmissionError(reason, str(exc)) from exc
+        adopted_at = _now_iso(now)
+        self._append_ledger(LEDGER_CANDIDATE_RESULTS, {
+            "event": "adopted", "result_id": result_id, "task_id": task_id,
+            "dispatch_id": dispatch_id, "result_sha256": str(receipt.get("result_sha256") or ""),
+            "adopted_by": "dify:{0}".format(identity["credential_id"]),
+            "adopted_at": adopted_at,
+        })
+        self._audit(identity["credential_id"], "adopt_result", allowed=True,
+                    reason="ok", task_id=task_id, dispatch_id=dispatch_id)
+        return {"status": "adopted", "executed": True, "result_id": result_id,
+                "task_id": task_id, "dispatch_id": dispatch_id,
+                "dispatch": consumed, "adopted_at": adopted_at}
+
+    # ------------------------------------------------------------------ #
     # principal verification (backend-issued; never mintable by Dify)    #
     # ------------------------------------------------------------------ #
 
     def issue_principal_verification(self, *, actor: str, role: str = "",
+                                     task_id: str = "", action: str = "",
                                      ttl_seconds: int = _DEFAULT_VERIFICATION_TTL_SECONDS,
                                      now: Optional[datetime] = None) -> str:
         """Backend-side: bind a REAL local identity to a one-command receipt.
 
         Issued by the human-facing path (local identity check), never exposed
         through a Dify credential scope. Single-use per command_id and
-        short-lived; a Dify-side caller can at worst relay a stolen receipt
-        once — every use lands in the audit ledger.
+        short-lived; R03 registers the claimable row in the task store (the
+        JSONL ledger keeps its audit copy), so concurrent commands race on a
+        guarded UPDATE instead of a read-then-append window.
         """
         actor = str(actor or "").strip()
         if not actor:
@@ -611,43 +731,59 @@ class DifyGateway:
         if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int) or ttl_seconds < 1:
             raise ValueError("ttl_seconds must be a positive integer")
         moment = now or datetime.now().astimezone()
+        expires_at = (moment + timedelta(seconds=int(ttl_seconds))).isoformat()
         verification_id = "pv-{0}".format(_canonical_sha256({
             "actor": actor, "role": str(role or ""), "issued_at": moment.isoformat(),
         })[:16])
+        with workflow_service.request_store(self._db_path) as store:
+            store.register_principal_verification(
+                verification_id, actor=actor, role=str(role or ""),
+                task_id=str(task_id or ""), action=str(action or ""),
+                expires_at=expires_at)
         self._append_ledger(LEDGER_PRINCIPAL_VERIFICATIONS, {
             "event": "issued", "verification_id": verification_id, "actor": actor,
-            "role": str(role or ""), "issued_at": moment.isoformat(),
-            "expires_at": (moment + timedelta(seconds=int(ttl_seconds))).isoformat(),
+            "role": str(role or ""), "task_id": str(task_id or ""),
+            "action": str(action or ""), "issued_at": moment.isoformat(),
+            "expires_at": expires_at,
         })
         return verification_id
 
+    def _lookup_verification(self, verification_id: str) -> Optional[Dict[str, Any]]:
+        for event in self._read_ledger(LEDGER_PRINCIPAL_VERIFICATIONS):
+            if event.get("event") == "issued" and str(event.get("verification_id")) == verification_id:
+                return event
+        return None
+
     def _verify_principal(self, verification_id: str, actor: str, command_id: str,
-                          *, now: Optional[datetime] = None) -> Tuple[bool, str]:
+                          *, now: Optional[datetime] = None) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """Friendly PRE-check over the audit ledger (unchanged reasons).
+
+        The AUTHORITATIVE atomic claim happens inside the task-store
+        transaction (R03); this pre-check only produces the pending-parking
+        reason and the legacy ``issued`` record used as migration fallback.
+        """
         verification_id = str(verification_id or "").strip()
         actor = str(actor or "").strip()
         if not verification_id or not actor:
-            return False, "principal_verification_required"
-        issued = None
-        for event in self._read_ledger(LEDGER_PRINCIPAL_VERIFICATIONS):
-            if event.get("event") == "issued" and str(event.get("verification_id")) == verification_id:
-                issued = event
+            return False, "principal_verification_required", None
+        issued = self._lookup_verification(verification_id)
         if issued is None:
-            return False, "principal_verification_unknown"
+            return False, "principal_verification_unknown", None
         if str(issued.get("actor")) != actor:
-            return False, "principal_actor_mismatch"
+            return False, "principal_actor_mismatch", None
         try:
             expiry = datetime.fromisoformat(str(issued.get("expires_at")))
         except ValueError:
-            return False, "principal_verification_invalid"
+            return False, "principal_verification_invalid", None
         if expiry.tzinfo is None:
             expiry = expiry.astimezone()
         if expiry <= (now or datetime.now().astimezone()):
-            return False, "principal_verification_expired"
+            return False, "principal_verification_expired", None
         for event in self._read_ledger(LEDGER_PRINCIPAL_VERIFICATIONS):
             if event.get("event") == "used" and str(event.get("verification_id")) == verification_id:
                 if str(event.get("command_id")) != str(command_id):
-                    return False, "principal_verification_already_used"
-        return True, "ok"
+                    return False, "principal_verification_already_used", None
+        return True, "ok", issued
 
     def _mark_verification_used(self, verification_id: str, command_id: str,
                                 task_id: str, now: Optional[datetime] = None) -> None:
@@ -670,7 +806,7 @@ class DifyGateway:
         task_id = str(task.get("task_id") or "")
         if not str(command_id or "").strip():
             raise ValueError("command_id must not be empty")
-        valid, reason = self._verify_principal(verification_id, actor, command_id, now=now)
+        valid, reason, issued = self._verify_principal(verification_id, actor, command_id, now=now)
         if not valid:
             self._append_ledger(LEDGER_PENDING_FEEDBACK, {
                 "record_type": "dify_pending_feedback",
@@ -684,10 +820,29 @@ class DifyGateway:
             return {"status": "pending_verification", "executed": False, "reason": reason,
                     "task_id": task_id}
         try:
-            task = self.store.record_human_response(
-                task_id, actor=str(actor), decision=str(decision),
+            task = workflow_service.submit_feedback_task(
+                self._db_path, task_id, actor=str(actor), decision=str(decision),
                 expected_version=int(expected_version), command_id=str(command_id),
-                input_patch=input_patch, notes=str(notes or ""))
+                input_patch=input_patch, notes=str(notes or ""),
+                principal_verification={
+                    "verification_id": str(verification_id), "actor": str(actor),
+                    "command_id": str(command_id), "action": "feedback",
+                    "issued_fallback": issued,
+                })
+        except PrincipalVerificationError as exc:
+            # The store-level atomic claim lost the race (or found the receipt
+            # stale): park as pending with the authoritative reason.
+            self._append_ledger(LEDGER_PENDING_FEEDBACK, {
+                "record_type": "dify_pending_feedback",
+                "task_id": task_id, "command_id": str(command_id),
+                "submitted_actor": str(actor or ""), "decision": str(decision or ""),
+                "expected_version": expected_version, "notes": str(notes or ""),
+                "reason": exc.reason, "created_at": _now_iso(now),
+            })
+            self._audit(identity["credential_id"], "submit_feedback", allowed=True,
+                        executed=False, reason=exc.reason, task_id=task_id)
+            return {"status": "pending_verification", "executed": False, "reason": exc.reason,
+                    "task_id": task_id}
         except (TaskRuntimeError, TaskVersionConflictError, TaskIdempotencyConflictError,
                 TaskTransitionError):
             self._audit(identity["credential_id"], "submit_feedback", allowed=True,
@@ -705,7 +860,7 @@ class DifyGateway:
         identity, task = self._gate_task(token, "submit_feedback", str(task_id or ""))
         task_id = str(task.get("task_id") or "")
         command_id = "cancel:{0}".format(task_id)
-        valid, why = self._verify_principal(verification_id, actor, command_id, now=now)
+        valid, why, issued = self._verify_principal(verification_id, actor, command_id, now=now)
         if not valid:
             self._append_ledger(LEDGER_PENDING_FEEDBACK, {
                 "record_type": "dify_pending_feedback",
@@ -719,9 +874,26 @@ class DifyGateway:
             return {"status": "pending_verification", "executed": False, "reason": why,
                     "task_id": task_id}
         try:
-            task = self.store.request_cancel(
-                task_id, actor=str(actor), reason=str(reason or ""),
-                expected_version=int(expected_version))
+            task = workflow_service.cancel_task(
+                self._db_path, task_id, actor=str(actor), reason=str(reason or ""),
+                expected_version=int(expected_version),
+                principal_verification={
+                    "verification_id": str(verification_id), "actor": str(actor),
+                    "command_id": command_id, "action": "cancel",
+                    "issued_fallback": issued,
+                })
+        except PrincipalVerificationError as exc:
+            self._append_ledger(LEDGER_PENDING_FEEDBACK, {
+                "record_type": "dify_pending_feedback",
+                "task_id": task_id, "command_id": command_id,
+                "submitted_actor": str(actor or ""), "decision": "cancel",
+                "expected_version": expected_version, "notes": str(reason or ""),
+                "reason": exc.reason, "created_at": _now_iso(now),
+            })
+            self._audit(identity["credential_id"], "cancel", allowed=True,
+                        executed=False, reason=exc.reason, task_id=task_id)
+            return {"status": "pending_verification", "executed": False, "reason": exc.reason,
+                    "task_id": task_id}
         except (TaskRuntimeError, TaskVersionConflictError, TaskTransitionError):
             self._audit(identity["credential_id"], "cancel", allowed=True,
                         executed=False, reason="task_store_rejected", task_id=task_id)
