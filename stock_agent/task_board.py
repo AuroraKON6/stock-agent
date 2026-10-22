@@ -633,7 +633,9 @@ def _is_loopback_host(host: str) -> bool:
 def create_task_board_server(store: TaskStore, host: str = "127.0.0.1", port: int = 8768, *,
                              config: Optional[Dict[str, Any]] = None,
                              sse_max_seconds: Optional[int] = None,
-                             sse_keepalive_seconds: Optional[float] = None) -> ThreadingHTTPServer:
+                             sse_keepalive_seconds: Optional[float] = None,
+                             session_store: Optional[Any] = None,
+                             login_authenticator: Optional[Any] = None) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer((host, port), _TaskBoardHandler)
     server.task_store = store
     server.csrf_token = secrets.token_urlsafe(32)
@@ -643,6 +645,12 @@ def create_task_board_server(store: TaskStore, host: str = "127.0.0.1", port: in
     # exercise the slow-consumer behavior quickly.
     server.sse_max_seconds = int(sse_max_seconds or SSE_MAX_SECONDS)
     server.sse_keepalive_seconds = float(sse_keepalive_seconds or SSE_KEEPALIVE_SECONDS)
+    # R10 personal sessions: when a session store is attached, protected
+    # writes require a logged-in session and REJECT form-supplied actors
+    # (A46). Without one the legacy form-actor path stays available
+    # (rollback); production attaches the store + a provider authenticator.
+    server.session_store = session_store
+    server.login_authenticator = login_authenticator
     return server
 
 
@@ -652,16 +660,86 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         return
 
-    def _send(self, code: int, body: bytes, content_type: str) -> None:
+    def _send(self, code: int, body: bytes, content_type: str, *,
+              set_cookie: str = "") -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if set_cookie:
+            self.send_header("Set-Cookie", set_cookie)
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_json(self, code: int, payload: Dict[str, Any]) -> None:
-        self._send(code, json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"), "application/json; charset=utf-8")
+    def _send_json(self, code: int, payload: Dict[str, Any], *,
+                   set_cookie: str = "") -> None:
+        self._send(code, json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8"),
+                   "application/json; charset=utf-8", set_cookie=set_cookie)
+
+    def _session_cookie(self, name: str) -> str:
+        from http.cookies import SimpleCookie
+
+        raw = self.headers.get("Cookie", "")
+        try:
+            jar = SimpleCookie()
+            jar.load(raw)
+            return str(jar[name].value) if name in jar else ""
+        except Exception:
+            return ""
+
+    def _handle_personal_login(self) -> None:
+        """R10: authenticate a real principal via the attached provider and
+        mint one server-side session. Fails closed when no session store or
+        no authenticator is attached (rollback stays the CLI/Windows path)."""
+        from .identity_providers import SESSION_COOKIE_NAME, PersonalSessionError
+
+        sessions = getattr(self.server, "session_store", None)
+        authenticator = getattr(self.server, "login_authenticator", None)
+        if sessions is None or authenticator is None:
+            self._send_json(503, {"error": "personal_sessions_unavailable",
+                                  "detail": "no session store/authenticator attached; use the CLI entry"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > 16384:
+            self._send_json(400, {"error": "invalid body size"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        actor = str(body.get("actor") or "").strip()
+        symbols = [str(s) for s in (body.get("symbols") or []) if str(s).strip()]
+        provider = str(body.get("provider") or "windows_local")
+        if not actor or not symbols:
+            self._send_json(400, {"error": "actor and symbols are required"})
+            return
+        try:
+            binding = authenticator(self.server.board_config, actor, symbols)
+            session = sessions.login(
+                actor=binding["actor"], provider=binding["provider"],
+                subject=binding["subject"],
+                policy_sha256=str(binding.get("policy_sha256") or ""))
+        except (PersonalSessionError, ValueError) as exc:
+            self._send_json(403, {"error": "login_failed", "detail": str(exc)})
+            return
+        self._send_json(200, {"status": "logged_in", "session": session.as_dict()},
+                        set_cookie="{0}={1}; HttpOnly; SameSite=Strict; Path=/".format(
+                            SESSION_COOKIE_NAME, session.session_id))
+
+    def _handle_personal_logout(self) -> None:
+        """R10/A48: logout revokes NOW — the next protected action fails."""
+        from .identity_providers import SESSION_COOKIE_NAME
+
+        sessions = getattr(self.server, "session_store", None)
+        if sessions is None:
+            self._send_json(503, {"error": "personal_sessions_unavailable"})
+            return
+        cookie = self._session_cookie(SESSION_COOKIE_NAME)
+        revoked = sessions.logout(cookie) if cookie else False
+        self._send_json(200, {"status": "logged_out", "revoked": bool(revoked)},
+                        set_cookie="{0}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".format(
+                            SESSION_COOKIE_NAME))
 
     def _valid_loopback(self) -> bool:
         host = self.headers.get("Host", "")
@@ -828,6 +906,13 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
         if not self._valid_loopback():
             self._send_json(403, {"error": "loopback only"})
             return
+        # ---- R10 personal session routes (fail closed without a store) ----
+        if parsed.path == "/api/v1/personal/login":
+            self._handle_personal_login()
+            return
+        if parsed.path == "/api/v1/personal/logout":
+            self._handle_personal_logout()
+            return
         if parsed.path != "/api/v1/human-responses":
             self._send_json(404, {"error": "not found"})
             return
@@ -864,6 +949,24 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
         task_id = str(body.get("task_id") or "")
         decision = str(body.get("decision") or "")
         actor = str(body.get("actor") or "")
+        # ---- R10/A46: session mode makes the principal SERVER-SIDE ----
+        if getattr(self.server, "session_store", None) is not None:
+            from .identity_providers import SESSION_COOKIE_NAME, PersonalSessionError
+
+            if actor:
+                # A form actor is not merged, not honored — it is rejected so
+                # a forged name can never ride a valid session (A46).
+                self._send_json(403, {"error": "actor_from_session_only",
+                                      "detail": "supply no actor field; the session names the principal"})
+                return
+            cookie = self._session_cookie(SESSION_COOKIE_NAME)
+            try:
+                session = self.server.session_store.resolve(cookie)
+            except PersonalSessionError as exc:
+                self._send_json(403, {"error": "session_required",
+                                      "detail": str(exc)})
+                return
+            actor = session.actor
         try:
             expected_version = int(body.get("expected_version") or 0)
         except (TypeError, ValueError):
