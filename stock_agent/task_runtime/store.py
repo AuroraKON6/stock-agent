@@ -1322,17 +1322,30 @@ class TaskStore:
         concurrent workers (separate connections) can never both spend the
         last slot. The recorded event IS the reservation — no model call may
         start without it — and a denial records nothing, so denied checks
-        never consume budget.
+        never consume budget. R07: the budget day is the EXPLICIT
+        Asia/Shanghai business date (fixed midnight boundary), counted by
+        parsing each attempt event's timestamp — never by a host-local
+        date-prefix match.
         """
-        today = datetime.now().astimezone().date().isoformat()
+        from ..runtime_layout import business_date, business_date_key
+
+        today = business_date_key()
         self._begin()
         try:
             row = self._task_row(task_id)
             self._assert_worker(row, worker_id, fencing_token)
-            count = int(self._conn.execute(
-                "SELECT COUNT(*) FROM task_outbox"
-                " WHERE event_type = 'research_attempt_started' AND created_at LIKE ?",
-                (today + "%",)).fetchone()[0])
+            count = 0
+            for event in self._conn.execute(
+                "SELECT created_at FROM task_outbox WHERE event_type = 'research_attempt_started'"
+            ).fetchall():
+                try:
+                    stamp = datetime.fromisoformat(str(event["created_at"] or ""))
+                except ValueError:
+                    continue
+                if stamp.tzinfo is None:
+                    stamp = stamp.astimezone()
+                if business_date(stamp).isoformat() == today:
+                    count += 1
             if daily_limit > 0 and count >= int(daily_limit):
                 self._rollback()
                 return {

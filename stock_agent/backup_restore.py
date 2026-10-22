@@ -28,6 +28,7 @@ from .audit_log import (
     object_hash,
 )
 from .config import project_path
+from .runtime_layout import resolve_layout
 from .release_controls import build_release_candidate_identity
 
 
@@ -232,6 +233,11 @@ def create_backup(
             "mode": cfg["mode"],
             "classification": "local_non_production_rehearsal",
             "bundle_format": "directory",
+            # R07: the five-root layout that produced this bundle. Recovery
+            # compares it against the CURRENT layout so a restore across
+            # relocated roots is an explicit, checkable mapping — never a
+            # silent rewrite of stored absolute paths.
+            "runtime_layout": resolve_layout(config).snapshot(),
             "release_candidate_fingerprint": candidate.get("fingerprint", ""),
             "files": entries,
             "file_count": len(entries),

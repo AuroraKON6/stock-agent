@@ -30,8 +30,14 @@ def budget_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def model_calls_today(store: Any, *, now: Optional = None) -> int:
-    """Count live model attempts started today from the audit outbox."""
-    today = (now or datetime.now().astimezone()).date()
+    """Count live model attempts started on the EXPLICIT Shanghai business day.
+
+    R07: the budget day is the Asia/Shanghai calendar date (fixed midnight
+    boundary), not the host-local date — the counting key and the stamp
+    filter both go through ``runtime_layout.business_date``."""
+    from .runtime_layout import business_date
+
+    today = business_date(now)
     count = 0
     for event in store.events(limit=100000):
         if event.get("event_type") != ATTEMPT_EVENT:
@@ -42,7 +48,7 @@ def model_calls_today(store: Any, *, now: Optional = None) -> int:
             continue
         if stamp.tzinfo is None:
             stamp = stamp.astimezone()
-        if stamp.date() == today:
+        if business_date(stamp) == today:
             count += 1
     return count
 

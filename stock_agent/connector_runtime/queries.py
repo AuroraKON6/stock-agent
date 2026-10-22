@@ -170,7 +170,11 @@ class ConnectorQueryStore:
         if not key:
             raise ValueError("idempotency_key must not be empty")
         moment = _now(now)
-        usage_date = moment.date().isoformat()
+        # R07: quota/budget days are the EXPLICIT Asia/Shanghai business date
+        # (fixed midnight boundary); persisted timestamps stay UTC.
+        from ..runtime_layout import business_date, business_date_key
+
+        usage_date = business_date_key(moment)
         window_start = _iso(moment - timedelta(seconds=60))
         self._begin()
         try:

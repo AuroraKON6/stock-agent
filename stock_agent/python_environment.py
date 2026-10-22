@@ -17,9 +17,13 @@ from .release_controls import build_release_candidate_identity, parse_python_loc
 
 
 PYTHON_ENVIRONMENT_VERSION = "1.0"
+# R07: both platform layouts probed; missing candidates are skipped, so one
+# tuple serves Windows (Scripts/python.exe) and Linux (bin/python) alike.
 DEFAULT_PYTHONS = (
     ".venv311/Scripts/python.exe",
     ".venv312/Scripts/python.exe",
+    ".venv311/bin/python",
+    ".venv312/bin/python",
 )
 REQUIRED_MINORS = ("3.11", "3.12")
 
@@ -48,7 +52,19 @@ def build_python_environment_audit(
     expected_components, lock_errors = parse_python_lock(lock_path)
     expected = {item["name"]: item["version"] for item in expected_components}
     environments = []
+    skipped_candidates = []
     for raw_path in list(python_paths or DEFAULT_PYTHONS):
+        candidate = project_path(raw_path)
+        if not candidate.is_file():
+            # R07: the tuple carries BOTH platform layouts; the layout absent
+            # on this OS is recorded as an informational skip, never a
+            # blocker. The required-minor check below still fails closed
+            # when neither layout provides a passing interpreter.
+            skipped_candidates.append({
+                "path": _display_path(candidate),
+                "reason": "interpreter not found on this platform layout",
+            })
+            continue
         environments.append(_audit_one_environment(raw_path, expected, run_tests, runner))
 
     by_minor = {str(item.get("minor") or ""): item for item in environments if item.get("minor")}
@@ -98,6 +114,7 @@ def build_python_environment_audit(
         "required_minors": list(REQUIRED_MINORS),
         "missing_minors": missing_minors,
         "environments": environments,
+        "skipped_candidates": skipped_candidates,
         "blockers": blockers,
         "operation_contract": {
             "network_access": False,
