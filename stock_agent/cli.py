@@ -1035,6 +1035,18 @@ def main() -> None:
     task_run_next_parser.add_argument("--worker-id", default="")
     task_run_next_parser.add_argument("--ttl-seconds", type=int, default=120)
 
+    worker_service_parser = subparsers.add_parser(
+        "worker-service",
+        help="R09 常驻 worker：循环认领执行，SIGTERM/SIGINT 优雅排空（不隐式开启任何调度）")
+    worker_service_parser.add_argument("--config", default="config/watchlist.local.json")
+    worker_service_parser.add_argument("--worker-id", default="")
+    worker_service_parser.add_argument("--ttl-seconds", type=int, default=120)
+    worker_service_parser.add_argument("--idle-sleep-seconds", type=float, default=2.0)
+    worker_service_parser.add_argument("--max-tasks", type=int, default=0,
+                                       help="处理 N 个任务后自动退出（0=持续运行直至停止信号）")
+    worker_service_parser.add_argument("--drain-deadline-seconds", type=float, default=0.0,
+                                       help="停止信号后允许的空闲等待窗口（0=空闲即退出）")
+
     task_cancel_parser = subparsers.add_parser("task-cancel", help="请求取消一个未终结的研究任务")
     task_cancel_parser.add_argument("--config", default="config/watchlist.local.json")
     task_cancel_parser.add_argument("--task-id", required=True)
@@ -1430,6 +1442,10 @@ def main() -> None:
         _task_list(args.config, args.status, args.json)
     elif args.command == "task-run-next":
         _task_run_next(args.config, args.worker_id, args.ttl_seconds)
+    elif args.command == "worker-service":
+        _worker_service(args.config, args.worker_id, args.ttl_seconds,
+                        args.idle_sleep_seconds, args.max_tasks,
+                        args.drain_deadline_seconds)
     elif args.command == "task-cancel":
         _task_cancel(args.config, args.task_id, args.actor, args.reason, args.expected_version)
     elif args.command == "human-response":
@@ -3696,3 +3712,40 @@ def _llm_governance_review(
 
 if __name__ == "__main__":
     main()
+
+
+def _worker_service(config_path: str, worker_id: str, ttl_seconds: int,
+                    idle_sleep_seconds: float, max_tasks: int,
+                    drain_deadline_seconds: float) -> None:
+    """R09: long-running worker loop with graceful SIGTERM/SIGINT drain.
+
+    Never installs timers or scheduled intents on its own (platform startup
+    parameters must not implicitly enable the scheduler)."""
+    import json as _json
+    import threading
+
+    from .research_worker import run_research_task
+    from .task_runtime import TaskStore
+    from .worker_service import WorkerService
+
+    store, config = _task_store(config_path)
+    worker = worker_id or "worker-{0}".format(os.getpid())
+    try:
+        service = WorkerService(
+            store_factory=lambda: TaskStore(store.db_path),
+            run_task=lambda s, t: run_research_task(
+                s, t["task_id"], worker_id=worker, config=config,
+                ttl_seconds=ttl_seconds),
+            worker_id=worker,
+            ttl_seconds=ttl_seconds,
+            idle_sleep_seconds=idle_sleep_seconds,
+            max_tasks=max_tasks)
+        stop = threading.Event()
+        service.install_signal_handlers(stop)
+        print("worker-service {0} started (ttl={1}s, max_tasks={2}, drain={3}s)".format(
+            worker, ttl_seconds, max_tasks or "unbounded", drain_deadline_seconds))
+        report = service.run(stop, drain_deadline_seconds=drain_deadline_seconds)
+        print("worker-service {0} drained: {1}".format(worker, _json.dumps(
+            report, ensure_ascii=False)))
+    finally:
+        store.close()

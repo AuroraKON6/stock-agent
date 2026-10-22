@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from . import dify_access
@@ -120,6 +121,31 @@ def create_dify_api_server(gateway: Any, host: str = "127.0.0.1", port: int = 87
             if self.path == "/health":
                 self._respond({"status": "ok", "service": "dify-api",
                                "version": SERVER_VERSION})
+                return
+            # R09 probes: liveness is process-alive only; readiness additionally
+            # verifies the task store opens READ-ONLY. Zero collection, zero
+            # model calls, zero business writes — a probe must never mutate
+            # anything (A45).
+            if self.path == "/livez":
+                self._respond({"status": "ok", "probe": "livez",
+                               "version": SERVER_VERSION})
+                return
+            if self.path == "/readyz":
+                from .task_runtime.store import TaskStore
+
+                ready = {"status": "ok", "probe": "readyz",
+                         "store_read_only_open": True}
+                try:
+                    db_path = Path(getattr(gateway, "_db_path"))
+                    probe = TaskStore(db_path, read_only=True)
+                    probe.close()
+                except Exception as exc:  # noqa: BLE001 — readiness reports, never crashes
+                    ready = {"status": "unavailable", "probe": "readyz",
+                             "store_read_only_open": False,
+                             "reason": "{0}: {1}".format(type(exc).__name__, str(exc)[:200])}
+                    self._respond(ready)
+                    return
+                self._respond(ready)
                 return
             self._reject(404, "not_found", self.path)
 
