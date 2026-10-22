@@ -243,3 +243,13 @@ class ProtocolBroker:
         _require(bool(note.strip()), "draft note must not be empty")
         _require(len(note) <= 8000, "draft note is too long")
         return {"research_note_draft": note, "status": "draft_pending_human_review"}
+
+
+# R06: claim extraction shared with the research-quality contract. The
+# protocol package stays the stable surface callers import from; the logic
+# lives in research_quality so worker and future façades share one scorer.
+def claim_texts(output: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Flatten a validated model output into {source, text, refs} claims."""
+    from ..research_quality import claim_texts as _claim_texts
+
+    return _claim_texts(output)

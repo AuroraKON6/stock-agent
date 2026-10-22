@@ -108,8 +108,14 @@ def task_detail(store: Any, task_id: str, *, config: Optional[Dict[str, Any]] = 
             "prompt_version": str(model_call.get("prompt_version") or ""),
             "error": str(model_call.get("error") or ""),
             "governance": model_call.get("governance") if isinstance(model_call.get("governance"), dict) else {},
+            # R06: the quality verdict that gate-checked this run, plus the
+            # preserved draft when completion was refused for uncited specific
+            # claims (the task sits blocked with the gap draft readable here).
+            "quality": model_call.get("quality") if isinstance(model_call.get("quality"), dict) else {},
+            "evidence_gap_draft": model_call.get("evidence_gap_draft") if isinstance(model_call.get("evidence_gap_draft"), dict) else None,
         },
         "output": output,
+        "output_quality": output.get("quality") if isinstance(output.get("quality"), dict) else {},
         "personal_acknowledgement": acknowledgement,
         "pending_human_questions": questions,
         "last_error": str(task.get("last_error") or ""),

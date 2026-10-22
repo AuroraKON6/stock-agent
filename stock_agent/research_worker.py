@@ -758,6 +758,27 @@ def run_research_task(
             return _fail("model output failed validation: {0}: {1}".format(
                 type(exc).__name__, str(exc)[:400]), retryable=True)
 
+    # ---- R06 quality gate: specific claims must be cited (A30/A31/A32) ----
+    # Runs for BOTH modes on the validated output. A specific (numeric) claim
+    # with no citations cannot complete the research: the draft is preserved
+    # as an evidence gap on the blocked record. Uncited GAP statements are
+    # fine — unknowns assert nothing. Cited numbers missing from the delivered
+    # context are flagged for review (A32), not silently trusted.
+    from .research_quality import assess_draft, context_text_for_quality
+
+    quality = assess_draft(output, context_text=context_text_for_quality(safe_context or {}))
+    output["quality"] = quality
+    if quality["verdict"] == "insufficient_evidence":
+        model_call["quality"] = quality
+        model_call["evidence_gap_draft"] = output
+        return _blocked(
+            "specific findings carry numbers without any citation; the draft is "
+            "saved as an evidence gap, not a completed analysis",
+            {"gate": "evidence_quality", "decision": "denied",
+             "unsupported_specific": [str(item.get("text") or "")[:200]
+                                      for item in quality["unsupported_specific_claims"]],
+             "quality_score": quality["score"]})
+
     broker_results: list = []
     for intent in output.get("requested_intents") or []:
         try:
