@@ -1,0 +1,64 @@
+# R08 .dockerignore — everything the image must NOT carry.
+# The image ships: stock_agent/ source, requirements.linux-py312.lock.txt,
+# pi_runtime/{package.json,package-lock.json,agent_home,roles} (no node_modules —
+# rebuilt in the builder stage from the lock), deploy/, scripts/ (read-only
+# verification entry points), and a build-time PROVENANCE.json.
+#
+# Hard exclusions (taskbook A37 stop conditions):
+#   - no .git, no host virtualenvs, no runtime state, no local configs,
+#     no secrets, no credentials, no evidence, no reports, no logs.
+
+# VCS / provenance-side artifacts (provenance is generated at build time)
+.git
+.gitignore
+.gitattributes
+.mimosa
+
+# Host virtual environments (Linux venv is built inside the builder stage)
+.venv*
+.venv312
+venv
+
+# Local configuration, secrets, rosters (images NEVER carry these)
+config/*.local.json
+config/watchlist.local.json
+config/research_roster.local.json
+config/research_restrictions.local.json
+config/dify/service_credentials.json
+config/candidates/**/credentials*
+.env
+.env.*
+*.env
+
+# Runtime state / business data / evidence / audit history
+data/
+reports/
+logs/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.jsonl
+
+# Pi runtime: source of truth is package-lock.json; node_modules is rebuilt
+# inside the image from the lock (A38: no runtime installs, but the BUILD
+# stage may npm ci from the frozen lock).
+pi_runtime/node_modules
+pi_runtime/workspace
+
+# Python / test / tooling artifacts
+__pycache__
+*.pyc
+.pytest_cache
+.pyache-codex
+.mypy_cache
+.ruff_cache
+htmlcov
+.coverage
+tests/
+docs/
+*.md
+!deploy/**/*.md
+
+# OS / editor noise
+Thumbs.db
+.DS_Store

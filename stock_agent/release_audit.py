@@ -29,6 +29,7 @@ RELEASE_POLICY_VERSION = "31.0"
 PYTHON_LOCK_CANDIDATES = (
     "requirements.lock",
     "requirements.lock.txt",
+    "requirements.linux-py312.lock.txt",  # R08: Linux candidate lock, separately reviewed
     "uv.lock",
     "poetry.lock",
     "Pipfile.lock",
@@ -117,7 +118,20 @@ def build_release_audit(
     blockers: List[str] = []
     warnings: List[str] = []
     if not git["repository_detected"]:
-        blockers.append("Git repository is not available or cannot be inspected")
+        # R08: a missing .git NEVER passes on its own. The only alternate
+        # reviewable identity is the image PROVENANCE chain (shipped record +
+        # external digest binding) — when that evidence is present and self-
+        # consistent, the audit records it and still keeps an explicit
+        # provenance-mode note; without it, the blocker stands.
+        provenance_verdict = _image_provenance_snapshot(root)
+        if provenance_verdict.get("verified"):
+            warnings.append(
+                "Git unavailable; release identity carried by the verified image "
+                "provenance chain (source_commit={0}, dirty={1})".format(
+                    provenance_verdict.get("source_commit"),
+                    provenance_verdict.get("source_dirty")))
+        else:
+            blockers.append("Git repository is not available or cannot be inspected")
     elif not git["head_valid"]:
         blockers.append("Git HEAD is missing; no reviewable source baseline exists")
     if git["repository_detected"] and not git["worktree_clean"]:
@@ -790,3 +804,35 @@ def _run_command(command: Sequence[str], cwd: Path) -> Tuple[int, str, str]:
 
 def _md(value: Any) -> str:
     return str(value or "").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
+def _image_provenance_snapshot(root: Path) -> Dict[str, Any]:
+    """R08: read-only provenance-chain verdict for the no-Git audit branch.
+
+    Looks for a shipped PROVENANCE.json plus the EXTERNAL digest binding and
+    the runtime-injected expectation; verifies the chain through
+    ``stock_agent.release_provenance``. Any missing piece leaves the verdict
+    unverified — the caller keeps its Git blocker (no auto-pass)."""
+    from .release_provenance import (
+        BINDING_FILENAME,
+        PROVENANCE_FILENAME,
+        ProvenanceError,
+        provenance_sha256,
+        verify_image_provenance,
+    )
+
+    shipped = root / PROVENANCE_FILENAME
+    binding_path = root / "deploy" / "docker" / BINDING_FILENAME
+    if not shipped.is_file() or not binding_path.is_file():
+        return {"verified": False, "problems": ["provenance evidence files absent"]}
+    try:
+        import json as _json
+
+        record = _json.loads(shipped.read_text(encoding="utf-8"))
+        binding = _json.loads(binding_path.read_text(encoding="utf-8"))
+        expected = str(binding.get("provenance_sha256") or "")
+        observed = str(binding.get("image_digest") or "")
+        return verify_image_provenance(
+            record, expected, observed, binding)
+    except (OSError, ValueError, ProvenanceError) as exc:
+        return {"verified": False, "problems": ["provenance evidence unreadable: {0}".format(exc)]}

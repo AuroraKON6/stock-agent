@@ -1,0 +1,51 @@
+# R08 candidate compose (NOT YET BUILT — engine unreachable from the
+# authoring session; see REFACTOR_R08 report §3 precheck evidence).
+#
+# A40: the published-image service and the source-build service share one
+# contract — same env, same volumes, same healthcheck — so both forms are
+# verifiable against each other. Pin IMAGE to a digest once the first
+# controlled build exists (deploy/docker/image_binding.json is the authority).
+
+services:
+  research-api:
+    # A39: the tag must be digest-pinned from deploy/docker/image_binding.json
+    # before first use; the intentionally-unset variable makes compose REFUSE
+    # to run a floating candidate.
+    image: stock-agent-research:${STOCK_AGENT_TAG:?set STOCK_AGENT_TAG=<tag>@sha256:<digest> from deploy/docker/image_binding.json}
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile
+    environment:
+      APP_CONFIG_ROOT: /app/config
+      APP_STATE_ROOT: /var/stock-agent/state
+      APP_EVIDENCE_ROOT: /var/stock-agent/evidence
+      APP_REPORT_ROOT: /var/stock-agent/reports
+      APP_TEMP_ROOT: /tmp/stock-agent
+    volumes:
+      - stock-agent-state:/var/stock-agent/state
+      - stock-agent-evidence:/var/stock-agent/evidence
+      - stock-agent-reports:/var/stock-agent/reports
+    # No host ports published: the API serves the internal compose network
+    # only (edge exposure is a later, reviewed unit).
+    expose:
+      - "8770"
+    read_only: true
+    tmpfs:
+      - /tmp/stock-agent:size=256m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import stock_agent, stock_agent.runtime_layout; stock_agent.runtime_layout.resolve_layout()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  stock-agent-state:
+  stock-agent-evidence:
+  stock-agent-reports:

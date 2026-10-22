@@ -2,7 +2,7 @@
 name = "stock-agent"
 version = "0.1.0"
 description = "Local A-share research intelligence pipeline"
-requires-python = ">=3.8"
+requires-python = ">=3.11"  # R08: aligned with the 3.11/3.12 acceptance baseline
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
