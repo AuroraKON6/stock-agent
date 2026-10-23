@@ -741,6 +741,86 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                         set_cookie="{0}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".format(
                             SESSION_COOKIE_NAME))
 
+    def _handle_workspace(self, action: str) -> None:
+        """R14 workspace actions: create / cancel / followup / rerun.
+
+        Session mode is REQUIRED for all four (the session names the owner);
+        CSRF is enforced exactly like every other POST."""
+        from .identity_providers import SESSION_COOKIE_NAME, PersonalSessionError
+        from . import personal_workspace
+
+        sessions = getattr(self.server, "session_store", None)
+        if sessions is None:
+            self._send_json(503, {"error": "workspace_requires_sessions"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > 65536:
+            self._send_json(400, {"error": "invalid body size"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        if not hmac.compare_digest(str(self.headers.get("X-Task-Board-CSRF", "")),
+                                   str(self.server.csrf_token)):
+            self._send_json(403, {"error": "csrf validation failed"})
+            return
+        try:
+            session = sessions.resolve(self._session_cookie(SESSION_COOKIE_NAME))
+        except PersonalSessionError as exc:
+            self._send_json(403, {"error": "session_required", "detail": str(exc)})
+            return
+        if "actor" in body:
+            # Same A46 rule: the principal comes from the session.
+            self._send_json(403, {"error": "actor_from_session_only"})
+            return
+        store: TaskStore = self.server.task_store
+        config = self.server.board_config
+        try:
+            if action == "create":
+                result = personal_workspace.create_personal_research(
+                    store, actor=session.actor,
+                    question=str(body.get("question") or ""),
+                    symbols=[str(s) for s in (body.get("symbols") or [])],
+                    execution_mode=str(body.get("execution_mode") or "replay"),
+                    config=config)
+            elif action == "cancel":
+                result = {"task": personal_workspace.cancel_personal_task(
+                    store, actor=session.actor,
+                    task_id=str(body.get("task_id") or ""),
+                    expected_version=int(body.get("expected_version") or 0),
+                    reason=str(body.get("reason") or ""))}
+            elif action == "followup":
+                result = {"task": personal_workspace.follow_up_awaiting(
+                    store, actor=session.actor,
+                    task_id=str(body.get("task_id") or ""),
+                    expected_version=int(body.get("expected_version") or 0),
+                    note=str(body.get("note") or ""),
+                    extra_note=str(body.get("extra_note") or ""),
+                    command_id=str(body.get("command_id") or ""))}
+            else:  # rerun
+                result = personal_workspace.rerun_completed_research(
+                    store, actor=session.actor,
+                    task_id=str(body.get("task_id") or ""),
+                    config=config,
+                    execution_mode=str(body.get("execution_mode") or "replay"))
+        except personal_workspace.WorkspaceError as exc:
+            self._send_json(400, {"error": str(exc).split(":", 1)[0],
+                                  "detail": str(exc)})
+            return
+        except (TaskVersionConflictError, TaskRuntimeError) as exc:
+            self._send_json(409, {"error": type(exc).__name__, "detail": str(exc)})
+            return
+        task = result.get("task") or {}
+        payload = {"status": "ok", "outcome": result.get("status"),
+                   "task_id": str(task.get("task_id") or "")}
+        if "supersedes_task_id" in result:
+            payload["prior_task_id"] = result.get("supersedes_task_id")
+        if task:
+            payload["task"] = task
+        self._send_json(200, payload)
+
     def _valid_loopback(self) -> bool:
         host = self.headers.get("Host", "")
         if not _is_loopback_host(host):
@@ -912,6 +992,19 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/v1/personal/logout":
             self._handle_personal_logout()
+            return
+        # ---- R14 workspace routes (session mode enforced, CSRF required) ----
+        if parsed.path == "/api/v1/workspace/create":
+            self._handle_workspace("create")
+            return
+        if parsed.path == "/api/v1/workspace/cancel":
+            self._handle_workspace("cancel")
+            return
+        if parsed.path == "/api/v1/workspace/followup":
+            self._handle_workspace("followup")
+            return
+        if parsed.path == "/api/v1/workspace/rerun":
+            self._handle_workspace("rerun")
             return
         if parsed.path != "/api/v1/human-responses":
             self._send_json(404, {"error": "not found"})
