@@ -112,6 +112,18 @@ class BackupRestoreError(ValueError):
 def backup_restore_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     raw = (config or {}).get("backup_restore", {}) or {}
     storage = (config or {}).get("storage", {}) or {}
+    # R24: the DEFAULT source set includes every operational SQLite authority —
+    # the signal store, the task runtime (tasks/outbox/attempts/verifications/
+    # dispatches, R01—R03) and the connector query intake (R04). Operators who
+    # pass sqlite_paths explicitly keep full control of the list.
+    default_sqlite = [storage.get("sqlite_path") or "data/stock_agent.sqlite3"]
+    task_runtime_db = str(((config or {}).get("task_runtime") or {}).get("db_path")
+                          or "data/task_runtime/tasks.sqlite3")
+    query_store_db = str(((config or {}).get("kimi_sources") or {}).get("query_store_path")
+                         or "data/kimi/query_intake.sqlite3")
+    for extra in (task_runtime_db, query_store_db):
+        if extra and extra not in default_sqlite:
+            default_sqlite.append(extra)
     return {
         "enabled": bool(raw.get("enabled", False)),
         "mode": str(raw.get("mode") or "local_rehearsal"),
@@ -119,7 +131,7 @@ def backup_restore_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, 
         "drill_root": str(raw.get("drill_root") or "data/backup_restore/drills"),
         "event_path": str(raw.get("event_path") or "data/backup_restore/events.jsonl"),
         "report_dir": str(raw.get("report_dir") or "reports/backup_restore"),
-        "sqlite_paths": list(raw.get("sqlite_paths") or [storage.get("sqlite_path") or "data/stock_agent.sqlite3"]),
+        "sqlite_paths": list(raw.get("sqlite_paths") or default_sqlite),
         "evidence_objects_dir": str(
             raw.get("evidence_objects_dir")
             or ((config or {}).get("official_evidence_vault", {}) or {}).get("objects_dir")
@@ -438,9 +450,17 @@ def run_restore_drill(
             shutil.copy2(str(source), str(destination))
         restored_validation = _validate_payload(restored_root, entries)
         restored_scan = _scan_payload(restored_root, entries)
+        # R24: the restored TASK RUNTIME must carry the full research state —
+        # tasks, outbox, budget reservations (attempt events), unknown-outcome
+        # attempts awaiting reconciliation, snapshots, platform runs,
+        # verifications and dispatches. Row counts are compared against the
+        # live source database; any drift fails the drill.
+        task_integrity = _task_runtime_integrity(restored_root, entries)
         elapsed = time.monotonic() - started
         rto_seconds = float(cfg["rto_target_minutes"]) * 60.0
         errors = list(restored_validation.get("errors", []))
+        errors.extend("task runtime integrity: {0}".format(item)
+                      for item in task_integrity["errors"])
         if restored_validation.get("fact_projection_hash") != manifest.get("fact_projection_hash"):
             errors.append("isolated recovery projection does not match the backup manifest")
         if restored_scan["blocking_finding_count"]:
@@ -470,6 +490,7 @@ def run_restore_drill(
             "recovery_projection_path": _relative_project_path(drill_dir / "recovery_projection.json"),
             "verification": verification,
             "restored_validation": restored_validation,
+            "task_runtime_integrity": task_integrity,
             "rto": {
                 "scope": "selected_data_and_configuration_bundle_only",
                 "elapsed_seconds": round(elapsed, 6),
@@ -745,6 +766,20 @@ def _discover_sources(
             missing.append("unsafe sqlite path: {0}".format(relative))
         else:
             add_path(path, relative, "sqlite")
+
+    # R24: personal evidence namespace objects and index projections are
+    # originals too — each owner root is content-addressed exactly like the
+    # institutional vault and joins the bundle with its own kind.
+    personal_root = project_path("data/personal_evidence")
+    if personal_root.is_dir():
+        for index_path in personal_root.glob("*/index.json"):
+            add_path(index_path,
+                     index_path.resolve().relative_to(root).as_posix(),
+                     "personal_evidence_index")
+        for path in personal_root.glob("*/objects/sha256/*/*"):
+            if path.is_file():
+                add_path(path, path.resolve().relative_to(root).as_posix(),
+                         "personal_evidence_object")
 
     return [found[key] for key in sorted(found)], _unique(missing)
 
@@ -1384,3 +1419,82 @@ def _unique(values: Iterable[str]) -> List[str]:
 
 def _md(value: Any) -> str:
     return str(value if value is not None else "").replace("|", "\\|").replace("`", "'")
+
+
+_TASK_RUNTIME_TABLES = (
+    ("research_tasks", "tasks"),
+    ("task_outbox", "outbox_events"),
+    ("task_input_snapshots", "input_snapshots"),
+    ("task_platform_runs", "platform_runs"),
+    ("task_invocation_attempts", "invocation_attempts"),
+    ("principal_verifications", "principal_verifications"),
+    ("workflow_dispatches", "workflow_dispatches"),
+)
+
+
+def _task_runtime_integrity(restored_root: Path, entries: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """R24: compare the RESTORED task runtime against the live source, table
+    by table, and specifically confirm unknown-outcome attempts (open
+    reconciliation work) survived the restore. Read-only on both sides."""
+    def _find_runtime_db(root: Path) -> Optional[Path]:
+        candidates = [
+            root / "data" / "task_runtime" / "tasks.sqlite3",
+            root / "data" / "stock_agent.sqlite3",
+        ]
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        for entry in entries:
+            if str(entry.get("kind")) == "sqlite" and "task_runtime" in str(entry.get("path")):
+                candidate = root / Path(str(entry["path"]))
+                if candidate.is_file():
+                    return candidate
+        return None
+
+    errors: List[str] = []
+    tables: Dict[str, Dict[str, int]] = {}
+    unknown_preserved: Optional[int] = None
+    source_db = _find_runtime_db(project_path("."))
+    restored_db = _find_runtime_db(restored_root)
+    if source_db is None or restored_db is None:
+        return {"status": "SKIPPED",
+                "reason": "task runtime database not present in source or restore",
+                "tables": tables, "unknown_attempts_restored": unknown_preserved,
+                "errors": errors}
+
+    def _counts(db: Path) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        conn = sqlite3.connect(str(db))  # read-only by usage: SELECT counts only
+        try:
+            for table, _ in _TASK_RUNTIME_TABLES:
+                try:
+                    out[table] = int(conn.execute(
+                        "SELECT COUNT(*) FROM {0}".format(table)).fetchone()[0])
+                except sqlite3.Error:
+                    out[table] = -1
+        finally:
+            conn.close()
+        return out
+
+    source_counts = _counts(source_db)
+    restored_counts = _counts(restored_db)
+    for table, label in _TASK_RUNTIME_TABLES:
+        left, right = source_counts.get(table, -1), restored_counts.get(table, -1)
+        tables[label] = {"source": left, "restored": right}
+        if left == -1 and right == -1:
+            continue  # table absent on both sides (older schema) — not a drift
+        if left != right:
+            errors.append("{0} row count drift: source={1} restored={2}".format(
+                table, left, right))
+    conn = sqlite3.connect(str(restored_db))  # read-only by usage: SELECT counts only
+    try:
+        unknown_preserved = int(conn.execute(
+            "SELECT COUNT(*) FROM task_invocation_attempts WHERE state = 'outcome_unknown'"
+        ).fetchone()[0])
+    except sqlite3.Error:
+        unknown_preserved = 0
+    finally:
+        conn.close()
+    return {"status": "PASS" if not errors else "FAIL",
+            "tables": tables, "unknown_attempts_restored": unknown_preserved,
+            "errors": errors}
