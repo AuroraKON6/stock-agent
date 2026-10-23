@@ -14,6 +14,7 @@ from stock_agent.config import project_path, project_path_override
 from stock_agent.evidence_context import verified_evidence_documents
 from stock_agent.evidence_vault import import_official_document
 from stock_agent.evidence_excerpts import (
+    HTML_EXTRACTOR_CHAIN,
     EvidenceExcerptError, bind_summary_draft, create_excerpt, excerpt_selector, verify_excerpt_selection,
 )
 from stock_agent.research_worker import build_safe_research_context, build_user_prompt
@@ -87,13 +88,21 @@ class EvidenceExcerptTests(unittest.TestCase):
             with self.assertRaisesRegex(EvidenceExcerptError, "bytes changed"):
                 self.excerpt()
 
-    def test_unsupported_html_has_no_title_fallback(self):
-        ref, _ = import_document(self.config, self.root, content="<!doctype html><html><body>Fixture</body></html>", title="HTML")
-        with self.assertRaisesRegex(EvidenceExcerptError, "unsupported format"):
-            create_excerpt(self.config, ref, 0, 5)
+    def test_html_is_supported_with_chain_version_r12a(self):
+        # R12a planned behavior step: HTML excerpting moved from "unsupported"
+        # to supported via the body-extraction pipeline; the locator names the
+        # full version chain and addresses the NORMALIZED visible text.
+        ref, _ = import_document(self.config, self.root,
+                                 content="<!doctype html><html><body><p>Fixture 公告正文</p></body></html>",
+                                 title="HTML")
+        excerpt = create_excerpt(self.config, ref, 0, 5)
+        self.assertEqual(excerpt["extractor_version"], HTML_EXTRACTOR_CHAIN)
+        self.assertEqual(excerpt["text"], "Fixtu")
+        verified = verify_excerpt_selection(self.config, excerpt_selector(excerpt))
+        self.assertEqual(verified["excerpt_id"], excerpt["excerpt_id"])
 
     def test_unsupported_bytes_and_size_limit_with_real_vault(self):
-        for body, reason in ((b"Bad UTF8: \xff", "strict UTF-8"),
+        for body, reason in ((b"Bad UTF8: \xff", "not_utf8"),
                              (b"Plain text\x00control", "control characters"),
                              (b"x" * (2 * 1024 * 1024 + 1), "size limit")):
             with self.subTest(reason=reason):

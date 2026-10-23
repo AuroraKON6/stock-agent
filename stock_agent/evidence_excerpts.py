@@ -1,21 +1,34 @@
-"""Local-only exact excerpts and unapproved summary lineage; no ledger writes."""
+"""Local-only exact excerpts and unapproved summary lineage; no ledger writes.
+
+R12a: excerpting now covers retained ``text/plain`` AND ``text/html`` through
+the shared body-extraction pipeline (``evidence_parsing.extract_body``). The
+excerpt locator stays (document, extractor version chain, source-text sha,
+char range): for plain text the chain is the historical ``utf8-codepoints-v1``
+(byte-identical selectors — old selectors still verify); for HTML it is
+``body-extract-v2-html+utf8-codepoints-v1`` — the excerpt addresses the
+NORMALIZED visible text, re-derived deterministically at every verification.
+Parse failures (binary, oversize, scans) are refusals, never empty text.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from .config import project_path
 from .evidence_context import verified_evidence_documents
+from .evidence_parsing import extract_body
 from .evidence_vault import evidence_vault_config
 
 EXTRACTOR_VERSION = "utf8-codepoints-v1"
+HTML_EXTRACTOR_CHAIN = "body-extract-v2-html+utf8-codepoints-v1"
 MAX_TEXT_BYTES = 2 * 1024 * 1024
 MAX_EXCERPT_CHARS = 1200
 SELECTOR_FIELDS = (
     "document_id", "document_sha256", "extractor_version", "source_text_sha256",
     "start", "end", "excerpt_sha256",
 )
+_SUPPORTED_CONTENT_TYPES = {"text/plain", "text/html"}
 
 
 class EvidenceExcerptError(ValueError):
@@ -27,9 +40,15 @@ def _digest(value: Any) -> str:
                                     separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def _document_text(config: Dict[str, Any], document: Dict[str, Any]) -> str:
-    if document.get("content_type") != "text/plain":
-        raise EvidenceExcerptError("unsupported format: only retained UTF-8 text/plain is supported")
+def _document_text(config: Dict[str, Any], document: Dict[str, Any]) -> Tuple[str, str]:
+    """Return (extraction text, extractor version chain) for a retained doc.
+
+    The bytes are re-read, re-hashed and re-parsed on EVERY call: a cached
+    verification result is never trusted for excerpt addressing."""
+    content_type = document.get("content_type")
+    if content_type not in _SUPPORTED_CONTENT_TYPES:
+        raise EvidenceExcerptError(
+            "unsupported format: only retained text/plain and text/html are supported")
     cfg = evidence_vault_config(config)
     sha = document["sha256"]
     root = project_path(cfg["objects_dir"])
@@ -47,16 +66,26 @@ def _document_text(config: Dict[str, Any], document: Dict[str, Any]) -> str:
         raise EvidenceExcerptError("retained object cannot be read") from exc
     if len(data) > MAX_TEXT_BYTES:
         raise EvidenceExcerptError("document exceeds local extraction size limit")
-    # Rehash the bytes actually decoded, not a cached verification result.
+    # Rehash the bytes actually parsed, not a cached verification result.
     if len(data) != document.get("byte_size") or hashlib.sha256(data).hexdigest() != sha:
         raise EvidenceExcerptError("retained bytes changed after vault verification")
-    try:
-        text = data.decode("utf-8-sig", errors="strict")
-    except UnicodeError as exc:
-        raise EvidenceExcerptError("document is not strict UTF-8 text") from exc
+    parsed = extract_body(data)
+    status = parsed.get("status")
+    if status != "ok":
+        # A parse failure is a refusal with the honest reason — an excerpt
+        # can never be minted from a document we could not actually read.
+        raise EvidenceExcerptError(
+            "body extraction refused: {0} ({1})".format(
+                status, parsed.get("reason") or "no usable text"))
+    text = parsed["text"]
     if any(ord(char) < 32 and char not in "\t\n\r" for char in text):
         raise EvidenceExcerptError("document contains unsupported control characters")
-    return text
+    if content_type == "text/html":
+        # The locator addresses the NORMALIZED visible text; the version chain
+        # names both stages so verification replays the exact pipeline.
+        return text, HTML_EXTRACTOR_CHAIN
+    # Plain text: byte-identical behavior to the historical extractor.
+    return text, EXTRACTOR_VERSION
 
 
 def create_excerpt(config: Dict[str, Any], document_id: str, start: int, end: int) -> Dict[str, Any]:
@@ -69,13 +98,13 @@ def create_excerpt(config: Dict[str, Any], document_id: str, start: int, end: in
                      if doc.get("document_id") == document_id), None)
     if document is None:
         raise EvidenceExcerptError("document is not currently verified and retained")
-    text = _document_text(config, document)
+    text, extractor_version = _document_text(config, document)
     if end > len(text):
         raise EvidenceExcerptError("excerpt range is outside the retained text")
     excerpt = text[start:end]
     selector = {
         "document_id": document_id, "document_sha256": document["sha256"],
-        "extractor_version": EXTRACTOR_VERSION,
+        "extractor_version": extractor_version,
         "source_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
         "start": start, "end": end,
         "excerpt_sha256": hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
