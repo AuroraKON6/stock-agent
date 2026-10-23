@@ -275,4 +275,10 @@ class ConnectorQueryStore:
         return dict(row) if row is not None else None
 
     def quota_usage(self, scope: str, *, now: Optional[datetime] = None) -> int:
-        return self._usage(str(scope), _now(now).date().isoformat())
+        """Read the counter under the SAME Shanghai business-date key that
+        ``reserve_query`` writes (R07/R13: the day boundary is the Shanghai
+        midnight — querying with the host-local UTC date would read a
+        different bucket after 16:00 UTC)."""
+        from ..runtime_layout import business_date_key
+
+        return self._usage(str(scope), business_date_key(now))

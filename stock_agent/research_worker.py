@@ -575,6 +575,41 @@ def run_research_task(
     safe_context, delivery = build_safe_research_context(task.get("input_payload") or {}, config=config)
     model_call["context_delivery"] = delivery
     model_call["outbound_context"] = safe_context
+    # R13: freeze the attempt's fact bundle and bind the EXACT outbound
+    # payload hash (A63) — the model context is provably the approved
+    # payload. Payload-declared facts with no host-policy basis and
+    # registry-denied sources are excluded here with recorded reasons
+    # (A60/A61); the bundle snapshot rides the model_call audit.
+    try:
+        from .fact_bundle import (FactBundleError, bind_outbound_payload,
+                                  build_research_fact_bundle, payload_digest)
+
+        payload_facts = (task.get("input_payload") or {}).get("approved_facts") or []
+        fact_selectors = [item for item in payload_facts
+                          if isinstance(item, dict) and "excerpt_sha256" in item]
+        fact_records = [item for item in payload_facts
+                        if isinstance(item, dict) and "excerpt_sha256" not in item]
+        if fact_selectors or fact_records:
+            bundle = build_research_fact_bundle(
+                config, task, fact_selectors=fact_selectors,
+                extra_facts=fact_records)
+            # Only STILL-DELIVERABLE bundle facts enter the minimized model
+            # context; exclusions live in the audit, never in the prompt.
+            delivered_facts = [dict(fact, content=str(fact.get("content") or "")[:1000])
+                               for fact in bundle.get("facts") or []]
+            if delivered_facts:
+                safe_context = dict(safe_context)
+                safe_context["verified_facts"] = delivered_facts
+            # A63: bind the payload hash AFTER the final context is assembled,
+            # with the SAME canonical digest the delivery record shows.
+            model_call["outbound_context"] = safe_context
+            outbound_hash = payload_digest(safe_context)
+            model_call["fact_bundle"] = bind_outbound_payload(bundle, safe_context)
+            model_call["context_delivery"] = dict(
+                delivery, fact_bundle_id=bundle["bundle_id"],
+                outbound_sha256=outbound_hash)
+    except FactBundleError as exc:
+        model_call["fact_bundle_error"] = str(exc)[:300]
 
     if model_call["mode"] == "replay":
         # Single recorded final answer; no rounds, no model entry.
