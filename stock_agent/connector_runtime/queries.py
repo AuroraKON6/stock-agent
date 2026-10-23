@@ -62,6 +62,13 @@ CREATE TABLE IF NOT EXISTS query_rate_events (
     at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_query_rate_events_source ON query_rate_events(source_id, at);
+CREATE TABLE IF NOT EXISTS query_consumptions (
+    intent_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    supply_status TEXT NOT NULL DEFAULT '',
+    consumed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_query_consumptions_task ON query_consumptions(task_id, consumed_at);
 """
 
 
@@ -282,3 +289,45 @@ class ConnectorQueryStore:
         from ..runtime_layout import business_date_key
 
         return self._usage(str(scope), business_date_key(now))
+
+    # -------- R11: query -> result -> consumed binding --------
+
+    def record_query_consumption(self, intent_id: str, task_id: str, *,
+                                 supply_status: str = "") -> Dict[str, Any]:
+        """Bind one reserved query to the task that consumed it (A51).
+
+        One consumption per intent (PK): a replayed query never double-binds;
+        the binding lands in the SAME database as the reservation so the
+        chain query->result->consumed is one authority."""
+        self._begin()
+        try:
+            existing = self._conn.execute(
+                "SELECT * FROM query_consumptions WHERE intent_id = ?",
+                (str(intent_id),)).fetchone()
+            if existing is not None:
+                self._rollback()
+                return {"recorded": False, "replay": True,
+                        "consumption": dict(existing)}
+            self._conn.execute(
+                "INSERT INTO query_consumptions (intent_id, task_id, supply_status, consumed_at) VALUES (?,?,?,?)",
+                (str(intent_id), str(task_id), str(supply_status or ""), _now()))
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return {"recorded": True, "replay": False,
+                "consumption": {"intent_id": str(intent_id), "task_id": str(task_id),
+                                "supply_status": str(supply_status or ""),
+                                "consumed_at": _now()}}
+
+    def find_query_consumption(self, intent_id: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT * FROM query_consumptions WHERE intent_id = ?",
+            (str(intent_id),)).fetchone()
+        return dict(row) if row is not None else None
+
+    def consumptions_for_task(self, task_id: str) -> List[Dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM query_consumptions WHERE task_id = ? ORDER BY consumed_at",
+            (str(task_id),)).fetchall()
+        return [dict(row) for row in rows]
