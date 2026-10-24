@@ -387,6 +387,17 @@ def run_research_task(
     except (TypeError, ValueError):
         case_time_limit = 600
     task = store.get_task(task_id)
+    # R17/A76 (defense in depth): a task bound to a role flow belongs to the
+    # role orchestrator alone — the Python full chain must not advance it.
+    # The primary protection is the claim-path exclusion; this entry check
+    # keeps a misrouted hand-off from spending even one attempt.
+    if (task.get("input_payload") or {}).get("role_flow"):
+        return {
+            "status": "refused_role_flow",
+            "model_call": {"mode": str(task.get("execution_mode") or "replay"),
+                           "called": False, "rounds": [], "steps": []},
+            "error": "role_flow_not_owned_by_full_chain",
+        }
     store.mark_running(task_id, worker_id=worker_id, fencing_token=task["fencing_token"], expected_version=task["version"])
     task = store.get_task(task_id)
     started = time.perf_counter()

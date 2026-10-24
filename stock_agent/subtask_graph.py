@@ -45,6 +45,8 @@ DEFAULT_MAX_CHILDREN = 3
 
 _ROLES = {"event_analyst", "fundamental_analyst", "counter_evidence",
           "synthesis_drafter", "quality_check"}
+# Public alias: R17's role flows bind the SAME role set (no second source of truth).
+ALLOWED_SUBTASK_ROLES = frozenset(_ROLES)
 
 
 class SubtaskGraphError(ValueError):
@@ -158,6 +160,9 @@ def propose_subtasks(
                               "reason": "duplicate_child"})
             continue
         payload = dict(parent["input_payload"])
+        # R17: a role-flow binding belongs to the ROOT only — children are
+        # ordinary worker-claimable steps (their identity rides in role_step).
+        payload.pop("role_flow", None)
         payload["research_question"] = item["question"]
         payload["symbols"] = item["symbols"]
         payload["budget_reserve"] = item["budget_reserve"]
@@ -168,6 +173,7 @@ def propose_subtasks(
             case_id=str(parent.get("case_id") or ""),
             role_id=item["role_id"],
             parent_task_id=parent_task_id,
+            execution_mode=str(parent.get("execution_mode") or "live"),
             idempotency_key="subtask::{0}::{1}::{2}".format(
                 parent_task_id, item["role_id"], key[1][:40]),
             actor="subtask_graph",

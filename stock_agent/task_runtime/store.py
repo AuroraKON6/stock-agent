@@ -719,6 +719,52 @@ class TaskStore:
             "workflow_version": run.get("workflow_version", ""), "actor": run.get("actor", ""),
         }
 
+    def _row_is_role_bound(self, row: Any) -> bool:
+        """R17: a task whose current payload carries a role_flow binding."""
+        try:
+            payload = json.loads(row["input_payload"] or "{}")
+        except (TypeError, ValueError):
+            return False
+        return isinstance(payload, dict) and bool(payload.get("role_flow"))
+
+    def bump_input_version(self, task_id: str, *, payload_overrides: Dict[str, Any],
+                           actor: str, reason: str) -> Dict[str, Any]:
+        """R17: apply a governed payload change as a NEW immutable input version.
+
+        Merges ``payload_overrides`` into the current payload, bumps the
+        authoritative ``input_version`` column, writes the snapshot for the
+        new version, and emits the audit event — one transaction. Only
+        non-terminal tasks may be bumped; every earlier snapshot stands
+        unchanged, so the change history stays replayable.
+        """
+        if not isinstance(payload_overrides, dict) or not payload_overrides:
+            raise TaskRuntimeError("payload_overrides must be a non-empty object")
+        if not str(actor or "").strip():
+            raise TaskRuntimeError("actor must not be empty")
+        self._begin()
+        try:
+            row = self._task_row(task_id)
+            if row["status"] in TERMINAL_STATUSES:
+                raise TaskTransitionError("task is already terminal: {0}".format(row["status"]))
+            current = self._decode(row)
+            payload = dict(current.get("input_payload") or {})
+            payload.update(payload_overrides)
+            new_version = int(row["input_version"]) + 1
+            payload["input_version"] = new_version
+            payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+            self._write_input_snapshot(task_id, new_version, payload,
+                                       created_by=actor, reason=str(reason or "bump_input_version"))
+            self._touch(task_id, input_version=new_version, input_payload=payload_json)
+            self._emit(task_id, "task_input_bumped", actor=actor,
+                       payload={"input_version": new_version,
+                                "reason": str(reason or "")[:500],
+                                "keys": sorted(str(k) for k in payload_overrides)})
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return self.get_task(task_id)
+
     def list_platform_runs(self, task_id: str) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
             "SELECT * FROM task_platform_runs WHERE task_id = ? ORDER BY recorded_at, run_key", (str(task_id),)
@@ -801,7 +847,8 @@ class TaskStore:
             "entries": entries,
         }
 
-    def claim_next(self, worker_id: str, ttl_seconds: int = 120) -> Optional[Dict[str, Any]]:
+    def claim_next(self, worker_id: str, ttl_seconds: int = 120,
+                   *, exclude_role_bound: bool = False) -> Optional[Dict[str, Any]]:
         if not str(worker_id or "").strip():
             raise TaskRuntimeError("worker_id must not be empty")
         expires = (datetime.now().astimezone() + timedelta(seconds=max(5, int(ttl_seconds)))).isoformat(timespec="seconds")
@@ -810,6 +857,15 @@ class TaskStore:
             row = self._conn.execute(
                 "SELECT * FROM research_tasks WHERE status = ? ORDER BY created_at LIMIT 1", (STATUS_QUEUED,)
             ).fetchone()
+            if exclude_role_bound and row is not None and self._row_is_role_bound(row):
+                # R17/A76: the Python full chain must never advance a task
+                # bound to a role flow — those belong to the role orchestrator
+                # alone. Scan past them; their cancellation/recovery is not
+                # skipped, just not triggered from the full-chain claim path.
+                rows = self._conn.execute(
+                    "SELECT * FROM research_tasks WHERE status = ? ORDER BY created_at",
+                    (STATUS_QUEUED,)).fetchall()
+                row = next((r for r in rows if not self._row_is_role_bound(r)), None)
             if row is None or row["cancel_requested"]:
                 self._rollback()
                 if row is not None and row["cancel_requested"]:
