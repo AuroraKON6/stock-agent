@@ -40,12 +40,15 @@ class BodyExtractionTests(unittest.TestCase):
         self.assertNotIn("text", result)
         self.assertEqual(result["detected_format"], "pdf")
 
-    def test_pdf_with_text_layer_is_unsupported_not_ocr(self):
+    def test_pdf_with_text_layer_extracts_not_ocr(self):
+        # R12b planned behavior step: a text layer is now EXTRACTED (stdlib
+        # subset) instead of refused as unsupported_format.
         with_text = b"%PDF-1.5\n<</Font<</F1 1 0 R>>>>\nBT /F1 12 Tf (x) Tj ET"
         result = extract_body(with_text)
-        self.assertEqual(result["status"], "unsupported_format")
+        self.assertEqual(result["status"], "ok")
         self.assertEqual(result["detected_format"], "pdf")
-        self.assertIn("text layer", result["reason"])
+        self.assertEqual(result["text"], "x")
+        self.assertEqual(result["parser_version"], "pdf-text-v1")
 
     def test_html_extracts_text_without_scripts_or_styles(self):
         result = extract_body(b"<!doctype html><html><body>x</body></html>")

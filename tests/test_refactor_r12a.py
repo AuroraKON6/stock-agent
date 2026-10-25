@@ -154,11 +154,12 @@ class A57A59RefusalTests(R12aVaultTestCase):
         document = self._document((ref, sha))
         with self.assertRaises(EvidenceExcerptError) as caught:
             create_excerpt(self.config, document["document_id"], 0, 10)
-        # PDFs are refused by format here; a scan additionally reports
-        # needs_ocr from the extraction pipeline — either way, NO excerpt.
-        self.assertIn(str(caught.exception),
-                      {"unsupported format: only retained text/plain and text/html are supported",
-                       "body extraction refused: needs_ocr"})
+        # R12b behavior step: application/pdf is now an excerpt-supported
+        # format, so a scan reaches the extraction pipeline and reports
+        # needs_ocr from there — either way, NO excerpt is minted.
+        self.assertTrue(
+            str(caught.exception).startswith("body extraction refused: needs_ocr"),
+            "unexpected refusal: {0}".format(caught.exception))
 
     def test_a59_binary_garbage_refused_with_status(self):
         garbage = bytes(range(256)) * 4  # definitely not UTF-8

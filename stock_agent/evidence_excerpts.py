@@ -8,6 +8,11 @@ char range): for plain text the chain is the historical ``utf8-codepoints-v1``
 ``body-extract-v2-html+utf8-codepoints-v1`` — the excerpt addresses the
 NORMALIZED visible text, re-derived deterministically at every verification.
 Parse failures (binary, oversize, scans) are refusals, never empty text.
+
+R12b: ``application/pdf`` joins through ``pdf-text-v1+utf8-codepoints-v1``.
+The locator addresses the DETERMINISTIC page-text join (pages separated by
+newlines) so the selector contract stays identical across all three formats;
+per-page structure (hashes, table_like flags) rides in the parse artifact.
 """
 from __future__ import annotations
 
@@ -22,13 +27,14 @@ from .evidence_vault import evidence_vault_config
 
 EXTRACTOR_VERSION = "utf8-codepoints-v1"
 HTML_EXTRACTOR_CHAIN = "body-extract-v2-html+utf8-codepoints-v1"
+PDF_EXTRACTOR_CHAIN = "pdf-text-v1+utf8-codepoints-v1"
 MAX_TEXT_BYTES = 2 * 1024 * 1024
 MAX_EXCERPT_CHARS = 1200
 SELECTOR_FIELDS = (
     "document_id", "document_sha256", "extractor_version", "source_text_sha256",
     "start", "end", "excerpt_sha256",
 )
-_SUPPORTED_CONTENT_TYPES = {"text/plain", "text/html"}
+_SUPPORTED_CONTENT_TYPES = {"text/plain", "text/html", "application/pdf"}
 
 
 class EvidenceExcerptError(ValueError):
@@ -48,7 +54,8 @@ def _document_text(config: Dict[str, Any], document: Dict[str, Any]) -> Tuple[st
     content_type = document.get("content_type")
     if content_type not in _SUPPORTED_CONTENT_TYPES:
         raise EvidenceExcerptError(
-            "unsupported format: only retained text/plain and text/html are supported")
+            "unsupported format: only retained text/plain, text/html and "
+            "application/pdf are supported")
     cfg = evidence_vault_config(config)
     sha = document["sha256"]
     root = project_path(cfg["objects_dir"])
@@ -84,6 +91,10 @@ def _document_text(config: Dict[str, Any], document: Dict[str, Any]) -> Tuple[st
         # The locator addresses the NORMALIZED visible text; the version chain
         # names both stages so verification replays the exact pipeline.
         return text, HTML_EXTRACTOR_CHAIN
+    if content_type == "application/pdf":
+        # R12b: the locator addresses the deterministic page-text join; the
+        # chain names the PDF text stage so verification replays it exactly.
+        return text, PDF_EXTRACTOR_CHAIN
     # Plain text: byte-identical behavior to the historical extractor.
     return text, EXTRACTOR_VERSION
 
