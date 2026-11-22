@@ -43,7 +43,8 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     APP_STATE_ROOT=/var/stock-agent/state \
     APP_EVIDENCE_ROOT=/var/stock-agent/evidence \
     APP_REPORT_ROOT=/var/stock-agent/reports \
-    APP_TEMP_ROOT=/tmp/stock-agent
+    APP_TEMP_ROOT=/tmp/stock-agent \
+    TMPDIR=/tmp/stock-agent
 WORKDIR /app
 # Application source only — .dockerignore strips .git, host venvs, local
 # configs, secrets, data/, reports/, logs/ (A37 stop conditions). The
