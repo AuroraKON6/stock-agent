@@ -15,7 +15,9 @@ import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
+from stock_agent.config import project_path, project_path_override
 from stock_agent.runtime_layout import (
     CLOCK_SKEW_TOLERANCE_SECONDS,
     LayoutError,
@@ -42,6 +44,24 @@ class LayoutResolutionTests(unittest.TestCase):
         self.assertEqual(layout.evidence_root, layout.project_root / "data" / "evidence_vault")
         self.assertEqual(layout.report_root, layout.project_root / "reports")
         self.assertNotIn(str(layout.project_root), str(layout.temp_root.relative_to(layout.temp_root.anchor)))
+
+    def test_project_paths_route_legacy_prefixes_to_container_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = {key: str(root / name) for key, name in (
+                ("APP_CONFIG_ROOT", "config"), ("APP_STATE_ROOT", "state"),
+                ("APP_EVIDENCE_ROOT", "evidence"), ("APP_REPORT_ROOT", "reports"),
+            )}
+            with patch.dict("os.environ", env):
+                self.assertEqual(project_path("config/watchlist.json"), root / "config/watchlist.json")
+                self.assertEqual(project_path("data"), root / "state")
+                self.assertEqual(project_path("data/tasks/queue.db"), root / "state/tasks/queue.db")
+                self.assertEqual(project_path("data/evidence_vault/objects"), root / "evidence/objects")
+                self.assertEqual(project_path("reports/daily"), root / "reports/daily")
+                self.assertEqual(project_path("logs/scheduled"), root / "state/logs/scheduled")
+                self.assertEqual(project_path(str(root / "explicit")), root / "explicit")
+                with project_path_override(lambda value: root / "isolated" / value):
+                    self.assertEqual(project_path("data"), root / "isolated/data")
 
     def test_env_overrides_win_and_freeze_is_immutable(self):
         with tempfile.TemporaryDirectory() as tmp:
