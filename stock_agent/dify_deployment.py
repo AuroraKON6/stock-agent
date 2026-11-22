@@ -1,4 +1,4 @@
-"""DF-01: Dify deployment candidate, capability matrix, interface inventory.
+"""Offline Dify deployment inventory and workflow artifact validation.
 
 Read-only groundwork for the Dify adoption plan (GLM_DIFY_ADOPTION_PLAN
 section DF-01): a validated, secret-free deployment CANDIDATE (nothing is
@@ -6,11 +6,15 @@ installed or started), the phase-one capability requirements to check
 against the pinned version's plan features, the Python/Dify authority
 boundary, and an inventory mapping the plan's minimal interface contract
 onto what ALREADY exists (board HTTP endpoints and CLI) with honest gaps.
-No service, no network, no credentials.
+R16 adds validation of the digest-bound, replay-only workflow candidate.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+from datetime import datetime, timezone
+from graphlib import CycleError, TopologicalSorter
+from pathlib import Path
 from typing import Any, Dict, List
 
 # Pinned 2026-10-13 against upstream evidence (GitHub releases + official docs,
@@ -23,10 +27,102 @@ DEPLOYMENT_CANDIDATE_VERSION = "dify-1.17.1-candidate-1"
 CANDIDATE_SCHEMA_VERSION = "1.0"
 
 _FORBIDDEN_KEY_MARKERS = ("api_key", "apikey", "password", "secret", "token")
+_R16_RELEASE = "1.17.1"
+_R16_RELEASE_COMMIT = "8387590ace4a094de812b7847fc6a4c3a27cd52b"
+_R16_ORIGIN = "http://stock-agent-r16-gateway:8770/api/dify/v1/"
+_R16_OPERATIONS = frozenset({"create-research", "research-status"})
+_R16_NODE_TYPES = frozenset({"start", "http-request", "code", "if-else", "end"})
+_R16_ENVIRONMENT = {
+    "STOCK_AGENT_SERVICE_SECRET": "secret",
+    "STOCK_AGENT_WORKFLOW_VERSION": "string",
+}
+_R16_AUTH = {
+    "type": "api-key",
+    "config": {"type": "bearer", "api_key": "{{#env.STOCK_AGENT_SERVICE_SECRET#}}"},
+}
 
 
 class DeploymentCandidateError(ValueError):
     pass
+
+
+def _validate_replay_graph(graph: dict) -> None:
+    nodes = graph["nodes"]
+    by_id = {node["id"]: node["data"] for node in nodes}
+    if len(nodes) != len(by_id) or {node["type"] for node in by_id.values()} - _R16_NODE_TYPES:
+        raise DeploymentCandidateError("workflow has duplicate IDs or unapproved node types")
+    calls = [node for node in by_id.values() if node["type"] == "http-request"]
+    if len(calls) != 2 or {node["url"] for node in calls} != {_R16_ORIGIN + op for op in _R16_OPERATIONS}:
+        raise DeploymentCandidateError("workflow must call each approved route exactly once")
+    for call in calls:
+        if call.get("authorization") != _R16_AUTH or call.get("headers") != "" or call.get("params") != "":
+            raise DeploymentCandidateError("HTTP node must use the runtime bearer secret and no custom headers or query")
+        if (call.get("method") != "POST"
+                or call.get("retry_config") != {"retry_enabled": False, "max_retries": 0, "retry_interval": 0}
+                or call.get("timeout") != {"connect": 2, "read": 3, "write": 2}):
+            raise DeploymentCandidateError("HTTP method, retry or timeout exceeds the replay policy")
+    order = TopologicalSorter()
+    for node_id in by_id:
+        order.add(node_id)
+    for edge in graph["edges"]:
+        source, target = edge["source"], edge["target"]
+        if source not in by_id or target not in by_id:
+            raise DeploymentCandidateError("workflow edge references an unknown node")
+        order.add(target, source)
+    try:
+        order.prepare()
+    except CycleError as exc:
+        raise DeploymentCandidateError("workflow must be acyclic") from exc
+
+
+def validate_replay_workflow(manifest_path: Path, *, approved_version: str | None = None) -> str:
+    """Return the digest-based version of the R16 candidate after offline validation."""
+    from .release_controls import build_secret_scan
+
+    try:
+        import yaml
+    except ImportError as exc:
+        raise DeploymentCandidateError("workflow validation requires the locked PyYAML dependency") from exc
+
+    try:
+        manifest = json.loads(manifest_path.read_bytes())
+        if (manifest["schema_version"] != 1 or manifest["dify_release"] != _R16_RELEASE
+                or manifest["dify_release_commit"] != _R16_RELEASE_COMMIT
+                or manifest["execution_mode"] != "replay"
+                or manifest["artifact"] != "single-research-replay.yml"):
+            raise DeploymentCandidateError("unexpected replay workflow manifest")
+        artifact = manifest_path.with_name(manifest["artifact"])
+        raw = artifact.read_bytes()
+        if len(raw) > 64 * 1024:
+            raise DeploymentCandidateError("workflow DSL exceeds the size limit")
+        version = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if version != manifest["workflow_version"] or (approved_version is not None and version != approved_version):
+            raise DeploymentCandidateError("workflow digest does not match the manifest or reviewed version")
+        # The reviewed file is a self-contained export. Aliases can obscure which
+        # values the importer actually uses.
+        if any(isinstance(token, (yaml.tokens.AliasToken, yaml.tokens.AnchorToken)) for token in yaml.scan(raw)):
+            raise DeploymentCandidateError("workflow DSL must not use YAML aliases or anchors")
+        document = yaml.safe_load(raw)
+        if (document["kind"] != "app" or document["version"] != "0.3.1"
+                or document["app"]["mode"] != "workflow"
+                or document.get("dependencies") != []):
+            raise DeploymentCandidateError("workflow must be a standalone app with no plugin dependencies")
+        workflow = document["workflow"]
+        variables = workflow["environment_variables"]
+        if (len(variables) != len(_R16_ENVIRONMENT)
+                or {item["name"]: item["value_type"] for item in variables} != _R16_ENVIRONMENT
+                or any(item.get("value") != "" for item in variables)):
+            raise DeploymentCandidateError("workflow environment may only declare empty runtime variables")
+        if any(isinstance(feature, dict) and feature.get("enabled") for feature in workflow["features"].values()):
+            raise DeploymentCandidateError("workflow features must be disabled for replay")
+        _validate_replay_graph(workflow["graph"])
+    except DeploymentCandidateError:
+        raise
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, yaml.YAMLError):
+        raise DeploymentCandidateError("invalid replay workflow manifest or DSL") from None
+    if build_secret_scan([artifact], [], datetime.now(timezone.utc))["status"] != "PASS":
+        raise DeploymentCandidateError("workflow DSL did not pass the release secret scan")
+    return version
 
 
 def deployment_candidate() -> Dict[str, Any]:

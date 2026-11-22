@@ -1,0 +1,575 @@
+app:
+  name: Stock Agent R16 replay
+  description: Create one replay task and return its case link
+  mode: workflow
+  icon: 📋
+  icon_background: '#E4FBCC'
+  use_icon_as_answer_icon: false
+kind: app
+version: 0.3.1
+dependencies: []
+workflow:
+  conversation_variables: []
+  environment_variables:
+  - id: 05d5cebc-c5ae-465d-aa07-6ab8a67acc97
+    name: STOCK_AGENT_SERVICE_SECRET
+    value_type: secret
+    value: ''
+    description: Case-scoped backend service credential
+  - id: b59324b4-836a-4266-96cc-c78862850861
+    name: STOCK_AGENT_WORKFLOW_VERSION
+    value_type: string
+    value: ''
+    description: Reviewed sha256 workflow version
+  features:
+    file_upload:
+      enabled: false
+    opening_statement: ''
+    suggested_questions: []
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    text_to_speech:
+      enabled: false
+    suggested_questions_after_answer:
+      enabled: false
+  graph:
+    nodes:
+    - id: '16001'
+      type: custom
+      data:
+        type: start
+        title: Public case
+        variables:
+        - label: title
+          variable: title
+          type: text-input
+          max_length: 120
+          options: []
+          required: true
+        - label: case_id
+          variable: case_id
+          type: text-input
+          max_length: 128
+          options: []
+          required: true
+        - label: research_question
+          variable: research_question
+          type: paragraph
+          max_length: 2000
+          options: []
+          required: true
+        - label: input_version
+          variable: input_version
+          type: number
+          max_length: null
+          options: []
+          required: true
+        - label: business_intent_id
+          variable: business_intent_id
+          type: text-input
+          max_length: 128
+          options: []
+          required: true
+      position:
+        x: 40
+        y: 140
+      positionAbsolute:
+        x: 40
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16002'
+      type: custom
+      data:
+        type: code
+        title: Build replay request
+        code_language: python3
+        code: |
+          import json
+
+
+          def main(title, case_id, research_question, input_version, business_intent_id,
+                   run_id, workflow_version):
+              return {"body": json.dumps({
+                  "title": title,
+                  "case_id": case_id,
+                  "research_question": research_question,
+                  "input_version": input_version,
+                  "business_intent_id": business_intent_id,
+                  "dify_run_id": run_id,
+                  "workflow_version": workflow_version,
+                  "execution_mode": "replay",
+              })}
+        variables:
+        - variable: title
+          value_selector:
+          - '16001'
+          - title
+        - variable: case_id
+          value_selector:
+          - '16001'
+          - case_id
+        - variable: research_question
+          value_selector:
+          - '16001'
+          - research_question
+        - variable: input_version
+          value_selector:
+          - '16001'
+          - input_version
+        - variable: business_intent_id
+          value_selector:
+          - '16001'
+          - business_intent_id
+        - variable: run_id
+          value_selector:
+          - sys
+          - workflow_run_id
+        - variable: workflow_version
+          value_selector:
+          - env
+          - STOCK_AGENT_WORKFLOW_VERSION
+        outputs:
+          body:
+            type: string
+            children: null
+      position:
+        x: 344
+        y: 140
+      positionAbsolute:
+        x: 344
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16003'
+      type: custom
+      data:
+        type: http-request
+        title: Create or recover task
+        method: POST
+        url: http://stock-agent-r16-gateway:8770/api/dify/v1/create-research
+        authorization:
+          type: api-key
+          config:
+            type: bearer
+            api_key: '{{#env.STOCK_AGENT_SERVICE_SECRET#}}'
+        headers: ''
+        params: ''
+        body:
+          type: json
+          data:
+          - type: text
+            value: '{{#16002.body#}}'
+        timeout:
+          connect: 2
+          read: 3
+          write: 2
+        retry_config:
+          retry_enabled: false
+          max_retries: 0
+          retry_interval: 0
+        error_strategy: default-value
+        default_value:
+        - key: body
+          type: string
+          value: '{}'
+        - key: status_code
+          type: number
+          value: 0
+      position:
+        x: 648
+        y: 140
+      positionAbsolute:
+        x: 648
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16004'
+      type: custom
+      data:
+        type: code
+        title: Check creation receipt
+        code_language: python3
+        code: |
+          import json
+          import re
+
+
+          def main(body, status_code, case_id, run_id):
+              result = {
+                  "task_id": "", "status": "create_unconfirmed", "case_path": "/",
+                  "status_body": "", "can_query": 0,
+              }
+              try:
+                  receipt = json.loads(body)
+                  if status_code != 200 or receipt["ok"] is not True:
+                      return result
+                  task = receipt["data"]
+                  task_id = task["task_id"]
+                  if (task["case_id"] != case_id or task["platform_run"]["run_id"] != run_id
+                          or not re.fullmatch(r"task_[0-9a-f]{16}", task_id)):
+                      return result
+              except (ValueError, TypeError, KeyError):
+                  return result
+              return {
+                  "task_id": task_id, "status": "status_unconfirmed",
+                  "case_path": "/?task=" + task_id, "can_query": 1,
+                  "status_body": json.dumps({"task_id": task_id, "status_only": True}),
+              }
+        variables:
+        - variable: body
+          value_selector:
+          - '16003'
+          - body
+        - variable: status_code
+          value_selector:
+          - '16003'
+          - status_code
+        - variable: case_id
+          value_selector:
+          - '16001'
+          - case_id
+        - variable: run_id
+          value_selector:
+          - sys
+          - workflow_run_id
+        outputs:
+          task_id:
+            type: string
+            children: null
+          status:
+            type: string
+            children: null
+          case_path:
+            type: string
+            children: null
+          status_body:
+            type: string
+            children: null
+          can_query:
+            type: number
+            children: null
+      position:
+        x: 952
+        y: 140
+      positionAbsolute:
+        x: 952
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16005'
+      type: custom
+      data:
+        type: if-else
+        title: Task confirmed?
+        cases:
+        - case_id: 'true'
+          id: 'true'
+          logical_operator: and
+          conditions:
+          - id: confirmed
+            varType: number
+            comparison_operator: '='
+            value: '1'
+            variable_selector:
+            - '16004'
+            - can_query
+      position:
+        x: 1256
+        y: 140
+      positionAbsolute:
+        x: 1256
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16006'
+      type: custom
+      data:
+        type: http-request
+        title: Read status once
+        method: POST
+        url: http://stock-agent-r16-gateway:8770/api/dify/v1/research-status
+        authorization:
+          type: api-key
+          config:
+            type: bearer
+            api_key: '{{#env.STOCK_AGENT_SERVICE_SECRET#}}'
+        headers: ''
+        params: ''
+        body:
+          type: json
+          data:
+          - type: text
+            value: '{{#16004.status_body#}}'
+        timeout:
+          connect: 2
+          read: 3
+          write: 2
+        retry_config:
+          retry_enabled: false
+          max_retries: 0
+          retry_interval: 0
+        error_strategy: default-value
+        default_value:
+        - key: body
+          type: string
+          value: '{}'
+        - key: status_code
+          type: number
+          value: 0
+      position:
+        x: 1560
+        y: 140
+      positionAbsolute:
+        x: 1560
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16007'
+      type: custom
+      data:
+        type: code
+        title: Read business status
+        code_language: python3
+        code: |
+          import json
+
+
+          def main(body, status_code, task_id, case_id):
+              status = "status_unconfirmed"
+              valid_statuses = {
+                  "queued", "leased", "running", "awaiting_human", "succeeded",
+                  "failed", "blocked", "cancelled", "expired",
+              }
+              try:
+                  receipt = json.loads(body)
+                  if status_code == 200 and receipt["ok"] is True:
+                      task = receipt["data"]
+                      if (task["task_id"] == task_id and task["case_id"] == case_id
+                              and task["status"] in valid_statuses):
+                          status = task["status"]
+              except (ValueError, TypeError, KeyError):
+                  pass
+              return {"status": status}
+        variables:
+        - variable: body
+          value_selector:
+          - '16006'
+          - body
+        - variable: status_code
+          value_selector:
+          - '16006'
+          - status_code
+        - variable: task_id
+          value_selector:
+          - '16004'
+          - task_id
+        - variable: case_id
+          value_selector:
+          - '16001'
+          - case_id
+        outputs:
+          status:
+            type: string
+            children: null
+      position:
+        x: 1864
+        y: 140
+      positionAbsolute:
+        x: 1864
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16008'
+      type: custom
+      data:
+        type: end
+        title: Return task link and status
+        outputs:
+        - variable: status
+          value_selector:
+          - '16007'
+          - status
+          value_type: string
+        - variable: task_id
+          value_selector:
+          - '16004'
+          - task_id
+          value_type: string
+        - variable: case_path
+          value_selector:
+          - '16004'
+          - case_path
+          value_type: string
+        - variable: case_id
+          value_selector:
+          - '16001'
+          - case_id
+          value_type: string
+        - variable: business_intent_id
+          value_selector:
+          - '16001'
+          - business_intent_id
+          value_type: string
+      position:
+        x: 2168
+        y: 140
+      positionAbsolute:
+        x: 2168
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16009'
+      type: custom
+      data:
+        type: end
+        title: Return unconfirmed creation
+        outputs:
+        - variable: status
+          value_selector:
+          - '16004'
+          - status
+          value_type: string
+        - variable: task_id
+          value_selector:
+          - '16004'
+          - task_id
+          value_type: string
+        - variable: case_path
+          value_selector:
+          - '16004'
+          - case_path
+          value_type: string
+        - variable: case_id
+          value_selector:
+          - '16001'
+          - case_id
+          value_type: string
+        - variable: business_intent_id
+          value_selector:
+          - '16001'
+          - business_intent_id
+          value_type: string
+      position:
+        x: 1560
+        y: 380
+      positionAbsolute:
+        x: 1560
+        y: 380
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    edges:
+    - id: 16001-source-16002
+      type: custom
+      source: '16001'
+      sourceHandle: source
+      target: '16002'
+      targetHandle: target
+      data:
+        sourceType: start
+        targetType: code
+        isInIteration: false
+        isInLoop: false
+    - id: 16002-source-16003
+      type: custom
+      source: '16002'
+      sourceHandle: source
+      target: '16003'
+      targetHandle: target
+      data:
+        sourceType: code
+        targetType: http-request
+        isInIteration: false
+        isInLoop: false
+    - id: 16003-source-16004
+      type: custom
+      source: '16003'
+      sourceHandle: source
+      target: '16004'
+      targetHandle: target
+      data:
+        sourceType: http-request
+        targetType: code
+        isInIteration: false
+        isInLoop: false
+    - id: 16004-source-16005
+      type: custom
+      source: '16004'
+      sourceHandle: source
+      target: '16005'
+      targetHandle: target
+      data:
+        sourceType: code
+        targetType: if-else
+        isInIteration: false
+        isInLoop: false
+    - id: 16005-true-16006
+      type: custom
+      source: '16005'
+      sourceHandle: 'true'
+      target: '16006'
+      targetHandle: target
+      data:
+        sourceType: if-else
+        targetType: http-request
+        isInIteration: false
+        isInLoop: false
+    - id: 16005-false-16009
+      type: custom
+      source: '16005'
+      sourceHandle: 'false'
+      target: '16009'
+      targetHandle: target
+      data:
+        sourceType: if-else
+        targetType: end
+        isInIteration: false
+        isInLoop: false
+    - id: 16006-source-16007
+      type: custom
+      source: '16006'
+      sourceHandle: source
+      target: '16007'
+      targetHandle: target
+      data:
+        sourceType: http-request
+        targetType: code
+        isInIteration: false
+        isInLoop: false
+    - id: 16007-source-16008
+      type: custom
+      source: '16007'
+      sourceHandle: source
+      target: '16008'
+      targetHandle: target
+      data:
+        sourceType: code
+        targetType: end
+        isInIteration: false
+        isInLoop: false
+    viewport:
+      x: 0
+      y: 0
+      zoom: 0.65

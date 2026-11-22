@@ -595,6 +595,8 @@ Personal acknowledgement is a personal research acknowledgement, not institution
     if (ev.target.closest && ev.target.closest('[data-detail-close]')) closeDetail();
   });
   document.addEventListener('keydown', function(ev) { if (ev.key === 'Escape') closeDetail(); });
+  var linkedTask = new URLSearchParams(window.location.search).get('task');
+  if (linkedTask) openDetail(linkedTask);
   var es = new EventSource('/api/v1/events');
   es.onopen = function() { conn.textContent = 'LIVE'; conn.className = 'live'; refresh(); fetchOverview(); fetchEvents(); fetchQueries(); fetchTodo(); fetchOps(); };
   es.onerror = function() { conn.textContent = 'RECONNECTING'; conn.className = 'down'; };
