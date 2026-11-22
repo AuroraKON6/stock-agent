@@ -46,6 +46,16 @@ class BrowserWiringTestCase(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.enterContext(project_path_override(lambda value: self.root / value))
+        # Handler threads do not inherit the contextvar override above, but
+        # they DO read the module-level PROJECT_ROOT: patch it too (the
+        # pattern test_summary_review uses) so vault records imported with
+        # project-relative object paths verify inside request threads as
+        # well — otherwise the route's context build silently drops them.
+        from unittest.mock import patch
+
+        import stock_agent.config as config_module
+
+        self.enterContext(patch.object(config_module, "PROJECT_ROOT", self.root.resolve()))
         self.config = vault_config(self.root, {})
         self.config["task_runtime"] = {"db_path": str(self.root / "tasks.sqlite3")}
         # The personal namespace root must be ABSOLUTE: board handler threads
@@ -511,6 +521,96 @@ class BrowserWiringTestCase(unittest.TestCase):
         self.assertEqual(body["error"], "not_succeeded")
 
     # ---------------- rework: A67 version reads back the feedback ---------------- #
+
+    def _add_signal_document(self):
+        """Import a signal-bound document through the shared vault fixture so
+        ``build_public_context`` already carries it (the supply-bound case)."""
+        from _vault_fixture import import_document
+
+        source_id, _ = import_document(
+            self.config, self.root,
+            content="样本公告甲，仅供隔离验收。", title="样本公告甲",
+            signal_ids=["konm18-wiring-signal"])
+        from stock_agent.task_supply import build_public_context
+
+        context = build_public_context(["600519"], config=self.config)
+        self.assertIn(source_id, context["evidence_summaries"],
+                      "fixture setup: the signal-bound source must already ride the context")
+        return source_id
+
+    def test_selected_document_preserves_signal_bound_summaries(self):
+        cookie = self._login()
+        signal_id = self._add_signal_document()
+        status, imported, _ = self._import_sample(cookie)
+        personal_id = imported["document"]["document_id"]
+        status, created, _ = self._request(
+            "POST", "/api/v1/workspace/create",
+            {"question": "比较两份公告中的样本口径", "symbols": ["600519"],
+             "document_ids": [personal_id]},
+            cookie=cookie)
+        self.assertEqual(status, 200)
+        # First claim (independent connection) must see BOTH sources: the
+        # selection ADDS to the pipeline-gathered summaries, never replaces.
+        second = TaskStore(self.config["task_runtime"]["db_path"])
+        self.addCleanup(second.close)
+        claimed = second.claim_next("w-supply")
+        self.assertEqual(claimed["task_id"], created["task_id"])
+        summaries = claimed["input_payload"]["public_context"]["evidence_summaries"]
+        self.assertIn(personal_id, summaries)
+        self.assertIn(signal_id, summaries,
+                      "first claim lost the signal-bound source")
+        snapshot = self.store.input_snapshots(created["task_id"])[0]
+        snapshot_summaries = (snapshot["payload"].get("public_context") or {}) \
+            .get("evidence_summaries") or {}
+        self.assertIn(signal_id, snapshot_summaries,
+                      "the v1 snapshot keeps the signal-bound source too")
+
+    def test_followup_retry_after_supply_refresh_returns_first_task(self):
+        cookie = self._login()
+        task_id = self._succeeded_no_question_task(cookie, "追问刷新重试的样本前案")
+        body = {"task_id": task_id,
+                "expected_version": self.store.get_task(task_id)["version"],
+                "extra_note": "请解释样本口径",
+                "command_id": "konm18-refresh-retry"}
+        status, first, _ = self._request("POST", "/api/v1/workspace/followup",
+                                         body, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(first["outcome"], "RECORDED")
+        # A market/evidence refresh between the submission and the lost-
+        # response retry must not turn the retry into a 409.
+        self._add_signal_document()
+        status, retry, _ = self._request("POST", "/api/v1/workspace/followup",
+                                         body, cookie=cookie)
+        self.assertEqual(status, 200, retry)
+        self.assertEqual(retry["outcome"], "DUPLICATE")
+        self.assertEqual(retry["task_id"], first["task_id"])
+        self.assertEqual(len(self.store.list_tasks()), 2,
+                         "the refreshed retry added no second task")
+
+    def test_same_command_for_different_followup_still_conflicts(self):
+        cookie = self._login()
+        # Both priors exist BEFORE any follow-up is created, so the helper's
+        # claim assertion always targets its own freshly created task.
+        task_id = self._succeeded_no_question_task(cookie, "追问冲突检测的样本前案")
+        other_prior = self._succeeded_no_question_task(cookie, "另一个样本前案")
+        first = {"task_id": task_id,
+                 "expected_version": self.store.get_task(task_id)["version"],
+                 "extra_note": "第一次追问原文", "command_id": "konm18-conflict"}
+        status, _, _ = self._request("POST", "/api/v1/workspace/followup",
+                                     first, cookie=cookie)
+        self.assertEqual(status, 200)
+        # Same request id naming a DIFFERENT follow-up question: conflict.
+        different_note = dict(first, extra_note="不同的追问原文")
+        status, body, _ = self._request("POST", "/api/v1/workspace/followup",
+                                        different_note, cookie=cookie)
+        self.assertEqual(status, 409)
+        # Same request id against a DIFFERENT prior case: conflict.
+        different_prior = {"task_id": other_prior,
+                           "expected_version": self.store.get_task(other_prior)["version"],
+                           "extra_note": "第一次追问原文", "command_id": "konm18-conflict"}
+        status, body, _ = self._request("POST", "/api/v1/workspace/followup",
+                                        different_prior, cookie=cookie)
+        self.assertEqual(status, 409)
 
     def test_a67_versions_expose_followup_note_and_selected_documents(self):
         cookie = self._login()

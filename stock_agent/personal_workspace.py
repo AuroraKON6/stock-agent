@@ -193,7 +193,28 @@ def follow_up_completed_research(store: TaskStore, *, actor: str, task_id: str,
     intent_id = str(intent_id or "").strip()
     if intent_id:
         # A retry of ONE submission (e.g. the first response was lost): the
-        # intent key returns the already-created follow-up task.
+        # intent key returns the already-created follow-up task. The lookup
+        # checks the LOGICAL identity (same follow-up text against the same
+        # prior case) rather than rebuilding the payload, so a market or
+        # evidence refresh between the two arrivals cannot turn the retry
+        # into a 409 — the page still recovers the first task's id. A
+        # DIFFERENT note or prior under the same id falls through to the
+        # intake, which reports the conflict.
+        existing = store.find_task_by_idempotency_key(
+            "question_intent::{0}".format(intent_id))
+        if existing is not None:
+            payload = existing.get("input_payload") or {}
+            origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
+            if (str(payload.get("research_question") or "") == note
+                    and str(origin.get("prior_task_id") or "") == str(task_id)):
+                return {
+                    "task": existing,
+                    "status": "DUPLICATE",
+                    "event_key": None,
+                    "base_key": None,
+                    "supersedes_task_id": origin.get("prior_task_id"),
+                    "business_intent_id": intent_id,
+                }
         return ensure_question_task(
             store, research_question=note, symbols=symbols,
             config=config, actor=actor,
