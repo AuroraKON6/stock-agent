@@ -42,6 +42,8 @@ data/inbox/*
 !data/inbox/full_flow_test_20260429.jsonl
 reports/
 logs/
+/PROVENANCE.json
+/deploy/docker/image_binding.json
 
 # Downloaded third-party skill repositories are installed locally.
 skills/*

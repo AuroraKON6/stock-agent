@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 class LayoutResolutionTests(unittest.TestCase):
     def test_defaults_anchor_under_project_root(self):
         layout = resolve_layout({}, env={})
-        self.assertEqual(layout.project_root.name, "stock agent")
+        self.assertEqual(layout.project_root, Path(__file__).resolve().parents[1])
         self.assertEqual(layout.config_root, layout.project_root / "config")
         self.assertEqual(layout.state_root, layout.project_root / "data")
         self.assertEqual(layout.evidence_root, layout.project_root / "data" / "evidence_vault")

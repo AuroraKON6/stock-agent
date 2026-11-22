@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from stock_agent.release_provenance import (
     BINDING_FILENAME,
@@ -63,7 +64,8 @@ class ProvenanceChainTests(unittest.TestCase):
         tampered = dict(record, extra_field="smuggled")
         verdict = verify_image_provenance(
             tampered, provenance_sha256(record), digest,
-            {"image_digest": digest, "provenance_sha256": provenance_sha256(record)})
+            {"schema_version": PROVENANCE_SCHEMA_VERSION, "image_digest": digest,
+             "provenance_sha256": provenance_sha256(record)})
         self.assertFalse(verdict["verified"])
         self.assertTrue(any("tampered" in item for item in verdict["problems"]))
 
@@ -78,7 +80,8 @@ class ProvenanceChainTests(unittest.TestCase):
 
     def test_digest_mismatch_rejected(self):
         record = self._record()
-        binding = {"image_digest": "sha256:" + "b" * 64,
+        binding = {"schema_version": PROVENANCE_SCHEMA_VERSION,
+                   "image_digest": "sha256:" + "b" * 64,
                    "provenance_sha256": provenance_sha256(record)}
         verdict = verify_image_provenance(
             record, provenance_sha256(record), "sha256:" + "c" * 64, binding)
@@ -147,7 +150,7 @@ class ImageContractTests(unittest.TestCase):
 
     def test_compose_refuses_floating_image(self):
         text = (ROOT / "deploy" / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn("STOCK_AGENT_TAG:?", text,
+        self.assertIn("stock-agent-research@sha256:${STOCK_AGENT_IMAGE_SHA256:?", text,
                       "compose must fail closed until a digest is pinned")
         self.assertIn("read_only: true", text)
         self.assertIn("cap_drop", text)
@@ -175,6 +178,25 @@ class ReleaseAuditProvenanceBranchTests(unittest.TestCase):
         from stock_agent import release_audit
         self.assertIn("requirements.linux-py312.lock.txt",
                       release_audit.PYTHON_LOCK_CANDIDATES)
+
+    def test_audit_requires_launch_values_independent_of_binding(self):
+        from stock_agent.release_audit import _image_provenance_snapshot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            record = build_provenance(root, source_commit="abc123", source_dirty=False)
+            (root / PROVENANCE_FILENAME).write_text(json.dumps(record), encoding="utf-8")
+            digest = "sha256:" + "a" * 64
+            write_image_binding(root / "deploy" / "docker" / BINDING_FILENAME,
+                                image_digest=digest, provenance=record)
+            with patch.dict("os.environ", {}, clear=True):
+                self.assertFalse(_image_provenance_snapshot(root)["verified"])
+            with patch.dict("os.environ", {"STOCK_AGENT_IMAGE_DIGEST": digest,
+                                           "STOCK_AGENT_PROVENANCE_SHA256": provenance_sha256(record)}):
+                self.assertTrue(_image_provenance_snapshot(root)["verified"])
+            with patch.dict("os.environ", {"STOCK_AGENT_IMAGE_DIGEST": "sha256:" + "b" * 64,
+                                           "STOCK_AGENT_PROVENANCE_SHA256": provenance_sha256(record)}):
+                self.assertFalse(_image_provenance_snapshot(root)["verified"])
 
 
 if __name__ == "__main__":
