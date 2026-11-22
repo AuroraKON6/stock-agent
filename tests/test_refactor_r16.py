@@ -113,4 +113,3 @@ class ReplayContractTests(gateway_test.GatewayTestCase):
         self.assertEqual(status("{}", 200, *args), {"status": "status_unconfirmed"})
         failed = {"ok": True, "data": {"task_id": args[0], "case_id": args[1], "status": "failed"}}
         self.assertEqual(status(json.dumps(failed), 200, *args), {"status": "failed"})
-
