@@ -16,13 +16,15 @@ import json
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from .config import project_path
 from .models import now_iso
 from .task_runtime import (
     STATUS_AWAITING_HUMAN,
+    STATUS_SUCCEEDED,
+    TERMINAL_STATUSES,
     HUMAN_DECISIONS,
     TaskRuntimeError,
     TaskStore,
@@ -51,7 +53,103 @@ def _board_state(store: TaskStore, config: Optional[Dict[str, Any]] = None) -> D
     }
 
 
-def _render_html(state: Dict[str, Any], csrf_token: str) -> str:
+def _action_buttons(task: Dict[str, Any], task_id: str, version: str, *,
+                    logged_in: bool) -> str:
+    """A93 row actions, shown ONLY to a logged-in principal (every target
+    route is session-gated). The terminal set mirrors the backend's
+    TERMINAL_STATUSES exactly — a rejected (blocked) row offers re-research,
+    not a cancel the store would refuse. Plain buttons — no actor, no English
+    decision strings, no JSON patch (taskbook R14 feedback rule)."""
+    if not logged_in:
+        return ""
+    status = str(task.get("status") or "")
+    buttons = []
+    if status not in TERMINAL_STATUSES:
+        buttons.append('<button type="button" class="act" data-ws="cancel" data-task="{0}" data-version="{1}">取消</button>'.format(task_id, version))
+    if status in TERMINAL_STATUSES or status == STATUS_AWAITING_HUMAN:
+        buttons.append('<button type="button" class="act" data-ws="rerun" data-task="{0}">重新研究</button>'.format(task_id))
+    return '<span class="acts">{0}</span>'.format("".join(buttons)) if buttons else ""
+
+
+def _feedback_row(task: Dict[str, Any], task_id: str, version: str) -> str:
+    """A64/A90 plain-language feedback row (session mode, logged in only —
+    the caller gates it).
+
+    - awaiting_human: the model's question plus 签收/否定/追问补证;
+    - succeeded without a pending question: the result is final, but the user
+      can STILL proactively follow up (A90 — new linked task) and sign off
+      (A50 — acknowledgement added to the preserved output).
+    """
+    status = str(task.get("status") or "")
+    if status == STATUS_AWAITING_HUMAN:
+        human_request = task.get("human_request") or {}
+        question = _esc(str(human_request.get("question") or ""))
+        if not question:
+            return ""
+        return (
+            '<tr data-taskform="{0}"><td colspan="8"><div class="feedback"><em>{1}</em>'
+            '<form data-task="{0}" data-version="{2}" class="ws-feedback">'
+            '<textarea name="note" placeholder="追问或补充说明（普通文字）"></textarea>'
+            '<button type="button" data-ws="acknowledge" data-task="{0}" data-version="{2}">签收（个人确认，非机构批准）</button>'
+            '<button type="button" data-ws="reject" data-task="{0}" data-version="{2}">否定（理由写在上方）</button>'
+            '<button type="button" data-ws="followup" data-task="{0}" data-version="{2}">提交追问/补证</button>'
+            '</form></div></td></tr>'
+        ).format(task_id, question, version)
+    if status == STATUS_SUCCEEDED:
+        output = task.get("output") if isinstance(task.get("output"), dict) else {}
+        acknowledged = bool(isinstance(output.get("personal_acknowledgement"), dict)
+                            and output.get("personal_acknowledgement"))
+        buttons = ['<button type="button" data-ws="followup" data-task="{0}" data-version="{1}">提交追问（针对该结果）</button>'.format(task_id, version)]
+        if not acknowledged:
+            buttons.insert(0, '<button type="button" data-ws="signoff" data-task="{0}" data-version="{1}">签收（个人确认，非机构批准）</button>'.format(task_id, version))
+        return (
+            '<tr data-taskform="{0}"><td colspan="8"><div class="feedback">'
+            '<form data-task="{0}" data-version="{2}" class="ws-feedback">'
+            '<textarea name="note" placeholder="追问该结果的问题（普通文字，将作为新的关联研究）"></textarea>'
+            '{3}</form></div></td></tr>'
+        ).format(task_id, "", version, "".join(buttons))
+    return ""
+
+
+def _personal_panel_html(session_mode: bool, session_actor: str) -> Tuple[str, str]:
+    """A93: the personal workspace panel, server-rendered so the FIRST paint
+    already matches the session state (the JS only attaches handlers).
+
+    Returns (inner_html, hidden_attr): the panel is hidden entirely on
+    legacy (no-session) pages, which keep their original form."""
+    if not session_mode:
+        return "", " hidden"
+    if not session_actor:
+        return (
+            '<form id="login-form">'
+            '<input name="actor" placeholder="账号（真实个人）" required>'
+            '<input name="symbols" placeholder="关注标的，逗号分隔（如 600519）" required>'
+            '<button type="submit">登录个人工作台</button></form>'
+            '<p class="hint">登录后即可仅用本页面完成创建研究、导入原件、追问、签收与取消。</p>'
+        ), ""
+    return (
+        '<div class="who">已登录：' + _esc(session_actor) +
+        ' <button type="button" id="logout-btn">退出</button></div>'
+        '<form id="create-form">'
+        '<textarea name="question" placeholder="研究问题（普通文字）" required></textarea>'
+        '<input name="symbols" placeholder="标的，逗号分隔（如 600519）" required>'
+        '<div class="docs" id="attach-docs"></div>'
+        '<button type="submit">创建研究（replay 样本回放）</button></form>'
+        '<details><summary>导入样本原件（个人命名空间，不发外部）</summary>'
+        '<form id="import-form">'
+        '<input type="file" name="file" required>'
+        '<input name="source_url" placeholder="原文 HTTPS 链接" required>'
+        '<input name="title" placeholder="标题" required>'
+        '<input name="published_at" placeholder="发布时间（ISO，如 2026-10-23T18:00:00+08:00）" required>'
+        '<button type="submit">导入</button></form>'
+        '<p class="hint">导入仅进入你的个人证据命名空间（R12a），机构准入状态保持 NOT_REQUESTED。</p></details>'
+        '<details open><summary>我的原件</summary><div class="docs" id="doc-list"></div></details>'
+    ), ""
+
+
+def _render_html(state: Dict[str, Any], csrf_token: str, *,
+                 session_mode: bool = False, session_actor: str = "") -> str:
+    logged_in = bool(session_mode and session_actor)
     rows = []
     for task in state.get("tasks", []):
         mode = "REPLAY" if task.get("is_replay") else "LIVE"
@@ -59,28 +157,42 @@ def _render_html(state: Dict[str, Any], csrf_token: str) -> str:
         version = _esc(str(task.get("version") or ""))
         # SSR rows carry the SAME task keys the client renderer uses so the
         # first client render recognizes them instead of duplicating rows.
-        row = '<tr data-task="{7}" data-version="{5}"><td>{0}</td><td>{1}</td><td class=\'status-{2}\'>{2}</td><td>{3}</td><td>v{4}</td><td>#{5}</td><td>{6}</td></tr>'.format(
+        row = '<tr data-task="{7}" data-version="{5}"><td>{0}</td><td>{1}</td><td class=\'status-{2}\'>{2}</td><td>{3}</td><td>v{4}</td><td>#{5}</td><td>{6}</td><td>{8}</td></tr>'.format(
             _esc(str(task.get("task_id") or "")),
-            _esc(mode),
+            _esc(str(mode)),
             _esc(str(task.get("status") or "")),
             _esc(str(task.get("title") or "")) + '<small class="summary-state">Summary: ' + _esc(str((task.get("summary_review") or {}).get("status") or "not_submitted")) + '</small>',
             _esc(str(task.get("input_version") or "")),
             version,
             _esc(str((task.get("model_call") or {}).get("error") or (task.get("last_error") or ""))[:120]),
             task_id,
+            _action_buttons(task, task_id, version, logged_in=logged_in),
         )
-        human_request = task.get("human_request") or {}
-        if task.get("status") == STATUS_AWAITING_HUMAN and human_request.get("question"):
+        if logged_in:
+            # A64/A90: plain-language personal feedback (taskbook: 反馈使用
+            # 明确按钮和普通文字，不要求 actor/英文 decision/JSON patch).
+            row += _feedback_row(task, task_id, version)
+        elif (not session_mode and task.get("status") == STATUS_AWAITING_HUMAN
+              and (task.get("human_request") or {}).get("question")):
+            # Legacy rollback page only: session-mode pages never show the
+            # form-actor path (a logged-out visitor has nothing that works).
             row += (
-                '<tr data-taskform="{0}"><td colspan="7"><div class="feedback"><em>{1}</em>'
+                '<tr data-taskform="{0}"><td colspan="8"><div class="feedback"><em>{1}</em>'
                 '<form data-task="{0}" data-version="{2}">'
                 '<input name="actor" placeholder="actor" required>'
                 '<select name="decision"><option>acknowledge</option><option>reject</option><option>provide_input</option></select>'
                 '<input name="input_patch" placeholder="JSON patch (provide_input)">'
                 '<input name="notes" placeholder="notes"><button type="submit">Submit</button></form></div></td></tr>'
-            ).format(task_id, _esc(str(human_request.get("question") or "")), version)
+            ).format(task_id, _esc(str(task["human_request"].get("question") or "")), version)
         rows.append(row)
-    page = _PAGE_TEMPLATE.replace("__ROWS__", "".join(rows)).replace("__CSRF_JSON__", json.dumps(str(csrf_token)))
+    panel_html, panel_hidden = _personal_panel_html(session_mode, session_actor)
+    page = (_PAGE_TEMPLATE
+            .replace("__ROWS__", "".join(rows))
+            .replace("__CSRF_JSON__", json.dumps(str(csrf_token)))
+            .replace("__SESSION_MODE_JSON__", "true" if session_mode else "false")
+            .replace("__SESSION_ACTOR_JSON__", json.dumps(str(session_actor or "")))
+            .replace("__PERSONAL_HIDDEN__", panel_hidden)
+            .replace("__PERSONAL_PANEL__", panel_html))
     return page
 
 
@@ -137,11 +249,23 @@ tr[data-task]{cursor:pointer}
 .evsec .blk{color:#ff9d9d}
 .evsec .muted{color:#777}
 .evsec .stale{color:#ffd27a}
+#personal{border:1px solid #3a5a3a;border-radius:.5rem;margin:.4rem 0 .8rem;padding:.6rem .8rem;background:#14201a}
+#personal .who{color:#9fd0ff;font-size:.85rem;margin-bottom:.4rem}
+#personal form{margin:.2rem 0}
+#personal textarea{flex:1 1 100%;min-height:2.4rem}
+#personal .docs{margin:.4rem 0;display:grid;gap:.25rem}
+#personal .doc{display:flex;gap:.5rem;align-items:baseline;font-size:.8rem;flex-wrap:wrap}
+#personal .doc .src{max-width:38ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#personal .hint{color:#888;font-size:.72rem}
+.ws-feedback textarea{flex:1 1 100%;min-height:2.2rem}
+button.act{cursor:pointer}
+span.acts{display:inline-flex;gap:.3rem;flex-wrap:wrap}
 </style></head><body>
 <h1>Research Task Board <span id="conn" class="down">CONNECTING</span></h1>
 <p class="note">REPLAY rows used recorded model responses, not live calls.
 Personal acknowledgement is a personal research acknowledgement, not institutional approval.</p>
 <p id="msg"></p>
+<div id="personal"__PERSONAL_HIDDEN__ aria-label="Personal workspace">__PERSONAL_PANEL__</div>
 <div id="overview" class="ovbar" hidden aria-label="Workbench overview"></div>
 <details id="todo" class="evsec" open>
   <summary>待办<span id="todocount"></span></summary>
@@ -159,20 +283,248 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   <summary>运行（引擎/预算/登记/投影）</summary>
   <div id="opslist"></div>
 </details>
-<div class="table-wrap" role="region" aria-label="Research tasks" tabindex="0"><table><thead><tr><th>task_id</th><th>mode</th><th>status</th><th>title</th><th>input_v</th><th>row_v</th><th>last error</th></tr></thead>
+<div class="table-wrap" role="region" aria-label="Research tasks" tabindex="0"><table><thead><tr><th>task_id</th><th>mode</th><th>status</th><th>title</th><th>input_v</th><th>row_v</th><th>last error</th><th>操作</th></tr></thead>
 <tbody id="tasks">__ROWS__
 </tbody></table></div>
 <aside id="detail" hidden aria-label="Task detail"></aside>
 <script>
 (function() {
   var CSRF = __CSRF_JSON__;
+  var SESSION_MODE = __SESSION_MODE_JSON__;
+  var SESSION_ACTOR = __SESSION_ACTOR_JSON__;
+  var LOGGED_IN = SESSION_MODE && !!SESSION_ACTOR;
+  // Mirrors the backend TERMINAL_STATUSES — blocked IS terminal, so a
+  // rejected row offers re-research, never a cancel the store would refuse.
+  var TERMINAL = ['succeeded', 'failed', 'blocked', 'cancelled', 'expired'];
   var tbody = document.getElementById('tasks');
   var conn = document.getElementById('conn');
   var msg = document.getElementById('msg');
+
+  // ---- A93 personal workspace panel (session mode pages only) ----
+  var personal = document.getElementById('personal');
+  function wsPost(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Task-Board-CSRF': CSRF},
+      body: JSON.stringify(body)
+    }).then(function(r) { return r.json().then(function(j) { return {ok: r.ok, j: j}; }); });
+  }
+  // The panel MARKUP is server-rendered (first paint matches the session);
+  // this side only wires the handlers to it.
+  function renderPersonalPanel() {
+    if (!SESSION_MODE || !personal) return;
+    var loginForm = document.getElementById('login-form');
+    if (loginForm) {
+      loginForm.addEventListener('submit', function(ev) {
+        ev.preventDefault();
+        var fd = new FormData(loginForm);
+        fetch('/api/v1/personal/login', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({actor: fd.get('actor'),
+                                symbols: String(fd.get('symbols') || '').split(/[,，\\s]+/).filter(Boolean)})
+        }).then(function(r) { return r.json().then(function(j) { return {ok: r.ok, j: j}; }); })
+          .then(function(out) {
+            if (out.ok) { window.location.reload(); return; }
+            msg.textContent = '登录失败: ' + (out.j.error || '') + (out.j.detail ? ' — ' + out.j.detail : '');
+          })
+          .catch(function() { msg.textContent = '登录请求失败'; });
+      });
+      return;
+    }
+    var logout = document.getElementById('logout-btn');
+    if (logout) logout.addEventListener('click', function() {
+      wsPost('/api/v1/personal/logout', {}).then(function() { window.location.reload(); });
+    });
+    var importForm = document.getElementById('import-form');
+    if (importForm) importForm.addEventListener('submit', function(ev) {
+      ev.preventDefault();
+      var fd = new FormData(importForm);
+      var file = fd.get('file');
+      if (!file) { msg.textContent = '请选择要导入的文件'; return; }
+      file.arrayBuffer().then(function(buffer) {
+        var binary = '';
+        new Uint8Array(buffer).forEach(function(byte) { binary += String.fromCharCode(byte); });
+        return wsPost('/api/v1/personal/import', {
+          filename: file.name,
+          content_base64: btoa(binary),
+          source_url: String(fd.get('source_url') || ''),
+          title: String(fd.get('title') || ''),
+          published_at: String(fd.get('published_at') || '')
+        });
+      }).then(function(out) {
+        if (out.ok) {
+          msg.textContent = '已导入: ' + ((out.j.document || {}).title || '');
+          importForm.reset();
+          loadDocuments();
+        } else {
+          msg.textContent = '导入被拒绝: ' + (out.j.error || '') + (out.j.detail ? ' — ' + out.j.detail : '');
+        }
+      }).catch(function() { msg.textContent = '导入请求失败'; });
+    });
+    var createForm = document.getElementById('create-form');
+    if (createForm) createForm.addEventListener('submit', function(ev) {
+      ev.preventDefault();
+      var fd = new FormData(createForm);
+      var documentIds = [];
+      createForm.querySelectorAll('input[name=document_id]:checked').forEach(function(box) {
+        documentIds.push(box.value);
+      });
+      wsPost('/api/v1/workspace/create', {
+        question: String(fd.get('question') || ''),
+        symbols: String(fd.get('symbols') || '').split(/[,，\\s]+/).filter(Boolean),
+        execution_mode: 'replay',
+        document_ids: documentIds
+      }).then(function(out) {
+        if (out.ok) {
+          msg.textContent = '已创建: ' + out.j.task_id + ' (' + out.j.outcome + ')';
+          createForm.querySelector('textarea[name=question]').value = '';
+          refresh();
+        } else {
+          msg.textContent = '创建失败: ' + (out.j.error || '') + (out.j.detail ? ' — ' + out.j.detail : '');
+        }
+      }).catch(function() { msg.textContent = '创建请求失败'; });
+    });
+    loadDocuments();
+  }
+  function loadDocuments() {
+    if (!SESSION_MODE || !SESSION_ACTOR) return;
+    fetch('/api/v1/personal/documents')
+      .then(function(r) { if (!r.ok) throw new Error('documents request failed'); return r.json(); })
+      .then(showDocuments)
+      .catch(function() { /* documents stay empty; the board works */ });
+  }
+  function showDocuments(view) {
+    if (!view || !Array.isArray(view.documents)) return;
+    var attach = document.getElementById('attach-docs');
+    var list = document.getElementById('doc-list');
+    var html = view.documents.map(function(d) {
+      return '<div class="doc"><input type="checkbox" name="document_id" value="' + esc(d.document_id) + '" id="doc-' + esc(d.document_id) + '">' +
+        '<label for="doc-' + esc(d.document_id) + '">' + esc(d.title) + '</label>' +
+        '<span class="src" title="' + esc(d.source_url) + '">' + esc(d.source_url) + '</span>' +
+        '<span class="src">' + esc(String(d.published_at || '').replace('T', ' ').slice(0, 16)) + '</span></div>';
+    }).join('');
+    if (attach) attach.innerHTML = html || '<p class="hint">尚无原件；可先在下方导入样本公告。</p>';
+    if (list) list.innerHTML = html || '<p class="hint">尚无原件。</p>';
+  }
+  // Delegated workspace actions: cancel / rerun row buttons plus the
+  // plain-language awaiting feedback (acknowledge / reject / followup).
+  // A submission whose response was lost can be resent: the SAME note on the
+  // SAME form reuses the SAME request id, so the server deduplicates instead
+  // of queueing a second task; editing the note or a confirmed success mints
+  // a fresh id (a genuinely new user action).
+  function pendingCommand(group, noteText) {
+    if (!group) return '';
+    if (group.dataset.pendingCommand && group.dataset.pendingNote === noteText) {
+      return group.dataset.pendingCommand;
+    }
+    var cmd = (window.crypto && window.crypto.randomUUID)
+      ? window.crypto.randomUUID()
+      : 'cmd-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+    group.dataset.pendingCommand = cmd;
+    group.dataset.pendingNote = noteText;
+    return cmd;
+  }
+  function workspaceAction(button) {
+    var kind = button.getAttribute('data-ws');
+    var taskId = button.getAttribute('data-task');
+    var version = parseInt(button.getAttribute('data-version') || '0', 10);
+    var group = tbody.querySelector('tr[data-taskform="' + taskId + '"] form');
+    var note = group && group.querySelector('textarea[name=note]');
+    var noteText = note ? note.value : '';
+    var body;
+    if (kind === 'cancel') {
+      body = {task_id: taskId, expected_version: version, reason: '网页取消'};
+    } else if (kind === 'rerun') {
+      body = {task_id: taskId, execution_mode: 'replay'};
+    } else if (kind === 'followup') {
+      if (!noteText.trim()) { msg.textContent = '追问前请先写下问题或补充说明'; return; }
+      body = {task_id: taskId, expected_version: version,
+              extra_note: noteText, command_id: pendingCommand(group, noteText)};
+    } else if (kind === 'acknowledge' || kind === 'reject') {
+      body = {task_id: taskId, expected_version: version,
+              decision: kind === 'acknowledge' ? 'acknowledge' : 'reject',
+              notes: noteText, command_id: pendingCommand(group, noteText), csrf_token: CSRF};
+    } else if (kind === 'signoff') {
+      // A90/A50: sign off an already-succeeded no-question result — the
+      // workspace route ADDS the acknowledgement to the preserved output.
+      body = {task_id: taskId, expected_version: version,
+              notes: noteText, command_id: pendingCommand(group, noteText)};
+    } else {
+      return;
+    }
+    var path = (kind === 'cancel' || kind === 'rerun' || kind === 'followup')
+      ? '/api/v1/workspace/' + kind
+      : (kind === 'signoff' ? '/api/v1/workspace/acknowledge' : '/api/v1/human-responses');
+    msg.textContent = '处理中…';
+    wsPost(path, body).then(function(out) {
+      if (out.ok) {
+        if (group) {
+          group.dataset.dirty = '';
+          // Confirmed: the next submission on this form is a NEW action.
+          group.dataset.pendingCommand = '';
+          group.dataset.pendingNote = '';
+        }
+        msg.textContent = '已' + ({cancel: '取消', rerun: '创建重新研究', followup: '记录追问',
+                                   acknowledge: '签收', reject: '否定', signoff: '签收'})[kind] +
+          (out.j.task_id ? ': ' + out.j.task_id : '');
+        refresh();
+      } else {
+        // Refused (or a lost-response retry arrives as an error): the pending
+        // id STAYS, so resending the same note reuses the same request.
+        msg.textContent = '操作被拒绝: ' + (out.j.error || '') + (out.j.detail ? ' — ' + out.j.detail : '');
+      }
+    }).catch(function() { msg.textContent = '操作请求失败'; });
+  }
+  document.addEventListener('click', function(ev) {
+    var button = ev.target.closest ? ev.target.closest('button[data-ws]') : null;
+    if (button) { ev.preventDefault(); workspaceAction(button); }
+  });
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
       return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
     });
+  }
+  function actionButtons(t) {
+    if (!LOGGED_IN) return '';
+    var buttons = '';
+    if (TERMINAL.indexOf(t.status) === -1) {
+      buttons += '<button type="button" class="act" data-ws="cancel" data-task="' + esc(t.task_id) +
+        '" data-version="' + esc(t.version) + '">取消</button>';
+    }
+    if (TERMINAL.indexOf(t.status) !== -1 || t.status === 'awaiting_human') {
+      buttons += '<button type="button" class="act" data-ws="rerun" data-task="' + esc(t.task_id) + '">重新研究</button>';
+    }
+    return buttons ? '<span class="acts">' + buttons + '</span>' : '';
+  }
+  function feedbackRow(t) {
+    // Mirrors the server-side _feedback_row: awaiting gets the question +
+    // 签收/否定/追问; a succeeded no-question result STILL gets 追问 (A90,
+    // new linked task) and 签收 until acknowledged (A50).
+    if (t.status === 'awaiting_human' && t.human_request && t.human_request.question) {
+      return '<tr data-taskform="' + esc(t.task_id) + '"><td colspan="8"><div class="feedback"><em>' + esc(t.human_request.question) + '</em>' +
+        '<form data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '" class="ws-feedback">' +
+        '<textarea name="note" placeholder="追问或补充说明（普通文字）"></textarea>' +
+        '<button type="button" data-ws="acknowledge" data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">签收（个人确认，非机构批准）</button>' +
+        '<button type="button" data-ws="reject" data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">否定（理由写在上方）</button>' +
+        '<button type="button" data-ws="followup" data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">提交追问/补证</button>' +
+        '</form></div></td></tr>';
+    }
+    if (t.status === 'succeeded') {
+      var output = t.output || {};
+      var acknowledged = !!(output.personal_acknowledgement &&
+        typeof output.personal_acknowledgement === 'object');
+      var buttons = '<button type="button" data-ws="followup" data-task="' + esc(t.task_id) +
+        '" data-version="' + esc(t.version) + '">提交追问（针对该结果）</button>';
+      if (!acknowledged) {
+        buttons = '<button type="button" data-ws="signoff" data-task="' + esc(t.task_id) +
+          '" data-version="' + esc(t.version) + '">签收（个人确认，非机构批准）</button>' + buttons;
+      }
+      return '<tr data-taskform="' + esc(t.task_id) + '"><td colspan="8"><div class="feedback">' +
+        '<form data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '" class="ws-feedback">' +
+        '<textarea name="note" placeholder="追问该结果的问题（普通文字，将作为新的关联研究）"></textarea>' +
+        buttons + '</form></div></td></tr>';
+    }
+    return '';
   }
   function rowHtml(t) {
     var mode = t.is_replay ? 'REPLAY' : 'LIVE';
@@ -180,9 +532,11 @@ Personal acknowledgement is a personal research acknowledgement, not institution
     var base = '<tr data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '"><td>' + esc(t.task_id) + '</td><td>' + esc(mode) + '</td>' +
       '<td class="status-' + esc(t.status) + '">' + esc(t.status) + '</td><td>' + esc(t.title) +
       '<small class="summary-state">Summary: ' + esc((t.summary_review || {}).status || 'not_submitted') + '</small></td>' +
-      '<td>v' + esc(t.input_version) + '</td><td>#' + esc(t.version) + '</td><td>' + esc(err) + '</td></tr>';
-    if (t.status === 'awaiting_human' && t.human_request && t.human_request.question) {
-      base += '<tr data-taskform="' + esc(t.task_id) + '"><td colspan="7"><div class="feedback"><em>' + esc(t.human_request.question) + '</em>' +
+      '<td>v' + esc(t.input_version) + '</td><td>#' + esc(t.version) + '</td><td>' + esc(err) + '</td><td>' + actionButtons(t) + '</td></tr>';
+    if (LOGGED_IN) {
+      base += feedbackRow(t);
+    } else if (!SESSION_MODE && t.status === 'awaiting_human' && t.human_request && t.human_request.question) {
+      base += '<tr data-taskform="' + esc(t.task_id) + '"><td colspan="8"><div class="feedback"><em>' + esc(t.human_request.question) + '</em>' +
         '<form data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">' +
         '<input name="actor" placeholder="actor" required>' +
         '<select name="decision"><option>acknowledge</option><option>reject</option><option>provide_input</option></select>' +
@@ -549,7 +903,10 @@ Personal acknowledgement is a personal research acknowledgement, not institution
       ' · attempts ' + esc((d.attempt_count || 0) + '/' + (d.max_attempts || 0)) + '</dd>' +
       '<dt>origin</dt><dd>' + esc(origin.kind || 'unknown') +
       (origin.event_key ? ' · ' + esc(origin.event_key) : '') +
-      (origin.supersedes_task_id ? ' · supersedes ' + esc(origin.supersedes_task_id) : '') + '</dd>' +
+      (origin.supersedes_task_id ? ' · supersedes ' + esc(origin.supersedes_task_id) : '') +
+      (origin.prior_task_id ? ' · 关联前案 <span class="tl" data-tasklink="' + esc(origin.prior_task_id) +
+        '" title="打开关联案件">' + esc(origin.prior_task_id) + '</span>' : '') +
+      (origin.research_occasion ? ' · ' + esc(origin.research_occasion) : '') + '</dd>' +
       '<dt>question</dt><dd>' + esc(d.research_question || '') + '</dd>' +
       '<dt>symbols</dt><dd>' + esc((d.symbols || []).join(', ')) + '</dd></dl>' +
       '<div class="sec">evidence actually delivered</div>' +
@@ -574,6 +931,20 @@ Personal acknowledgement is a personal research acknowledgement, not institution
         (d.pending_human_questions || []).map(function(q) {
           return '<div class="round">' + esc(q.question || '') + '</div>';
         }).join('') : '') +
+      ((d.input_versions || []).length ? '<div class="sec">输入版本（' + d.input_versions.length + '，只读）</div>' +
+        d.input_versions.map(function(v) {
+          var docs = v.evidence_documents || [];
+          return '<div class="round">v' + esc(v.input_version) + ' · ' + esc(v.reason || '') +
+            ' · ' + esc(String(v.created_at || '').replace('T', ' ').slice(0, 19)) +
+            (v.followup_note ? '<div class="why">追问原文：' + esc(v.followup_note) + '</div>' : '') +
+            (docs.length ? '<div class="why">所选原件：' + docs.map(function(id) { return esc(id); }).join(' · ') + '</div>' : '') +
+            '</div>';
+        }).join('') : '') +
+      (d.personal_acknowledgement ? '<div class="sec">个人签收（非机构批准）</div>' +
+        '<dl><dt>by</dt><dd>' + esc(d.personal_acknowledgement.actor || '') + '</dd>' +
+        '<dt>at</dt><dd>' + esc(String(d.personal_acknowledgement.at || '').replace('T', ' ').slice(0, 19)) + '</dd>' +
+        (d.personal_acknowledgement.notes ? '<dt>备注</dt><dd>' + esc(d.personal_acknowledgement.notes) + '</dd>' : '') +
+        '<dt>范围</dt><dd>' + esc(d.personal_acknowledgement.scope || '') + '</dd></dl>' : '') +
       (d.last_error ? '<div class="sec">error</div><div>' + esc(d.last_error) + '</div>' : '') +
       '<p class="scope">' + esc(d.scope_note || '') + '</p>';
     detail.innerHTML = html;
@@ -588,11 +959,14 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   }
   tbody.addEventListener('click', function(ev) {
     if (ev.target.closest && ev.target.closest('form')) return;  // never hijack feedback inputs
+    if (ev.target.closest && ev.target.closest('button[data-ws]')) return;  // workspace actions, not detail
     var tr = ev.target.closest ? ev.target.closest('tr[data-task]') : null;
     if (tr) openDetail(tr.getAttribute('data-task'));
   });
   detail.addEventListener('click', function(ev) {
     if (ev.target.closest && ev.target.closest('[data-detail-close]')) closeDetail();
+    var link = ev.target.closest ? ev.target.closest('[data-tasklink]') : null;
+    if (link) openDetail(link.getAttribute('data-tasklink'));
   });
   document.addEventListener('keydown', function(ev) { if (ev.key === 'Escape') closeDetail(); });
   var es = new EventSource('/api/v1/events');
@@ -609,6 +983,8 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   window.__taskBoardTodo = showTodo;
   window.__taskBoardOps = showOps;
   window.__taskBoardQueries = showQueries;
+  window.__taskBoardShowDocuments = showDocuments;
+  renderPersonalPanel();
   fetchOverview();
   fetchEvents();
   fetchQueries();
@@ -741,6 +1117,151 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                         set_cookie="{0}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".format(
                             SESSION_COOKIE_NAME))
 
+    def _resolve_session(self) -> Optional[Any]:
+        """Resolve the caller's session, or None when absent/invalid."""
+        from .identity_providers import SESSION_COOKIE_NAME, PersonalSessionError
+
+        sessions = getattr(self.server, "session_store", None)
+        if sessions is None:
+            return None
+        try:
+            return sessions.resolve(self._session_cookie(SESSION_COOKIE_NAME))
+        except PersonalSessionError:
+            return None
+
+    def _handle_personal_session(self) -> None:
+        """Read-only login state for the page (A93): never mutates anything."""
+        if getattr(self.server, "session_store", None) is None:
+            self._send_json(200, {"logged_in": False, "sessions_available": False})
+            return
+        session = self._resolve_session()
+        if session is None:
+            self._send_json(200, {"logged_in": False, "sessions_available": True})
+            return
+        self._send_json(200, {"logged_in": True, "sessions_available": True,
+                              "actor": session.actor, "provider": session.provider,
+                              "expires_at": getattr(session, "expires_at", "")})
+
+    def _handle_personal_documents(self) -> None:
+        """A93: the owner's personal namespace documents (read-only list)."""
+        from .personal_evidence import personal_documents, PersonalEvidenceError
+
+        if getattr(self.server, "session_store", None) is None:
+            self._send_json(503, {"error": "workspace_requires_sessions"})
+            return
+        session = self._resolve_session()
+        if session is None:
+            self._send_json(403, {"error": "session_required"})
+            return
+        try:
+            view = personal_documents(self.server.board_config, session.actor)
+        except PersonalEvidenceError as exc:
+            self._send_json(400, {"error": "personal_documents_failed", "detail": str(exc)})
+            return
+        documents = [
+            {
+                "document_id": str(item.get("document_id") or ""),
+                "title": str(item.get("title") or ""),
+                "sha256": str(item.get("sha256") or ""),
+                "source_url": str(item.get("source_url") or ""),
+                "published_at": str(item.get("published_at") or ""),
+                "content_type": str(item.get("content_type") or ""),
+            }
+            for item in view.get("documents") or []
+        ]
+        self._send_json(200, {"owner": view.get("owner"),
+                              "namespace": view.get("namespace"),
+                              "documents": documents})
+
+    def _handle_personal_import(self) -> None:
+        """A93 page wiring: import one file into the owner's personal
+        namespace through the R12a service (never the institutional vault).
+
+        The session names the owner; CSRF is enforced like every POST. The
+        upload arrives as JSON (filename + base64 body) so the whole contract
+        stays stdlib JSON, matching the other board routes."""
+        import base64
+        import binascii
+        import uuid
+        from pathlib import Path
+
+        from .identity_providers import SESSION_COOKIE_NAME, PersonalSessionError
+        from .personal_evidence import (
+            PersonalEvidenceError,
+            import_personal_document,
+            personal_root,
+        )
+
+        sessions = getattr(self.server, "session_store", None)
+        if sessions is None:
+            self._send_json(503, {"error": "workspace_requires_sessions"})
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0 or length > 8 * 1024 * 1024:
+            self._send_json(400, {"error": "invalid body size"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        if not hmac.compare_digest(str(self.headers.get("X-Task-Board-CSRF", "")),
+                                   str(self.server.csrf_token)):
+            self._send_json(403, {"error": "csrf validation failed"})
+            return
+        try:
+            session = sessions.resolve(self._session_cookie(SESSION_COOKIE_NAME))
+        except PersonalSessionError as exc:
+            self._send_json(403, {"error": "session_required", "detail": str(exc)})
+            return
+        if "actor" in body:
+            self._send_json(403, {"error": "actor_from_session_only"})
+            return
+        try:
+            decoded = base64.b64decode(
+                str(body.get("content_base64") or ""), validate=True)
+        except (binascii.Error, ValueError):
+            self._send_json(400, {"error": "content_base64 is not valid base64"})
+            return
+        if not decoded:
+            self._send_json(400, {"error": "content_base64 is empty"})
+            return
+        if len(decoded) > 2 * 1024 * 1024:
+            self._send_json(400, {"error": "file exceeds the 2MB personal import limit"})
+            return
+        filename = Path(str(body.get("filename") or "announcement.html")).name
+        source_url = str(body.get("source_url") or "").strip()
+        title = str(body.get("title") or "").strip()
+        published_at = str(body.get("published_at") or "").strip()
+        if not (source_url.startswith("https://") and title and published_at):
+            self._send_json(400, {"error": "source_url (https), title and published_at are required"})
+            return
+        incoming = personal_root(self.server.board_config, session.actor) / "incoming"
+        incoming.mkdir(parents=True, exist_ok=True)
+        staged = incoming / "{0}-{1}".format(uuid.uuid4().hex[:12], filename)
+        staged.write_bytes(decoded)
+        try:
+            imported = import_personal_document(
+                self.server.board_config, session.actor, str(staged),
+                source_url=source_url, title=title, published_at=published_at)
+        except (PersonalEvidenceError, ValueError) as exc:
+            self._send_json(400, {"error": "personal_import_rejected",
+                                  "detail": str(exc)})
+            return
+        finally:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+        document = imported.get("document") or {}
+        self._send_json(200, {"status": "imported",
+                              "document": {
+                                  "document_id": str(document.get("document_id") or ""),
+                                  "title": str(document.get("title") or ""),
+                                  "sha256": str(document.get("sha256") or ""),
+                                  "content_type": str(document.get("content_type") or ""),
+                              }})
+
     def _handle_workspace(self, action: str) -> None:
         """R14 workspace actions: create / cancel / followup / rerun.
 
@@ -784,7 +1305,8 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     question=str(body.get("question") or ""),
                     symbols=[str(s) for s in (body.get("symbols") or [])],
                     execution_mode=str(body.get("execution_mode") or "replay"),
-                    config=config)
+                    config=config,
+                    document_ids=[str(d) for d in (body.get("document_ids") or [])])
             elif action == "cancel":
                 result = {"task": personal_workspace.cancel_personal_task(
                     store, actor=session.actor,
@@ -792,13 +1314,39 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     expected_version=int(body.get("expected_version") or 0),
                     reason=str(body.get("reason") or ""))}
             elif action == "followup":
-                result = {"task": personal_workspace.follow_up_awaiting(
+                # A64 while awaiting (same task, input version bump) vs A90
+                # on a finished no-question result (new linked task).
+                follow_task = store.get_task(str(body.get("task_id") or ""))
+                if follow_task["status"] == "awaiting_human":
+                    result = {"task": personal_workspace.follow_up_awaiting(
+                        store, actor=session.actor,
+                        task_id=str(body.get("task_id") or ""),
+                        expected_version=int(body.get("expected_version") or 0),
+                        note=str(body.get("note") or ""),
+                        extra_note=str(body.get("extra_note") or ""),
+                        command_id=str(body.get("command_id") or ""))}
+                else:
+                    followed = personal_workspace.follow_up_completed_research(
+                        store, actor=session.actor,
+                        task_id=str(body.get("task_id") or ""),
+                        note=str(body.get("extra_note") or body.get("note") or ""),
+                        config=config,
+                        # The page's request id: a lost-response retry of ONE
+                        # submission reuses the task the intent already named.
+                        intent_id=str(body.get("command_id") or ""))
+                    # Shape like the intake result so the generic response
+                    # tail reports outcome + the followed-up task as prior.
+                    result = {"task": followed.get("task") or followed,
+                              "status": followed.get("status"),
+                              "supersedes_task_id": str(body.get("task_id") or "")}
+            elif action == "acknowledge":
+                # A90/A50: personal sign-off on an already-succeeded result
+                # (the awaiting_human path stays on /api/v1/human-responses).
+                result = {"task": personal_workspace.acknowledge_completed_research(
                     store, actor=session.actor,
                     task_id=str(body.get("task_id") or ""),
                     expected_version=int(body.get("expected_version") or 0),
-                    note=str(body.get("note") or ""),
-                    extra_note=str(body.get("extra_note") or ""),
-                    command_id=str(body.get("command_id") or ""))}
+                    note=str(body.get("notes") or body.get("note") or ""))}
             else:  # rerun
                 result = personal_workspace.rerun_completed_research(
                     store, actor=session.actor,
@@ -914,13 +1462,28 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     return
             self._send_json(200, detail)
             return
+        # ---- A93 personal workspace wiring (session mode only) ----
+        if parsed.path == "/api/v1/personal/session":
+            self._handle_personal_session()
+            return
+        if parsed.path == "/api/v1/personal/documents":
+            self._handle_personal_documents()
+            return
         if parsed.path == "/api/v1/events":
             self._stream_events()
             return
         if parsed.path == "/":
+            session_mode = getattr(self.server, "session_store", None) is not None
+            session_actor = ""
+            if session_mode:
+                session = self._resolve_session()
+                session_actor = str(getattr(session, "actor", "") or "")
             with self.server.board_lock:
                 state = _board_state(store, self.server.board_config)
-            self._send(200, _render_html(state, str(self.server.csrf_token)).encode("utf-8"), "text/html; charset=utf-8")
+            self._send(200, _render_html(state, str(self.server.csrf_token),
+                                         session_mode=session_mode,
+                                         session_actor=session_actor).encode("utf-8"),
+                       "text/html; charset=utf-8")
             return
         self._send_json(404, {"error": "not found"})
 
@@ -993,6 +1556,10 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v1/personal/logout":
             self._handle_personal_logout()
             return
+        # ---- A93: personal source import (session + CSRF, R12a service) ----
+        if parsed.path == "/api/v1/personal/import":
+            self._handle_personal_import()
+            return
         # ---- R14 workspace routes (session mode enforced, CSRF required) ----
         if parsed.path == "/api/v1/workspace/create":
             self._handle_workspace("create")
@@ -1002,6 +1569,9 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/v1/workspace/followup":
             self._handle_workspace("followup")
+            return
+        if parsed.path == "/api/v1/workspace/acknowledge":
+            self._handle_workspace("acknowledge")
             return
         if parsed.path == "/api/v1/workspace/rerun":
             self._handle_workspace("rerun")

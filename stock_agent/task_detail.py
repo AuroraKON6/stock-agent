@@ -18,6 +18,27 @@ DETAIL_SCHEMA_VERSION = "1.0"
 SCOPE_NOTE = "personal_research_only_not_institutional"
 
 
+def _input_version_history(store: Any, task_id: str) -> list:
+    """Per-version readable history (A67) from the immutable snapshot chain:
+    the follow-up note the user typed and the documents that version
+    selected travel WITH the version, never re-derived from elsewhere."""
+    history = []
+    for item in (store.input_snapshots(task_id) if hasattr(store, "input_snapshots") else []):
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        context = payload.get("public_context") if isinstance(payload.get("public_context"), dict) else {}
+        summaries = context.get("evidence_summaries") if isinstance(context.get("evidence_summaries"), dict) else {}
+        history.append({
+            "input_version": int(item.get("input_version") or 0),
+            "reason": str(item.get("reason") or ""),
+            "created_at": str(item.get("created_at") or ""),
+            "created_by": str(item.get("created_by") or ""),
+            "followup_note": str(payload.get("extra_note") or ""),
+            "question": str(payload.get("research_question") or "")[:300],
+            "evidence_documents": sorted(str(key) for key in summaries),
+        })
+    return history
+
+
 def task_detail(store: Any, task_id: str, *, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     task = store.get_task(task_id)  # raises TaskRuntimeError for unknown ids
     input_payload = task.get("input_payload") or {}
@@ -117,6 +138,11 @@ def task_detail(store: Any, task_id: str, *, config: Optional[Dict[str, Any]] = 
         "output": output,
         "output_quality": output.get("quality") if isinstance(output.get("quality"), dict) else {},
         "personal_acknowledgement": acknowledgement,
+        # A67 (readable history): the immutable per-version input chain from
+        # the store — version, reason, timestamp, the follow-up note the user
+        # actually typed, and the documents that version selected, so the
+        # case can be re-opened and the feedback read back verbatim.
+        "input_versions": _input_version_history(store, task_id),
         "pending_human_questions": questions,
         "last_error": str(task.get("last_error") or ""),
     }

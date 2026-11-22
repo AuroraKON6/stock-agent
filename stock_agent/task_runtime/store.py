@@ -1204,6 +1204,79 @@ class TaskStore:
             raise
         return self.get_task(task_id)
 
+    def record_personal_acknowledgement(
+        self,
+        task_id: str,
+        *,
+        actor: str,
+        notes: str = "",
+        expected_version: int,
+        command_id: str = "",
+    ) -> Dict[str, Any]:
+        """A90/A50: personal sign-off on an ALREADY succeeded result.
+
+        The awaiting_human path (``record_human_response``) acknowledges a
+        pending decision and CLOSES the task; this sibling covers the model
+        asking no question at all — the result is already final, so the scoped
+        acknowledgement is ADDED to the preserved output and neither status
+        nor any prior output byte is rewritten. A second sign-off attempt on
+        the same result is a conflict, and the optimistic ``expected_version``
+        lock keeps a stale page from stamping a newer state."""
+        if not str(actor or "").strip():
+            raise TaskRuntimeError("actor must not be empty")
+        request_sha256 = self._content_fingerprint({
+            "operation": "personal_acknowledgement", "task_id": task_id,
+            "actor": actor, "expected_version": expected_version, "notes": notes,
+        })
+        self._begin()
+        try:
+            if command_id:
+                receipt = self._conn.execute(
+                    "SELECT * FROM idempotency_receipts WHERE command_id = ?", (command_id,)
+                ).fetchone()
+                if receipt is not None:
+                    recorded = json.loads(receipt["result"])
+                    if receipt["task_id"] != task_id or recorded.get("request_sha256") != request_sha256:
+                        raise TaskIdempotencyConflictError("command_id is not an exact replay of this acknowledgement")
+                    self._rollback()
+                    return self.get_task(task_id)
+            row = self._task_row(task_id)
+            if int(row["version"]) != int(expected_version):
+                raise TaskVersionConflictError("expected_version {0} does not match current {1}".format(expected_version, row["version"]))
+            if row["status"] != STATUS_SUCCEEDED:
+                raise TaskTransitionError(
+                    "personal acknowledgement requires succeeded, got {0}".format(row["status"]))
+            try:
+                output = json.loads(row["output"] or "{}")
+            except json.JSONDecodeError as exc:
+                raise TaskRuntimeError("task output is not valid JSON") from exc
+            if not isinstance(output, dict):
+                raise TaskRuntimeError("task output is not an object")
+            if "personal_acknowledgement" in output:
+                raise TaskTransitionError("task already carries a personal acknowledgement")
+            output["personal_acknowledgement"] = {
+                "actor": actor,
+                "at": _now(),
+                "notes": str(notes or ""),
+                "scope": "personal_research_acknowledgement_not_institutional_approval",
+            }
+            self._touch(task_id, output=json.dumps(output, ensure_ascii=False, default=str))
+            self._emit(task_id, "personal_acknowledgement", actor=actor, command_id=command_id,
+                       payload={"notes": str(notes or "")[:500], "on": "terminal_result"})
+            if command_id:
+                self._conn.execute(
+                    "INSERT INTO idempotency_receipts (command_id, task_id, result, created_at) VALUES (?,?,?,?)",
+                    (command_id, task_id, json.dumps({"request_sha256": request_sha256}), _now()),
+                )
+            self._commit()
+        except sqlite3.IntegrityError as exc:
+            self._rollback()
+            raise TaskIdempotencyConflictError("duplicate command_id: {0}".format(command_id)) from exc
+        except BaseException:
+            self._rollback()
+            raise
+        return self.get_task(task_id)
+
     def recover_abandoned(self, *, ttl_grace_seconds: int = 0) -> List[Dict[str, Any]]:
         """Requeue or expire tasks whose lease expired without a terminal state.
 
