@@ -150,6 +150,7 @@ def ensure_question_task(
     intent_id: str = "",
     new_research: bool = False,
     as_of: str = "",
+    spec_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Create a question task with explicit retry/new-research semantics (R01).
 
@@ -211,6 +212,18 @@ def ensure_question_task(
         idempotency_key = "question_intent::{0}".format(business_intent_id)
     else:
         idempotency_key = question_key
+    # Caller-owned spec enrichment (R14 A93/A90): applied INSIDE the same
+    # create transaction, so the task is born claimable with its COMPLETE
+    # input — a worker's first claim can never observe a half-finished
+    # payload that a later version bump was meant to complete. Dict values
+    # merge one level; anything else replaces. Applied after the branch
+    # bookkeeping above so callers can refine origin fields.
+    if spec_overrides:
+        for key, value in spec_overrides.items():
+            if isinstance(value, dict) and isinstance(spec.get(key), dict):
+                spec[key] = {**spec[key], **value}
+            else:
+                spec[key] = value
     task, status = store.create_task(
         title="用户问题：{0}".format(question)[:MAX_TITLE_CHARS],
         input_payload=spec,

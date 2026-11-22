@@ -88,41 +88,21 @@ def create_personal_research(store: TaskStore, *, actor: str, question: str,
     # untouched, so retrying with a corrected selection creates exactly one
     # task (a leftover orphan would swallow the retry as DUPLICATE).
     attachments = _resolve_personal_documents(config, actor, document_ids)
+    # The selected documents ride the task's FIRST input version, inside the
+    # same create transaction: the task becomes claimable only WITH its
+    # complete input, so any worker's first claim already sees the sources.
+    # The R01 snapshot chain stays fully intact (v1 snapshot written at
+    # creation; every later follow-up keeps bumping immutable versions).
     result = ensure_question_task(
         store, research_question=question, symbols=symbols,
         config=config, actor=actor, execution_mode=execution_mode,
-        intent_id=intent_id)
-    attached = _attach_personal_documents(
-        store, result, actor=actor, attachments=attachments)
-    if attached is not None:
-        result["task"] = attached
+        intent_id=intent_id,
+        spec_overrides=(
+            {"public_context": {"evidence_summaries": attachments}}
+            if attachments else None))
+    if attachments and str(result.get("status") or "") == "RECORDED":
         result["documents_attached"] = len(attachments)
     return result
-
-
-def _attach_personal_documents(store: TaskStore, result: Dict[str, Any], *,
-                               actor: str,
-                               attachments: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """A93 page wiring: documents the user selected at create time ride the
-    task payload as an additional immutable input version (R01 snapshot chain
-    via ``bump_input_version`` — the governed path, never a raw payload edit).
-
-    Selections are already namespace-verified by the caller; a DUPLICATE
-    intake keeps the existing task untouched."""
-    if not attachments:
-        return None
-    if str(result.get("status") or "") != "RECORDED":
-        return None  # a retry/dedup hit returns the existing task as-is
-    task = result.get("task") or {}
-    payload = task.get("input_payload") or {}
-    context = payload.get("public_context") if isinstance(payload.get("public_context"), dict) else {}
-    summaries = dict(context.get("evidence_summaries") if isinstance(context.get("evidence_summaries"), dict) else {})
-    summaries.update(attachments)
-    merged_context = dict(context, evidence_summaries=summaries)
-    return store.bump_input_version(
-        str(task.get("task_id") or ""),
-        payload_overrides={"public_context": merged_context},
-        actor=actor, reason="attach_personal_documents")
 
 
 def cancel_personal_task(store: TaskStore, *, actor: str, task_id: str,
@@ -180,14 +160,19 @@ def rerun_completed_research(store: TaskStore, *, actor: str, task_id: str,
 
 def follow_up_completed_research(store: TaskStore, *, actor: str, task_id: str,
                                  note: str,
-                                 config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                                 config: Optional[Dict[str, Any]] = None,
+                                 intent_id: str = "") -> Dict[str, Any]:
     """A90: proactive follow-up on a result the model delivered WITHOUT a
     question (the task already sits succeeded).
 
     The follow-up text IS a new research question: it becomes a NEW task
-    linked back to the finished one (prior_task_id + user_followup occasion,
-    recorded as a governed input version), and the finished result keeps its
-    terminal state and output untouched (A91)."""
+    linked back to the finished one, and the finished result keeps its
+    terminal state and output untouched (A91). The origin (prior_task_id +
+    user_followup occasion) rides the SAME create transaction, so a worker's
+    first claim already sees the correct link. ``intent_id`` (the page's
+    command id) makes a lost-response retry of ONE submission deduplicate to
+    the same task; no as_of is stamped here because an intent retry must
+    rebuild byte-identical content to dedup."""
     task = store.get_task(str(task_id or ""))
     if task["status"] != STATUS_SUCCEEDED:
         raise WorkspaceError(
@@ -200,26 +185,27 @@ def follow_up_completed_research(store: TaskStore, *, actor: str, task_id: str,
     symbols = [str(s).strip() for s in (payload.get("symbols") or []) if str(s).strip()]
     if not symbols:
         raise WorkspaceError("unknown_task: original input lacks a symbol scope")
-    result = ensure_question_task(
+    origin_override = {
+        "prior_task_id": str(task_id),
+        "research_occasion": "user_followup",
+        "followup_note": note[:2000],
+    }
+    intent_id = str(intent_id or "").strip()
+    if intent_id:
+        # A retry of ONE submission (e.g. the first response was lost): the
+        # intent key returns the already-created follow-up task.
+        return ensure_question_task(
+            store, research_question=note, symbols=symbols,
+            config=config, actor=actor,
+            execution_mode=str(task.get("execution_mode") or "replay"),
+            intent_id=intent_id,
+            spec_overrides={"origin": origin_override})
+    return ensure_question_task(
         store, research_question=note, symbols=symbols,
         config=config, actor=actor,
         execution_mode=str(task.get("execution_mode") or "replay"),
-        new_research=True)
-    if str(result.get("status") or "") != "RECORDED":
-        # The same follow-up text already exists — return it unchanged.
-        return result
-    created = result.get("task") or {}
-    origin = dict((created.get("input_payload") or {}).get("origin") or {})
-    # Tag the link explicitly: a fresh question text carries no prior of its
-    # own, so the followed-up task is bound here in one governed version.
-    origin["prior_task_id"] = str(task_id)
-    origin["research_occasion"] = "user_followup"
-    origin["followup_note"] = note[:2000]
-    result["task"] = store.bump_input_version(
-        str(created.get("task_id") or ""),
-        payload_overrides={"origin": origin},
-        actor=actor, reason="user_followup")
-    return result
+        new_research=True,
+        spec_overrides={"origin": origin_override})
 
 
 def acknowledge_completed_research(store: TaskStore, *, actor: str, task_id: str,

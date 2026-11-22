@@ -178,10 +178,11 @@ async function main() {
     assert.ok(createdId, 'page reports the created task id');
     await page.locator(`tr[data-task="${createdId}"] td.status-queued`).waitFor();
     const createdState = state(createdId);
-    assert.equal(createdState.input_version, 2, 'selected source attached as governed v2');
-    assert.equal(createdState.snapshot_count, 2, 'v1 question and v2 attachment both preserved');
+    assert.equal(createdState.input_version, 1,
+      'the task is BORN claimable with its complete v1 input (documents included)');
+    assert.equal(createdState.snapshot_count, 1, 'the R01 snapshot chain starts at complete v1');
     assert.equal(createdState.evidence_documents.length, 1);
-    console.log(`PASS research created from the page (${createdId}); source attached as input v2 (snapshots=2)`);
+    console.log(`PASS research created from the page (${createdId}); complete v1 with the selected source (snapshots=1)`);
 
     // ---- 4) replay worker pass; view the result on the page ----
     const worked = work(createdId);
@@ -202,7 +203,8 @@ async function main() {
         detail.textContent.includes('REPLAY 草稿') && detail.textContent.includes('输入版本');
     }, createdId);
     const detailText = await page.locator('#detail').innerText();
-    assert.ok(detailText.includes('attach_personal_documents'), 'version history shows the attachment reason');
+    assert.ok(detailText.includes('所选原件：document:sha256:'),
+      'the v1 version history already names the selected source document');
     await page.screenshot({ path: path.join(shots, '02-replay-awaiting-detail.png'), fullPage: true });
     await page.keyboard.press('Escape');
     console.log('PASS replay result, pending question and input version history visible in the page');
@@ -216,12 +218,12 @@ async function main() {
     await page.locator(`tr[data-task="${createdId}"] td.status-queued`).waitFor();
     await page.waitForFunction(id => {
       const cell = document.querySelector(`tr[data-task="${id}"] td:nth-child(5)`);
-      return cell && cell.textContent.trim() === 'v3';
+      return cell && cell.textContent.trim() === 'v2';
     }, createdId);
     const followedState = state(createdId);
-    assert.equal(followedState.snapshot_count, 3, 'follow-up preserved v1/v2 and added v3');
+    assert.equal(followedState.snapshot_count, 2, 'follow-up preserved v1 and added v2');
     assert.equal(followedState.extra_note, note, 'the typed note is the persisted extra_note');
-    console.log('PASS follow-up from the page: input v3, snapshot chain 1→3, note persisted verbatim');
+    console.log('PASS follow-up from the page: input v2, snapshot chain 1→2, note persisted verbatim');
 
     // ---- 6) worker pass again, then personal sign-off through the page ----
     assert.equal(work(createdId).status, 'awaiting_human');
@@ -351,6 +353,40 @@ async function main() {
     assert.equal(state(noQuestionId).output_summary, outputBefore,
       'the finished output is preserved across the follow-up');
     console.log('PASS A90 proactive follow-up on a no-question result: new linked task, original output intact');
+    // 10a-2) lost-response retry: the first submission REACHES the server and
+    // commits, but its response is lost (fixture 503). Resending the SAME
+    // note must reuse the pending request id — had the page minted a fresh
+    // id, the retry would queue a SECOND task.
+    const retryNote = '主动追问：响应丢失后重发应复用同一任务。';
+    let interceptOnce = true;
+    await page.route('**/api/v1/workspace/followup', async route => {
+      if (interceptOnce) {
+        interceptOnce = false;
+        await route.fetch(); // the server commits the follow-up task…
+        await route.fulfill({status: 503, contentType: 'application/json',
+          body: JSON.stringify({error: 'fixture: response lost after commit'})}); // …response lost
+        return;
+      }
+      await route.continue();
+    });
+    const rowsBeforeRetry = await page.locator('tr[data-task]').count();
+    await page.locator(`form[data-task="${noQuestionId}"].ws-feedback textarea[name=note]`).fill(retryNote);
+    await page.locator(`form[data-task="${noQuestionId}"] button[data-ws="followup"]`).click();
+    await page.waitForFunction(() => (document.querySelector('#msg') || {}).textContent &&
+      document.querySelector('#msg').textContent.includes('操作被拒绝'));
+    await page.locator(`form[data-task="${noQuestionId}"] button[data-ws="followup"]`).click();
+    await page.waitForFunction(() => (document.querySelector('#msg') || {}).textContent &&
+      document.querySelector('#msg').textContent.includes('已记录追问'));
+    await page.unroute('**/api/v1/workspace/followup');
+    const rowsAfterRetry = await page.locator('tr[data-task]').count();
+    assert.equal(rowsAfterRetry, rowsBeforeRetry + 1,
+      'the lost-response retry reused the request id and queued exactly ONE task');
+    const retriedTaskId = await page.evaluate(() => {
+      const match = document.querySelector('#msg').textContent.match(/task_[0-9a-f]+/);
+      return match ? match[0] : '';
+    });
+    assert.equal(state(retriedTaskId).question, retryNote);
+    console.log('PASS lost-response follow-up retry: same request id resent, one task (server-side dedup)');
     // 10b) personal sign-off: acknowledgement ADDED to the preserved output.
     await page.locator(`form[data-task="${noQuestionId}"] button[data-ws="signoff"]`).click();
     await page.waitForFunction(() => (document.querySelector('#msg') || {}).textContent &&

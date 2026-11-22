@@ -190,29 +190,40 @@ class BrowserWiringTestCase(unittest.TestCase):
 
     # ---------------- create with documents ---------------- #
 
-    def test_a93_create_attaches_documents_as_new_input_version(self):
+    def test_a93_create_commits_complete_input_before_claimability(self):
         cookie = self._login()
         status, imported, _ = self._import_sample(cookie)
         document_id = imported["document"]["document_id"]
         status, created, _ = self._request(
             "POST", "/api/v1/workspace/create",
-            {"question": "A93 页面接线的样本研究问题？", "symbols": ["600519"],
+            {"question": "首次领取即可见原件的样本问题？", "symbols": ["600519"],
              "document_ids": [document_id]},
             cookie=cookie)
         self.assertEqual(status, 200)
         self.assertEqual(created["outcome"], "RECORDED")
         task_id = created["task_id"]
         task = self.store.get_task(task_id)
-        self.assertEqual(task["input_version"], 2,
-                         "attaching the selected source is a governed new input version")
         summaries = task["input_payload"]["public_context"]["evidence_summaries"]
         self.assertIn(document_id, summaries)
         self.assertEqual(summaries[document_id]["sha256"],
                          imported["document"]["sha256"])
+        # Independent connection: once the create response is back, the very
+        # FIRST claim already sees the selected source — the complete input
+        # committed together with the claimable state (no create→bump window).
+        second = TaskStore(self.config["task_runtime"]["db_path"])
+        self.addCleanup(second.close)
+        claimed = second.claim_next("w-concurrent")
+        self.assertEqual(claimed["task_id"], task_id)
+        self.assertIn(document_id,
+                      claimed["input_payload"]["public_context"]["evidence_summaries"])
+        self.assertEqual(claimed["input_version"], 1,
+                         "the task is born with its complete v1 input")
         snapshots = self.store.input_snapshots(task_id)
-        self.assertEqual([item["input_version"] for item in snapshots], [1, 2],
-                         "v1 (question) and v2 (attached source) both preserved")
-        self.assertEqual(snapshots[1]["reason"], "attach_personal_documents")
+        self.assertEqual([item["input_version"] for item in snapshots], [1],
+                         "the R01 snapshot chain starts at the complete v1")
+        self.assertEqual(sorted((snapshots[0]["payload"].get("public_context") or {})
+                                .get("evidence_summaries") or {}), [document_id],
+                         "the v1 snapshot itself carries the selected source")
 
     def test_a93_create_rejects_unknown_document(self):
         cookie = self._login()
@@ -238,7 +249,7 @@ class BrowserWiringTestCase(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(second["outcome"], "DUPLICATE")
         self.assertEqual(second["task_id"], first["task_id"])
-        self.assertEqual(self.store.get_task(first["task_id"])["input_version"], 2)
+        self.assertEqual(self.store.get_task(first["task_id"])["input_version"], 1)
 
     # ---------------- page rendering ---------------- #
 
@@ -323,7 +334,7 @@ class BrowserWiringTestCase(unittest.TestCase):
                                           csrf=False, cookie=cookie)
         self.assertEqual(status, 200)
         versions = detail["input_versions"]
-        self.assertEqual([item["input_version"] for item in versions], [1, 2])
+        self.assertEqual([item["input_version"] for item in versions], [1])
         self.assertEqual(versions[0]["reason"], "created")
 
     # ---------------- rework: failed create leaves no orphan ---------------- #
@@ -406,6 +417,61 @@ class BrowserWiringTestCase(unittest.TestCase):
         self.assertEqual(original["output"], before_output,
                          "the finished result is preserved byte-for-byte")
 
+    def test_a90_followup_task_claimable_only_with_complete_origin(self):
+        cookie = self._login()
+        task_id = self._succeeded_no_question_task(cookie, "A90 追问领取完整性的样本研究？")
+        task = self.store.get_task(task_id)
+        status, followed, _ = self._request(
+            "POST", "/api/v1/workspace/followup",
+            {"task_id": task_id, "expected_version": task["version"],
+             "extra_note": "主动追问：领取时前案链接必须已完整。"},
+            cookie=cookie)
+        self.assertEqual(status, 200)
+        # Independent connection: the FIRST claim of the follow-up task
+        # already sees the correct prior link and occasion — they rode the
+        # create transaction, not a later correction bump.
+        second = TaskStore(self.config["task_runtime"]["db_path"])
+        self.addCleanup(second.close)
+        claimed = second.claim_next("w-concurrent")
+        self.assertEqual(claimed["task_id"], followed["task_id"])
+        origin = claimed["input_payload"]["origin"]
+        self.assertEqual(origin["prior_task_id"], task_id)
+        self.assertEqual(origin["research_occasion"], "user_followup")
+        self.assertEqual(claimed["input_version"], 1,
+                         "the follow-up task is born complete (no correction bump)")
+
+    def test_a90_followup_retry_with_same_command_reuses_task(self):
+        cookie = self._login()
+        task_id = self._succeeded_no_question_task(cookie, "A90 追问重试去重的样本研究？")
+        task = self.store.get_task(task_id)
+        body = {"task_id": task_id, "expected_version": task["version"],
+                "extra_note": "主动追问：响应丢失后重发应复用同一任务。",
+                "command_id": "cmd-followup-retry-1"}
+        status, first, _ = self._request("POST", "/api/v1/workspace/followup",
+                                         body, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(first["outcome"], "RECORDED")
+        # The first submission succeeded but its response was lost: the page
+        # resends the SAME request id — one task, not two.
+        status, retry, _ = self._request("POST", "/api/v1/workspace/followup",
+                                         body, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(retry["outcome"], "DUPLICATE")
+        self.assertEqual(retry["task_id"], first["task_id"])
+        followups = [item for item in self.store.list_tasks()
+                     if item["task_id"] != task_id]
+        self.assertEqual(len(followups), 1, "the retry queued no second task")
+        # A genuinely new user action (fresh request id) still creates new work.
+        status, anew, _ = self._request(
+            "POST", "/api/v1/workspace/followup",
+            {"task_id": task_id, "expected_version": task["version"],
+             "extra_note": "主动追问：这是用户另行发起的第二次追问。",
+             "command_id": "cmd-followup-retry-2"},
+            cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(anew["outcome"], "RECORDED")
+        self.assertNotEqual(anew["task_id"], first["task_id"])
+
     def test_a90_signoff_on_no_question_completion(self):
         cookie = self._login()
         task_id = self._succeeded_no_question_task(cookie, "A90 签收无待答结果的样本研究？")
@@ -475,14 +541,14 @@ class BrowserWiringTestCase(unittest.TestCase):
                                           csrf=False, cookie=cookie)
         self.assertEqual(status, 200)
         versions = {item["input_version"]: item for item in detail["input_versions"]}
-        self.assertEqual(sorted(versions), [1, 2, 3])
-        self.assertEqual(versions[2]["evidence_documents"], [document_id],
-                         "the attachment version names the selected document")
-        self.assertEqual(versions[2]["reason"], "attach_personal_documents")
-        self.assertEqual(versions[3]["followup_note"], note,
+        self.assertEqual(sorted(versions), [1, 2])
+        self.assertEqual(versions[1]["evidence_documents"], [document_id],
+                         "the creation version already names the selected document")
+        self.assertEqual(versions[1]["reason"], "created")
+        self.assertEqual(versions[2]["followup_note"], note,
                          "the typed follow-up is readable at its version")
-        self.assertEqual(versions[3]["reason"], "human_provide_input")
-        self.assertEqual(versions[3]["evidence_documents"], [document_id],
+        self.assertEqual(versions[2]["reason"], "human_provide_input")
+        self.assertEqual(versions[2]["evidence_documents"], [document_id],
                          "the follow-up version still names the selected document")
 
     # ---------------- rework: buttons match state and session ---------------- #

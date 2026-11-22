@@ -408,30 +408,47 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   }
   // Delegated workspace actions: cancel / rerun row buttons plus the
   // plain-language awaiting feedback (acknowledge / reject / followup).
+  // A submission whose response was lost can be resent: the SAME note on the
+  // SAME form reuses the SAME request id, so the server deduplicates instead
+  // of queueing a second task; editing the note or a confirmed success mints
+  // a fresh id (a genuinely new user action).
+  function pendingCommand(group, noteText) {
+    if (!group) return '';
+    if (group.dataset.pendingCommand && group.dataset.pendingNote === noteText) {
+      return group.dataset.pendingCommand;
+    }
+    var cmd = (window.crypto && window.crypto.randomUUID)
+      ? window.crypto.randomUUID()
+      : 'cmd-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+    group.dataset.pendingCommand = cmd;
+    group.dataset.pendingNote = noteText;
+    return cmd;
+  }
   function workspaceAction(button) {
     var kind = button.getAttribute('data-ws');
     var taskId = button.getAttribute('data-task');
     var version = parseInt(button.getAttribute('data-version') || '0', 10);
     var group = tbody.querySelector('tr[data-taskform="' + taskId + '"] form');
     var note = group && group.querySelector('textarea[name=note]');
+    var noteText = note ? note.value : '';
     var body;
     if (kind === 'cancel') {
       body = {task_id: taskId, expected_version: version, reason: '网页取消'};
     } else if (kind === 'rerun') {
       body = {task_id: taskId, execution_mode: 'replay'};
     } else if (kind === 'followup') {
+      if (!noteText.trim()) { msg.textContent = '追问前请先写下问题或补充说明'; return; }
       body = {task_id: taskId, expected_version: version,
-              extra_note: note ? note.value : ''};
-      if (!body.extra_note.trim()) { msg.textContent = '追问前请先写下问题或补充说明'; return; }
+              extra_note: noteText, command_id: pendingCommand(group, noteText)};
     } else if (kind === 'acknowledge' || kind === 'reject') {
       body = {task_id: taskId, expected_version: version,
               decision: kind === 'acknowledge' ? 'acknowledge' : 'reject',
-              notes: note ? note.value : '', command_id: '', csrf_token: CSRF};
+              notes: noteText, command_id: pendingCommand(group, noteText), csrf_token: CSRF};
     } else if (kind === 'signoff') {
       // A90/A50: sign off an already-succeeded no-question result — the
       // workspace route ADDS the acknowledgement to the preserved output.
       body = {task_id: taskId, expected_version: version,
-              notes: note ? note.value : ''};
+              notes: noteText, command_id: pendingCommand(group, noteText)};
     } else {
       return;
     }
@@ -441,12 +458,19 @@ Personal acknowledgement is a personal research acknowledgement, not institution
     msg.textContent = '处理中…';
     wsPost(path, body).then(function(out) {
       if (out.ok) {
-        if (group) group.dataset.dirty = '';
+        if (group) {
+          group.dataset.dirty = '';
+          // Confirmed: the next submission on this form is a NEW action.
+          group.dataset.pendingCommand = '';
+          group.dataset.pendingNote = '';
+        }
         msg.textContent = '已' + ({cancel: '取消', rerun: '创建重新研究', followup: '记录追问',
                                    acknowledge: '签收', reject: '否定', signoff: '签收'})[kind] +
           (out.j.task_id ? ': ' + out.j.task_id : '');
         refresh();
       } else {
+        // Refused (or a lost-response retry arrives as an error): the pending
+        // id STAYS, so resending the same note reuses the same request.
         msg.textContent = '操作被拒绝: ' + (out.j.error || '') + (out.j.detail ? ' — ' + out.j.detail : '');
       }
     }).catch(function() { msg.textContent = '操作请求失败'; });
@@ -1306,7 +1330,10 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                         store, actor=session.actor,
                         task_id=str(body.get("task_id") or ""),
                         note=str(body.get("extra_note") or body.get("note") or ""),
-                        config=config)
+                        config=config,
+                        # The page's request id: a lost-response retry of ONE
+                        # submission reuses the task the intent already named.
+                        intent_id=str(body.get("command_id") or ""))
                     # Shape like the intake result so the generic response
                     # tail reports outcome + the followed-up task as prior.
                     result = {"task": followed.get("task") or followed,
