@@ -180,12 +180,27 @@ class WorkspaceRouteTests(R14BoardTestCase):
                          [task["input_version"], task["input_version"] + 1])
 
     def test_followup_rejected_when_not_awaiting(self):
-        task = self._seed_task(with_questions=False, state="succeeded")
+        # Unfinished, not awaiting: there is nothing to follow up on yet.
+        task = self._seed_task(with_questions=False, state="queued")
         status, body = self._workspace("followup", {
             "task_id": task["task_id"], "expected_version": task["version"],
             "note": "x"})
         self.assertEqual(status, 400)
-        self.assertEqual(body["error"], "not_awaiting")
+        self.assertEqual(body["error"], "not_succeeded")
+
+    def test_followup_on_succeeded_no_question_creates_linked_task(self):
+        # A90 rework: a no-question completion is follow-up-able — the note
+        # becomes a NEW linked question; the finished result is untouched.
+        task = self._seed_task(with_questions=False, state="succeeded")
+        status, body = self._workspace("followup", {
+            "task_id": task["task_id"], "expected_version": task["version"],
+            "extra_note": "主动追问：该结论的口径边界？"})
+        self.assertEqual(status, 200)
+        self.assertNotEqual(body["task_id"], task["task_id"])
+        origin = body["task"]["input_payload"]["origin"]
+        self.assertEqual(origin["prior_task_id"], task["task_id"])
+        self.assertEqual(origin["research_occasion"], "user_followup")
+        self.assertEqual(self.store.get_task(task["task_id"])["status"], "succeeded")
 
 
 class A90A91A92Tests(R14BoardTestCase):

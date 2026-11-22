@@ -23,6 +23,8 @@ from .config import project_path
 from .models import now_iso
 from .task_runtime import (
     STATUS_AWAITING_HUMAN,
+    STATUS_SUCCEEDED,
+    TERMINAL_STATUSES,
     HUMAN_DECISIONS,
     TaskRuntimeError,
     TaskStore,
@@ -51,17 +53,62 @@ def _board_state(store: TaskStore, config: Optional[Dict[str, Any]] = None) -> D
     }
 
 
-def _action_buttons(task: Dict[str, Any], task_id: str, version: str) -> str:
-    """A93 row actions: cancel while unfinished, explicit re-research after a
-    terminal/awaiting state. Plain buttons — no actor, no English decision
-    strings, no JSON patch (taskbook R14 feedback rule)."""
+def _action_buttons(task: Dict[str, Any], task_id: str, version: str, *,
+                    logged_in: bool) -> str:
+    """A93 row actions, shown ONLY to a logged-in principal (every target
+    route is session-gated). The terminal set mirrors the backend's
+    TERMINAL_STATUSES exactly — a rejected (blocked) row offers re-research,
+    not a cancel the store would refuse. Plain buttons — no actor, no English
+    decision strings, no JSON patch (taskbook R14 feedback rule)."""
+    if not logged_in:
+        return ""
     status = str(task.get("status") or "")
     buttons = []
-    if status not in ("succeeded", "failed", "cancelled", "expired"):
+    if status not in TERMINAL_STATUSES:
         buttons.append('<button type="button" class="act" data-ws="cancel" data-task="{0}" data-version="{1}">取消</button>'.format(task_id, version))
-    if status in ("succeeded", "failed", "cancelled", "expired", "awaiting_human"):
+    if status in TERMINAL_STATUSES or status == STATUS_AWAITING_HUMAN:
         buttons.append('<button type="button" class="act" data-ws="rerun" data-task="{0}">重新研究</button>'.format(task_id))
     return '<span class="acts">{0}</span>'.format("".join(buttons)) if buttons else ""
+
+
+def _feedback_row(task: Dict[str, Any], task_id: str, version: str) -> str:
+    """A64/A90 plain-language feedback row (session mode, logged in only —
+    the caller gates it).
+
+    - awaiting_human: the model's question plus 签收/否定/追问补证;
+    - succeeded without a pending question: the result is final, but the user
+      can STILL proactively follow up (A90 — new linked task) and sign off
+      (A50 — acknowledgement added to the preserved output).
+    """
+    status = str(task.get("status") or "")
+    if status == STATUS_AWAITING_HUMAN:
+        human_request = task.get("human_request") or {}
+        question = _esc(str(human_request.get("question") or ""))
+        if not question:
+            return ""
+        return (
+            '<tr data-taskform="{0}"><td colspan="8"><div class="feedback"><em>{1}</em>'
+            '<form data-task="{0}" data-version="{2}" class="ws-feedback">'
+            '<textarea name="note" placeholder="追问或补充说明（普通文字）"></textarea>'
+            '<button type="button" data-ws="acknowledge" data-task="{0}" data-version="{2}">签收（个人确认，非机构批准）</button>'
+            '<button type="button" data-ws="reject" data-task="{0}" data-version="{2}">否定（理由写在上方）</button>'
+            '<button type="button" data-ws="followup" data-task="{0}" data-version="{2}">提交追问/补证</button>'
+            '</form></div></td></tr>'
+        ).format(task_id, question, version)
+    if status == STATUS_SUCCEEDED:
+        output = task.get("output") if isinstance(task.get("output"), dict) else {}
+        acknowledged = bool(isinstance(output.get("personal_acknowledgement"), dict)
+                            and output.get("personal_acknowledgement"))
+        buttons = ['<button type="button" data-ws="followup" data-task="{0}" data-version="{1}">提交追问（针对该结果）</button>'.format(task_id, version)]
+        if not acknowledged:
+            buttons.insert(0, '<button type="button" data-ws="signoff" data-task="{0}" data-version="{1}">签收（个人确认，非机构批准）</button>'.format(task_id, version))
+        return (
+            '<tr data-taskform="{0}"><td colspan="8"><div class="feedback">'
+            '<form data-task="{0}" data-version="{2}" class="ws-feedback">'
+            '<textarea name="note" placeholder="追问该结果的问题（普通文字，将作为新的关联研究）"></textarea>'
+            '{3}</form></div></td></tr>'
+        ).format(task_id, "", version, "".join(buttons))
+    return ""
 
 
 def _personal_panel_html(session_mode: bool, session_actor: str) -> Tuple[str, str]:
@@ -102,6 +149,7 @@ def _personal_panel_html(session_mode: bool, session_actor: str) -> Tuple[str, s
 
 def _render_html(state: Dict[str, Any], csrf_token: str, *,
                  session_mode: bool = False, session_actor: str = "") -> str:
+    logged_in = bool(session_mode and session_actor)
     rows = []
     for task in state.get("tasks", []):
         mode = "REPLAY" if task.get("is_replay") else "LIVE"
@@ -118,31 +166,24 @@ def _render_html(state: Dict[str, Any], csrf_token: str, *,
             version,
             _esc(str((task.get("model_call") or {}).get("error") or (task.get("last_error") or ""))[:120]),
             task_id,
-            _action_buttons(task, task_id, version),
+            _action_buttons(task, task_id, version, logged_in=logged_in),
         )
-        human_request = task.get("human_request") or {}
-        if task.get("status") == STATUS_AWAITING_HUMAN and human_request.get("question"):
-            if session_mode:
-                # A93: plain-language personal feedback (taskbook: 反馈使用
-                # 明确按钮和普通文字，不要求 actor/英文 decision/JSON patch).
-                row += (
-                    '<tr data-taskform="{0}"><td colspan="8"><div class="feedback"><em>{1}</em>'
-                    '<form data-task="{0}" data-version="{2}" class="ws-feedback">'
-                    '<textarea name="note" placeholder="追问或补充说明（普通文字）"></textarea>'
-                    '<button type="button" data-ws="acknowledge" data-task="{0}" data-version="{2}">签收（个人确认，非机构批准）</button>'
-                    '<button type="button" data-ws="reject" data-task="{0}" data-version="{2}">否定（理由写在上方）</button>'
-                    '<button type="button" data-ws="followup" data-task="{0}" data-version="{2}">提交追问/补证</button>'
-                    '</form></div></td></tr>'
-                ).format(task_id, _esc(str(human_request.get("question") or "")), version)
-            else:
-                row += (
-                    '<tr data-taskform="{0}"><td colspan="8"><div class="feedback"><em>{1}</em>'
-                    '<form data-task="{0}" data-version="{2}">'
-                    '<input name="actor" placeholder="actor" required>'
-                    '<select name="decision"><option>acknowledge</option><option>reject</option><option>provide_input</option></select>'
-                    '<input name="input_patch" placeholder="JSON patch (provide_input)">'
-                    '<input name="notes" placeholder="notes"><button type="submit">Submit</button></form></div></td></tr>'
-                ).format(task_id, _esc(str(human_request.get("question") or "")), version)
+        if logged_in:
+            # A64/A90: plain-language personal feedback (taskbook: 反馈使用
+            # 明确按钮和普通文字，不要求 actor/英文 decision/JSON patch).
+            row += _feedback_row(task, task_id, version)
+        elif (not session_mode and task.get("status") == STATUS_AWAITING_HUMAN
+              and (task.get("human_request") or {}).get("question")):
+            # Legacy rollback page only: session-mode pages never show the
+            # form-actor path (a logged-out visitor has nothing that works).
+            row += (
+                '<tr data-taskform="{0}"><td colspan="8"><div class="feedback"><em>{1}</em>'
+                '<form data-task="{0}" data-version="{2}">'
+                '<input name="actor" placeholder="actor" required>'
+                '<select name="decision"><option>acknowledge</option><option>reject</option><option>provide_input</option></select>'
+                '<input name="input_patch" placeholder="JSON patch (provide_input)">'
+                '<input name="notes" placeholder="notes"><button type="submit">Submit</button></form></div></td></tr>'
+            ).format(task_id, _esc(str(task["human_request"].get("question") or "")), version)
         rows.append(row)
     panel_html, panel_hidden = _personal_panel_html(session_mode, session_actor)
     page = (_PAGE_TEMPLATE
@@ -251,6 +292,10 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   var CSRF = __CSRF_JSON__;
   var SESSION_MODE = __SESSION_MODE_JSON__;
   var SESSION_ACTOR = __SESSION_ACTOR_JSON__;
+  var LOGGED_IN = SESSION_MODE && !!SESSION_ACTOR;
+  // Mirrors the backend TERMINAL_STATUSES — blocked IS terminal, so a
+  // rejected row offers re-research, never a cancel the store would refuse.
+  var TERMINAL = ['succeeded', 'failed', 'blocked', 'cancelled', 'expired'];
   var tbody = document.getElementById('tasks');
   var conn = document.getElementById('conn');
   var msg = document.getElementById('msg');
@@ -382,20 +427,25 @@ Personal acknowledgement is a personal research acknowledgement, not institution
       body = {task_id: taskId, expected_version: version,
               decision: kind === 'acknowledge' ? 'acknowledge' : 'reject',
               notes: note ? note.value : '', command_id: '', csrf_token: CSRF};
+    } else if (kind === 'signoff') {
+      // A90/A50: sign off an already-succeeded no-question result — the
+      // workspace route ADDS the acknowledgement to the preserved output.
+      body = {task_id: taskId, expected_version: version,
+              notes: note ? note.value : ''};
     } else {
       return;
     }
     var path = (kind === 'cancel' || kind === 'rerun' || kind === 'followup')
-      ? '/api/v1/workspace/' + kind : '/api/v1/human-responses';
+      ? '/api/v1/workspace/' + kind
+      : (kind === 'signoff' ? '/api/v1/workspace/acknowledge' : '/api/v1/human-responses');
     msg.textContent = '处理中…';
     wsPost(path, body).then(function(out) {
       if (out.ok) {
         if (group) group.dataset.dirty = '';
         msg.textContent = '已' + ({cancel: '取消', rerun: '创建重新研究', followup: '记录追问',
-                                   acknowledge: '签收', reject: '否定'})[kind] +
+                                   acknowledge: '签收', reject: '否定', signoff: '签收'})[kind] +
           (out.j.task_id ? ': ' + out.j.task_id : '');
-        if (kind === 'followup') { refresh(); loadDocuments(); }
-        else refresh();
+        refresh();
       } else {
         msg.textContent = '操作被拒绝: ' + (out.j.error || '') + (out.j.detail ? ' — ' + out.j.detail : '');
       }
@@ -411,15 +461,46 @@ Personal acknowledgement is a personal research acknowledgement, not institution
     });
   }
   function actionButtons(t) {
+    if (!LOGGED_IN) return '';
     var buttons = '';
-    if (['succeeded', 'failed', 'cancelled', 'expired'].indexOf(t.status) === -1) {
+    if (TERMINAL.indexOf(t.status) === -1) {
       buttons += '<button type="button" class="act" data-ws="cancel" data-task="' + esc(t.task_id) +
         '" data-version="' + esc(t.version) + '">取消</button>';
     }
-    if (['succeeded', 'failed', 'cancelled', 'expired', 'awaiting_human'].indexOf(t.status) !== -1) {
+    if (TERMINAL.indexOf(t.status) !== -1 || t.status === 'awaiting_human') {
       buttons += '<button type="button" class="act" data-ws="rerun" data-task="' + esc(t.task_id) + '">重新研究</button>';
     }
     return buttons ? '<span class="acts">' + buttons + '</span>' : '';
+  }
+  function feedbackRow(t) {
+    // Mirrors the server-side _feedback_row: awaiting gets the question +
+    // 签收/否定/追问; a succeeded no-question result STILL gets 追问 (A90,
+    // new linked task) and 签收 until acknowledged (A50).
+    if (t.status === 'awaiting_human' && t.human_request && t.human_request.question) {
+      return '<tr data-taskform="' + esc(t.task_id) + '"><td colspan="8"><div class="feedback"><em>' + esc(t.human_request.question) + '</em>' +
+        '<form data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '" class="ws-feedback">' +
+        '<textarea name="note" placeholder="追问或补充说明（普通文字）"></textarea>' +
+        '<button type="button" data-ws="acknowledge" data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">签收（个人确认，非机构批准）</button>' +
+        '<button type="button" data-ws="reject" data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">否定（理由写在上方）</button>' +
+        '<button type="button" data-ws="followup" data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">提交追问/补证</button>' +
+        '</form></div></td></tr>';
+    }
+    if (t.status === 'succeeded') {
+      var output = t.output || {};
+      var acknowledged = !!(output.personal_acknowledgement &&
+        typeof output.personal_acknowledgement === 'object');
+      var buttons = '<button type="button" data-ws="followup" data-task="' + esc(t.task_id) +
+        '" data-version="' + esc(t.version) + '">提交追问（针对该结果）</button>';
+      if (!acknowledged) {
+        buttons = '<button type="button" data-ws="signoff" data-task="' + esc(t.task_id) +
+          '" data-version="' + esc(t.version) + '">签收（个人确认，非机构批准）</button>' + buttons;
+      }
+      return '<tr data-taskform="' + esc(t.task_id) + '"><td colspan="8"><div class="feedback">' +
+        '<form data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '" class="ws-feedback">' +
+        '<textarea name="note" placeholder="追问该结果的问题（普通文字，将作为新的关联研究）"></textarea>' +
+        buttons + '</form></div></td></tr>';
+    }
+    return '';
   }
   function rowHtml(t) {
     var mode = t.is_replay ? 'REPLAY' : 'LIVE';
@@ -428,23 +509,15 @@ Personal acknowledgement is a personal research acknowledgement, not institution
       '<td class="status-' + esc(t.status) + '">' + esc(t.status) + '</td><td>' + esc(t.title) +
       '<small class="summary-state">Summary: ' + esc((t.summary_review || {}).status || 'not_submitted') + '</small></td>' +
       '<td>v' + esc(t.input_version) + '</td><td>#' + esc(t.version) + '</td><td>' + esc(err) + '</td><td>' + actionButtons(t) + '</td></tr>';
-    if (t.status === 'awaiting_human' && t.human_request && t.human_request.question) {
-      if (SESSION_MODE) {
-        base += '<tr data-taskform="' + esc(t.task_id) + '"><td colspan="8"><div class="feedback"><em>' + esc(t.human_request.question) + '</em>' +
-          '<form data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '" class="ws-feedback">' +
-          '<textarea name="note" placeholder="追问或补充说明（普通文字）"></textarea>' +
-          '<button type="button" data-ws="acknowledge" data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">签收（个人确认，非机构批准）</button>' +
-          '<button type="button" data-ws="reject" data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">否定（理由写在上方）</button>' +
-          '<button type="button" data-ws="followup" data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">提交追问/补证</button>' +
-          '</form></div></td></tr>';
-      } else {
-        base += '<tr data-taskform="' + esc(t.task_id) + '"><td colspan="8"><div class="feedback"><em>' + esc(t.human_request.question) + '</em>' +
-          '<form data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">' +
-          '<input name="actor" placeholder="actor" required>' +
-          '<select name="decision"><option>acknowledge</option><option>reject</option><option>provide_input</option></select>' +
-          '<input name="input_patch" placeholder="JSON patch (provide_input)">' +
-          '<input name="notes" placeholder="notes"><button type="submit">Submit</button></form></div></td></tr>';
-      }
+    if (LOGGED_IN) {
+      base += feedbackRow(t);
+    } else if (!SESSION_MODE && t.status === 'awaiting_human' && t.human_request && t.human_request.question) {
+      base += '<tr data-taskform="' + esc(t.task_id) + '"><td colspan="8"><div class="feedback"><em>' + esc(t.human_request.question) + '</em>' +
+        '<form data-task="' + esc(t.task_id) + '" data-version="' + esc(t.version) + '">' +
+        '<input name="actor" placeholder="actor" required>' +
+        '<select name="decision"><option>acknowledge</option><option>reject</option><option>provide_input</option></select>' +
+        '<input name="input_patch" placeholder="JSON patch (provide_input)">' +
+        '<input name="notes" placeholder="notes"><button type="submit">Submit</button></form></div></td></tr>';
     }
     return base;
   }
@@ -836,8 +909,12 @@ Personal acknowledgement is a personal research acknowledgement, not institution
         }).join('') : '') +
       ((d.input_versions || []).length ? '<div class="sec">输入版本（' + d.input_versions.length + '，只读）</div>' +
         d.input_versions.map(function(v) {
+          var docs = v.evidence_documents || [];
           return '<div class="round">v' + esc(v.input_version) + ' · ' + esc(v.reason || '') +
-            ' · ' + esc(String(v.created_at || '').replace('T', ' ').slice(0, 19)) + '</div>';
+            ' · ' + esc(String(v.created_at || '').replace('T', ' ').slice(0, 19)) +
+            (v.followup_note ? '<div class="why">追问原文：' + esc(v.followup_note) + '</div>' : '') +
+            (docs.length ? '<div class="why">所选原件：' + docs.map(function(id) { return esc(id); }).join(' · ') + '</div>' : '') +
+            '</div>';
         }).join('') : '') +
       (d.personal_acknowledgement ? '<div class="sec">个人签收（非机构批准）</div>' +
         '<dl><dt>by</dt><dd>' + esc(d.personal_acknowledgement.actor || '') + '</dd>' +
@@ -1213,13 +1290,36 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     expected_version=int(body.get("expected_version") or 0),
                     reason=str(body.get("reason") or ""))}
             elif action == "followup":
-                result = {"task": personal_workspace.follow_up_awaiting(
+                # A64 while awaiting (same task, input version bump) vs A90
+                # on a finished no-question result (new linked task).
+                follow_task = store.get_task(str(body.get("task_id") or ""))
+                if follow_task["status"] == "awaiting_human":
+                    result = {"task": personal_workspace.follow_up_awaiting(
+                        store, actor=session.actor,
+                        task_id=str(body.get("task_id") or ""),
+                        expected_version=int(body.get("expected_version") or 0),
+                        note=str(body.get("note") or ""),
+                        extra_note=str(body.get("extra_note") or ""),
+                        command_id=str(body.get("command_id") or ""))}
+                else:
+                    followed = personal_workspace.follow_up_completed_research(
+                        store, actor=session.actor,
+                        task_id=str(body.get("task_id") or ""),
+                        note=str(body.get("extra_note") or body.get("note") or ""),
+                        config=config)
+                    # Shape like the intake result so the generic response
+                    # tail reports outcome + the followed-up task as prior.
+                    result = {"task": followed.get("task") or followed,
+                              "status": followed.get("status"),
+                              "supersedes_task_id": str(body.get("task_id") or "")}
+            elif action == "acknowledge":
+                # A90/A50: personal sign-off on an already-succeeded result
+                # (the awaiting_human path stays on /api/v1/human-responses).
+                result = {"task": personal_workspace.acknowledge_completed_research(
                     store, actor=session.actor,
                     task_id=str(body.get("task_id") or ""),
                     expected_version=int(body.get("expected_version") or 0),
-                    note=str(body.get("note") or ""),
-                    extra_note=str(body.get("extra_note") or ""),
-                    command_id=str(body.get("command_id") or ""))}
+                    note=str(body.get("notes") or body.get("note") or ""))}
             else:  # rerun
                 result = personal_workspace.rerun_completed_research(
                     store, actor=session.actor,
@@ -1442,6 +1542,9 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/v1/workspace/followup":
             self._handle_workspace("followup")
+            return
+        if parsed.path == "/api/v1/workspace/acknowledge":
+            self._handle_workspace("acknowledge")
             return
         if parsed.path == "/api/v1/workspace/rerun":
             self._handle_workspace("rerun")

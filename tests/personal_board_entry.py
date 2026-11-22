@@ -88,6 +88,18 @@ def cmd_work(args: argparse.Namespace) -> int:
         if args.task_id and claimed["task_id"] != args.task_id:
             raise SystemExit(
                 "claim mismatch: wanted {0} got {1}".format(args.task_id, claimed["task_id"]))
+        if args.replay_no_questions:
+            # Fixture prep through the GOVERNED input-version bump (auditable,
+            # never raw SQL): the recorded replay answer carries no question,
+            # so the run lands succeeded — the A90 no-question completion.
+            payload = store.get_task(claimed["task_id"])["input_payload"]
+            replay = dict(payload.get("replay_response") or {})
+            replay["human_questions"] = []
+            store.bump_input_version(
+                claimed["task_id"],
+                payload_overrides={"replay_response": replay},
+                actor="fixture-replay",
+                reason="fixture: replay without human questions")
         # The replay worker runs against the OWNER's personal vault view, so
         # the imported sources are verifiable in the namespace that owns them.
         view = personal_vault_view(config, OWNER)
@@ -115,6 +127,8 @@ def cmd_state(args: argparse.Namespace) -> int:
         payload = task.get("input_payload") or {}
         summaries = ((payload.get("public_context") or {})
                      .get("evidence_summaries") or {})
+        delivery = ((task.get("model_call") or {})
+                    .get("context_delivery") or {})
         print(json.dumps({
             "task_id": task["task_id"],
             "status": task["status"],
@@ -124,6 +138,8 @@ def cmd_state(args: argparse.Namespace) -> int:
             "question": payload.get("research_question"),
             "extra_note": payload.get("extra_note"),
             "evidence_documents": sorted(summaries),
+            "dropped_evidence": delivery.get("dropped_evidence") or [],
+            "delivered_evidence": delivery.get("delivered_evidence") or [],
             "snapshot_count": len(store.input_snapshots(args.task_id)),
             "has_output": bool(output),
             "output_summary": str(output.get("summary") or "")[:200],
@@ -152,6 +168,9 @@ def main() -> int:
     work.add_argument("--config", required=True)
     work.add_argument("--task-id", default="")
     work.add_argument("--worker-id", default="w-a93-browser")
+    work.add_argument("--replay-no-questions", action="store_true",
+                      help="fixture: strip human_questions from the recorded replay answer "
+                           "(governed input-version bump) before the run")
 
     state = sub.add_parser("state")
     state.add_argument("--root", required=True)

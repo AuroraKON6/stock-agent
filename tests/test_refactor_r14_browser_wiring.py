@@ -326,6 +326,224 @@ class BrowserWiringTestCase(unittest.TestCase):
         self.assertEqual([item["input_version"] for item in versions], [1, 2])
         self.assertEqual(versions[0]["reason"], "created")
 
+    # ---------------- rework: failed create leaves no orphan ---------------- #
+
+    def test_a93_failed_create_leaves_queue_empty_then_retry_creates_one(self):
+        cookie = self._login()
+        question = "失败重试语义的样本问题？"
+        status, body, _ = self._request(
+            "POST", "/api/v1/workspace/create",
+            {"question": question, "symbols": ["600519"],
+             "document_ids": ["doc_does_not_exist"]},
+            cookie=cookie)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "unknown_document")
+        self.assertEqual(self.store.list_tasks(), [],
+                         "a failed create must leave the queue untouched")
+        status, imported, _ = self._import_sample(cookie)
+        document_id = imported["document"]["document_id"]
+        status, created, _ = self._request(
+            "POST", "/api/v1/workspace/create",
+            {"question": question, "symbols": ["600519"],
+             "document_ids": [document_id]},
+            cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(created["outcome"], "RECORDED")
+        tasks = self.store.list_tasks()
+        self.assertEqual(len(tasks), 1, "retry creates exactly ONE task")
+        payload = tasks[0]["input_payload"]
+        self.assertIn(document_id, payload["public_context"]["evidence_summaries"],
+                      "the worker reads the selected source on first claim")
+
+    # ---------------- rework: A90 no-question completion ---------------- #
+
+    def _succeeded_no_question_task(self, cookie, question):
+        status, created, _ = self._request(
+            "POST", "/api/v1/workspace/create",
+            {"question": question, "symbols": ["600519"]}, cookie=cookie)
+        self.assertEqual(status, 200)
+        task_id = created["task_id"]
+        claimed = self.store.claim_next("w-o-layer")
+        self.assertEqual(claimed["task_id"], task_id)
+        # Fixture prep through the GOVERNED version bump (auditable, no raw
+        # SQL): the recorded replay answer carries no human question.
+        payload = self.store.get_task(task_id)["input_payload"]
+        replay = dict(payload.get("replay_response") or {})
+        replay["human_questions"] = []
+        self.store.bump_input_version(
+            task_id, payload_overrides={"replay_response": replay},
+            actor="fixture-replay", reason="fixture: replay without human questions")
+        from stock_agent.research_worker import run_research_task
+
+        result = run_research_task(self.store, task_id, worker_id="w-o-layer",
+                                   config=self.config)
+        self.assertEqual(result["status"], "succeeded")
+        return task_id
+
+    def test_a90_followup_on_no_question_completion_creates_linked_task(self):
+        cookie = self._login()
+        task_id = self._succeeded_no_question_task(cookie, "A90 无待答问题的样本研究？")
+        before = self.store.get_task(task_id)
+        before_output = before["output"]
+        followup_note = "主动追问：样本结论对下游口径是否稳健？"
+        status, followed, _ = self._request(
+            "POST", "/api/v1/workspace/followup",
+            {"task_id": task_id, "expected_version": before["version"],
+             "extra_note": followup_note},
+            cookie=cookie)
+        self.assertEqual(status, 200)
+        new_id = followed["task_id"]
+        self.assertNotEqual(new_id, task_id)
+        new_task = self.store.get_task(new_id)
+        origin = new_task["input_payload"]["origin"]
+        self.assertEqual(origin["prior_task_id"], task_id)
+        self.assertEqual(origin["research_occasion"], "user_followup")
+        self.assertEqual(origin["followup_note"], followup_note)
+        self.assertEqual(new_task["input_payload"]["research_question"], followup_note,
+                         "the follow-up text is readable back as the new question")
+        original = self.store.get_task(task_id)
+        self.assertEqual(original["status"], "succeeded")
+        self.assertEqual(original["output"], before_output,
+                         "the finished result is preserved byte-for-byte")
+
+    def test_a90_signoff_on_no_question_completion(self):
+        cookie = self._login()
+        task_id = self._succeeded_no_question_task(cookie, "A90 签收无待答结果的样本研究？")
+        task = self.store.get_task(task_id)
+        summary_before = task["output"].get("summary")
+        status, signed, _ = self._request(
+            "POST", "/api/v1/workspace/acknowledge",
+            {"task_id": task_id, "expected_version": task["version"],
+             "notes": "样本签收（页面验收）"},
+            cookie=cookie)
+        self.assertEqual(status, 200)
+        after = self.store.get_task(task_id)
+        self.assertEqual(after["status"], "succeeded")
+        acknowledgement = after["output"]["personal_acknowledgement"]
+        self.assertEqual(acknowledgement["actor"], OWNER)
+        self.assertEqual(acknowledgement["scope"],
+                         "personal_research_acknowledgement_not_institutional_approval")
+        self.assertEqual(after["output"].get("summary"), summary_before,
+                         "sign-off adds the record without rewriting the output")
+        status, again, _ = self._request(
+            "POST", "/api/v1/workspace/acknowledge",
+            {"task_id": task_id, "expected_version": after["version"]},
+            cookie=cookie)
+        self.assertEqual(status, 400)
+        self.assertEqual(again["error"], "already_acknowledged")
+
+    def test_a90_signoff_rejects_unfinished_tasks(self):
+        cookie = self._login()
+        status, created, _ = self._request(
+            "POST", "/api/v1/workspace/create",
+            {"question": "签收门控的样本问题？", "symbols": ["600519"]}, cookie=cookie)
+        task_id = created["task_id"]
+        status, body, _ = self._request(
+            "POST", "/api/v1/workspace/acknowledge",
+            {"task_id": task_id, "expected_version": 1}, cookie=cookie)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"], "not_succeeded")
+
+    # ---------------- rework: A67 version reads back the feedback ---------------- #
+
+    def test_a67_versions_expose_followup_note_and_selected_documents(self):
+        cookie = self._login()
+        status, imported, _ = self._import_sample(cookie)
+        document_id = imported["document"]["document_id"]
+        status, created, _ = self._request(
+            "POST", "/api/v1/workspace/create",
+            {"question": "版本读回的样本问题？", "symbols": ["600519"],
+             "document_ids": [document_id]},
+            cookie=cookie)
+        task_id = created["task_id"]
+        claimed = self.store.claim_next("w-o-layer")
+        self.assertEqual(claimed["task_id"], task_id)
+        from stock_agent.research_worker import run_research_task
+
+        result = run_research_task(self.store, task_id, worker_id="w-o-layer",
+                                   config=self.config)
+        self.assertEqual(result["status"], "awaiting_human")
+        awaiting = self.store.get_task(task_id)
+        note = "版本读回：请补充分季度口径。"
+        status, _, _ = self._request(
+            "POST", "/api/v1/workspace/followup",
+            {"task_id": task_id, "expected_version": awaiting["version"],
+             "extra_note": note},
+            cookie=cookie)
+        self.assertEqual(status, 200)
+        status, detail, _ = self._request("GET", "/api/v1/tasks/{0}".format(task_id),
+                                          csrf=False, cookie=cookie)
+        self.assertEqual(status, 200)
+        versions = {item["input_version"]: item for item in detail["input_versions"]}
+        self.assertEqual(sorted(versions), [1, 2, 3])
+        self.assertEqual(versions[2]["evidence_documents"], [document_id],
+                         "the attachment version names the selected document")
+        self.assertEqual(versions[2]["reason"], "attach_personal_documents")
+        self.assertEqual(versions[3]["followup_note"], note,
+                         "the typed follow-up is readable at its version")
+        self.assertEqual(versions[3]["reason"], "human_provide_input")
+        self.assertEqual(versions[3]["evidence_documents"], [document_id],
+                         "the follow-up version still names the selected document")
+
+    # ---------------- rework: buttons match state and session ---------------- #
+
+    def _render_with(self, status, *, output=None, session_mode=True, session_actor=OWNER):
+        from stock_agent.task_board import _render_html
+
+        state = {"schema_version": "1.0", "generated_at": "", "summary": {},
+                 "tasks": [{"task_id": "task_btn", "is_replay": True,
+                            "status": status, "title": "按钮态样本",
+                            "input_version": 1, "version": 4, "model_call": {},
+                            "last_error": "", "human_request": {},
+                            "output": output or {}}]}
+        page = _render_html(state, "csrf", session_mode=session_mode,
+                            session_actor=session_actor)
+        row_start = page.index('data-task="task_btn"')
+        return page, page[row_start:page.index("</tr>", row_start)]
+
+    def test_buttons_blocked_row_offers_rerun_not_cancel(self):
+        page, row = self._render_with("blocked")
+        self.assertNotIn('data-ws="cancel"', row,
+                         "blocked is terminal — the store would refuse the cancel")
+        self.assertIn('data-ws="rerun"', row)
+
+    def test_buttons_succeeded_unacknowledged_offers_signoff_and_followup(self):
+        page, row_and_form = self._render_with("succeeded")
+        self.assertIn('data-ws="signoff"', page)
+        self.assertIn('data-ws="followup"', page)
+        acknowledged = self._render_with(
+            "succeeded", output={"personal_acknowledgement": {"actor": OWNER}})[0]
+        acknowledged_markup = acknowledged.split("<script>")[0]
+        self.assertNotIn('data-ws="signoff"', acknowledged_markup,
+                         "an already-signed result hides the sign-off button")
+        self.assertIn('data-ws="followup"', acknowledged_markup)
+
+    def test_buttons_logged_out_and_legacy_show_no_session_actions(self):
+        page, row = self._render_with("queued", session_mode=True, session_actor="")
+        self.assertNotIn("data-ws=", row,
+                         "logged-out pages show no session-gated action buttons")
+        from stock_agent.task_board import _render_html
+
+        state = {"schema_version": "1.0", "generated_at": "", "summary": {},
+                 "tasks": [{"task_id": "task_btn", "is_replay": True,
+                            "status": "awaiting_human", "title": "t",
+                            "input_version": 1, "version": 4,
+                            "model_call": {}, "last_error": "",
+                            "human_request": {"question": "样本问题？"}}]}
+        # Assert on the SSR MARKUP only — the template's JS source always
+        # contains the class/button strings for the client renderer.
+        logged_out = _render_html(state, "csrf", session_mode=True, session_actor="")
+        logged_out_markup = logged_out.split("<script>")[0]
+        self.assertNotIn("<tr data-taskform", logged_out_markup,
+                         "logged-out session pages render no feedback form row")
+        self.assertNotIn('placeholder="actor"', logged_out_markup,
+                         "the legacy feedback form never appears on session pages")
+        legacy = _render_html(state, "csrf")
+        legacy_markup = legacy.split("<script>")[0]
+        self.assertIn('name="actor" placeholder="actor"', legacy_markup,
+                      "legacy rollback pages keep their form")
+        self.assertNotIn("data-ws=", legacy_markup)
+
 
 if __name__ == "__main__":
     unittest.main()

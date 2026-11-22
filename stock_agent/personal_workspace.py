@@ -12,21 +12,28 @@ future façade share one behavior set:
   wins at the next worker checkpoint.
 - **follow-up while awaiting**: provide_input bumps input_version (R01
   snapshot chain) — the input is preserved, never overwritten.
-- **re-research after completion (A90/A91/A92)**: the model NOT asking a
-  question never blocks the user; an explicit rerun creates a NEW business
-  intent with as_of recorded and prior_task_id linked — the old terminal
-  result stays untouched, while a network retry of the SAME intent still
-  deduplicates.
+- **follow-up after a no-question completion (A90)**: the model asking
+  nothing must not end the conversation — the user's follow-up question
+  becomes a NEW linked task (prior_task_id + user_followup occasion) and the
+  finished result stays byte-for-byte intact.
+- **personal sign-off on a no-question completion (A90/A50)**: a succeeded
+  result with no pending question can still be acknowledged personally; the
+  acknowledgement is ADDED to the preserved output, never rewriting it.
+- **re-research after completion (A90/A91/A92)**: an explicit rerun creates a
+  NEW business intent with as_of recorded and prior_task_id linked — the old
+  terminal result stays untouched, while a network retry of the SAME intent
+  still deduplicates.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .models import now_iso
 from .task_intake import ensure_question_task
 from .task_runtime import TaskStore
 from .task_runtime.store import (
     STATUS_AWAITING_HUMAN,
+    STATUS_SUCCEEDED,
     TERMINAL_STATUSES,
     TaskRuntimeError,
     TaskVersionConflictError,
@@ -35,7 +42,35 @@ from .task_runtime.store import (
 
 class WorkspaceError(ValueError):
     """reason codes: empty_question, no_symbols, unknown_task, task_terminal,
-    not_awaiting, cancel_terminal"""
+    not_awaiting, not_succeeded, cancel_terminal, unknown_document,
+    empty_note, already_acknowledged"""
+
+
+def _resolve_personal_documents(config: Optional[Dict[str, Any]], actor: str,
+                                document_ids: Optional[list]) -> Dict[str, Dict[str, Any]]:
+    """Resolve the user's document selection against the OWNER's personal
+    namespace BEFORE anything is created, so an invalid selection can never
+    leave a half-created (document-less) task behind."""
+    wanted = [str(item).strip() for item in (document_ids or []) if str(item).strip()]
+    if not wanted:
+        return {}
+    from .personal_evidence import personal_documents
+
+    available = {}
+    for document in personal_documents(config or {}, actor).get("documents") or []:
+        available[str(document.get("document_id") or "")] = document
+    unknown = [item for item in wanted if item not in available]
+    if unknown:
+        raise WorkspaceError(
+            "unknown_document: not in the personal namespace of {0}: {1}".format(
+                actor, ",".join(unknown)))
+    return {
+        document_id: {
+            "summary": str(available[document_id].get("title") or "")[:1000],
+            "sha256": str(available[document_id].get("sha256") or ""),
+        }
+        for document_id in wanted
+    }
 
 
 def create_personal_research(store: TaskStore, *, actor: str, question: str,
@@ -49,53 +84,40 @@ def create_personal_research(store: TaskStore, *, actor: str, question: str,
         raise WorkspaceError("empty_question: research question required")
     if not symbols:
         raise WorkspaceError("no_symbols: name at least one symbol")
+    # Validate the selection FIRST: a failed create must leave the queue
+    # untouched, so retrying with a corrected selection creates exactly one
+    # task (a leftover orphan would swallow the retry as DUPLICATE).
+    attachments = _resolve_personal_documents(config, actor, document_ids)
     result = ensure_question_task(
         store, research_question=question, symbols=symbols,
         config=config, actor=actor, execution_mode=execution_mode,
         intent_id=intent_id)
     attached = _attach_personal_documents(
-        store, result, actor=actor, config=config, document_ids=document_ids)
+        store, result, actor=actor, attachments=attachments)
     if attached is not None:
         result["task"] = attached
-        result["documents_attached"] = len(document_ids or [])
+        result["documents_attached"] = len(attachments)
     return result
 
 
 def _attach_personal_documents(store: TaskStore, result: Dict[str, Any], *,
-                               actor: str, config: Optional[Dict[str, Any]],
-                               document_ids: Optional[list]) -> Optional[Dict[str, Any]]:
+                               actor: str,
+                               attachments: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """A93 page wiring: documents the user selected at create time ride the
     task payload as an additional immutable input version (R01 snapshot chain
     via ``bump_input_version`` — the governed path, never a raw payload edit).
 
-    Only documents verified in the OWNER's personal namespace may attach; a
-    DUPLICATE intake keeps the existing task untouched."""
-    wanted = [str(item).strip() for item in (document_ids or []) if str(item).strip()]
-    if not wanted:
+    Selections are already namespace-verified by the caller; a DUPLICATE
+    intake keeps the existing task untouched."""
+    if not attachments:
         return None
     if str(result.get("status") or "") != "RECORDED":
         return None  # a retry/dedup hit returns the existing task as-is
-    from .personal_evidence import personal_documents
-
-    available = {}
-    for document in personal_documents(config or {}, actor).get("documents") or []:
-        available[str(document.get("document_id") or "")] = document
-    unknown = [item for item in wanted if item not in available]
-    if unknown:
-        raise WorkspaceError(
-            "unknown_document: not in the personal namespace of {0}: {1}".format(
-                actor, ",".join(unknown)))
-    summaries = {}
     task = result.get("task") or {}
     payload = task.get("input_payload") or {}
     context = payload.get("public_context") if isinstance(payload.get("public_context"), dict) else {}
     summaries = dict(context.get("evidence_summaries") if isinstance(context.get("evidence_summaries"), dict) else {})
-    for document_id in wanted:
-        document = available[document_id]
-        summaries[document_id] = {
-            "summary": str(document.get("title") or "")[:1000],
-            "sha256": str(document.get("sha256") or ""),
-        }
+    summaries.update(attachments)
     merged_context = dict(context, evidence_summaries=summaries)
     return store.bump_input_version(
         str(task.get("task_id") or ""),
@@ -154,3 +176,67 @@ def rerun_completed_research(store: TaskStore, *, actor: str, task_id: str,
         store, research_question=question, symbols=symbols,
         config=config, actor=actor, execution_mode=execution_mode,
         new_research=True, as_of=now_iso())
+
+
+def follow_up_completed_research(store: TaskStore, *, actor: str, task_id: str,
+                                 note: str,
+                                 config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """A90: proactive follow-up on a result the model delivered WITHOUT a
+    question (the task already sits succeeded).
+
+    The follow-up text IS a new research question: it becomes a NEW task
+    linked back to the finished one (prior_task_id + user_followup occasion,
+    recorded as a governed input version), and the finished result keeps its
+    terminal state and output untouched (A91)."""
+    task = store.get_task(str(task_id or ""))
+    if task["status"] != STATUS_SUCCEEDED:
+        raise WorkspaceError(
+            "not_succeeded: follow-up on a finished result targets succeeded, got {0}".format(
+                task["status"]))
+    note = str(note or "").strip()
+    if not note:
+        raise WorkspaceError("empty_note: follow-up question required")
+    payload = task.get("input_payload") or {}
+    symbols = [str(s).strip() for s in (payload.get("symbols") or []) if str(s).strip()]
+    if not symbols:
+        raise WorkspaceError("unknown_task: original input lacks a symbol scope")
+    result = ensure_question_task(
+        store, research_question=note, symbols=symbols,
+        config=config, actor=actor,
+        execution_mode=str(task.get("execution_mode") or "replay"),
+        new_research=True)
+    if str(result.get("status") or "") != "RECORDED":
+        # The same follow-up text already exists — return it unchanged.
+        return result
+    created = result.get("task") or {}
+    origin = dict((created.get("input_payload") or {}).get("origin") or {})
+    # Tag the link explicitly: a fresh question text carries no prior of its
+    # own, so the followed-up task is bound here in one governed version.
+    origin["prior_task_id"] = str(task_id)
+    origin["research_occasion"] = "user_followup"
+    origin["followup_note"] = note[:2000]
+    result["task"] = store.bump_input_version(
+        str(created.get("task_id") or ""),
+        payload_overrides={"origin": origin},
+        actor=actor, reason="user_followup")
+    return result
+
+
+def acknowledge_completed_research(store: TaskStore, *, actor: str, task_id: str,
+                                   expected_version: int,
+                                   note: str = "") -> Dict[str, Any]:
+    """A90/A50: personal sign-off on a result that needs no further input.
+
+    The model asked nothing, the result is final — the acknowledgement is
+    ADDED to the preserved output (scope: personal, never institutional);
+    status and every prior output byte stay as they were."""
+    task = store.get_task(str(task_id or ""))
+    if task["status"] != STATUS_SUCCEEDED:
+        raise WorkspaceError(
+            "not_succeeded: sign-off targets succeeded results, got {0}".format(
+                task["status"]))
+    if isinstance(task.get("output"), dict) and task["output"].get("personal_acknowledgement"):
+        raise WorkspaceError("already_acknowledged: this result already carries a personal acknowledgement")
+    return store.record_personal_acknowledgement(
+        str(task_id), actor=actor, notes=str(note or "").strip()[:2000],
+        expected_version=int(expected_version))

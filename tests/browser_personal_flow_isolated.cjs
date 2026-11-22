@@ -107,8 +107,8 @@ async function main() {
 
   const entry = path.join(root, 'tests', 'personal_board_entry.py');
   const common = ['--root', root, '--temp', tempReal, '--config', configPath];
-  const work = taskId => JSON.parse(cp.execFileSync(python,
-    ['-B', entry, 'work', ...common, ...(taskId ? ['--task-id', taskId] : [])],
+  const work = (taskId, extra = []) => JSON.parse(cp.execFileSync(python,
+    ['-B', entry, 'work', ...common, ...(taskId ? ['--task-id', taskId] : []), ...extra],
     { cwd: root, encoding: 'utf8', timeout: 120000 }));
   const state = taskId => JSON.parse(cp.execFileSync(python,
     ['-B', entry, 'state', ...common, '--task-id', taskId],
@@ -186,6 +186,13 @@ async function main() {
     // ---- 4) replay worker pass; view the result on the page ----
     const worked = work(createdId);
     assert.equal(worked.status, 'awaiting_human');
+    // The worker READ the selected source in the owner's namespace: the drop
+    // reason is the missing signal binding, never "not verified in vault".
+    const workedState = state(createdId);
+    assert.ok(workedState.evidence_documents.length === 1,
+      'the claimed task carries the selected source');
+    assert.ok(!workedState.dropped_evidence.some(reason => reason.includes('not_verified_in_vault')),
+      `worker verified the source in the personal namespace (drops: ${workedState.dropped_evidence})`);
     await page.locator(`tr[data-task="${createdId}"] td.status-awaiting_human`).waitFor();
     await page.locator(`form[data-task="${createdId}"].ws-feedback textarea[name=note]`).waitFor();
     await page.locator(`tr[data-task="${createdId}"] td:first-child`).click();
@@ -278,7 +285,12 @@ async function main() {
       document.querySelector('#msg').textContent.includes('已否定'));
     await page.locator(`tr[data-task="${rerunId}"] td.status-blocked`).waitFor();
     assert.ok(state(rerunId).last_error.includes('样本口径'), 'reject reason persisted as last_error');
-    console.log('PASS rejection from the page: task blocked with the typed reason persisted');
+    // blocked IS terminal: the row offers re-research, never a cancel.
+    assert.equal(await page.locator(`tr[data-task="${rerunId}"] button[data-ws="cancel"]`).count(), 0,
+      'a rejected (blocked) row shows no cancel button');
+    assert.ok((await page.locator(`tr[data-task="${rerunId}"] button[data-ws="rerun"]`).count()) === 1,
+      'a rejected row still offers explicit re-research');
+    console.log('PASS rejection from the page: task blocked with the typed reason persisted; blocked row offers rerun, not cancel');
 
     // ---- 9) create a second research and CANCEL it from the page ----
     await page.locator('#create-form [name=question]').fill('A93浏览器验收：用于取消验证的第二个问题？');
@@ -298,8 +310,91 @@ async function main() {
     assert.equal(state(cancelId).status, 'cancelled');
     console.log('PASS cancellation from the page while queued lands immediately');
 
-    // ---- 10) page-vs-persistence consistency sweep ----
-    for (const taskId of [createdId, rerunId, cancelId]) {
+    // ---- 10) A90: a no-question completion still allows 追问 and 签收 ----
+    await page.locator('#create-form [name=question]').fill('A90浏览器验收：模型没有待答问题的样本研究？');
+    await page.locator('#create-form [name=symbols]').fill('600519');
+    await page.locator('#create-form button[type=submit]').click();
+    await page.waitForFunction(() => (document.querySelector('#msg') || {}).textContent &&
+      document.querySelector('#msg').textContent.includes('已创建'));
+    const noQuestionId = await page.evaluate(() => {
+      const match = document.querySelector('#msg').textContent.match(/task_[0-9a-f]+/);
+      return match ? match[0] : '';
+    });
+    await page.locator(`tr[data-task="${noQuestionId}"] td.status-queued`).waitFor();
+    // Fixture (governed input bump): the recorded replay answer carries no
+    // question, so the run completes without any human decision point.
+    assert.equal(work(noQuestionId, ['--replay-no-questions']).status, 'succeeded');
+    await page.locator(`tr[data-task="${noQuestionId}"] td.status-succeeded`).waitFor();
+    const succeededForm = page.locator(`form[data-task="${noQuestionId}"].ws-feedback`);
+    await succeededForm.waitFor();
+    assert.ok((await page.locator(`form[data-task="${noQuestionId}"] button[data-ws="signoff"]`).count()) === 1,
+      'an unacknowledged no-question result offers sign-off');
+    assert.ok((await page.locator(`form[data-task="${noQuestionId}"] button[data-ws="followup"]`).count()) === 1,
+      'a no-question result still offers a proactive follow-up');
+    const outputBefore = state(noQuestionId).output_summary;
+    // 10a) proactive follow-up: the note becomes a NEW linked question (A90).
+    const a90Note = '主动追问：样本结论对下游口径是否稳健？';
+    await succeededForm.locator('textarea[name=note]').fill(a90Note);
+    await succeededForm.locator('button[data-ws="followup"]').click();
+    await page.waitForFunction(() => (document.querySelector('#msg') || {}).textContent &&
+      document.querySelector('#msg').textContent.includes('已记录追问'));
+    const followupTaskId = await page.evaluate(() => {
+      const match = document.querySelector('#msg').textContent.match(/task_[0-9a-f]+/);
+      return match ? match[0] : '';
+    });
+    assert.ok(followupTaskId && followupTaskId !== noQuestionId);
+    await page.locator(`tr[data-task="${followupTaskId}"] td.status-queued`).waitFor();
+    const followupState = state(followupTaskId);
+    assert.equal(followupState.origin.prior_task_id, noQuestionId, 'A90 follow-up links the finished case');
+    assert.equal(followupState.origin.research_occasion, 'user_followup');
+    assert.equal(followupState.question, a90Note, 'the follow-up text is the new question');
+    assert.equal(state(noQuestionId).output_summary, outputBefore,
+      'the finished output is preserved across the follow-up');
+    console.log('PASS A90 proactive follow-up on a no-question result: new linked task, original output intact');
+    // 10b) personal sign-off: acknowledgement ADDED to the preserved output.
+    await page.locator(`form[data-task="${noQuestionId}"] button[data-ws="signoff"]`).click();
+    await page.waitForFunction(() => (document.querySelector('#msg') || {}).textContent &&
+      document.querySelector('#msg').textContent.includes('已签收'));
+    const signedNoQuestion = state(noQuestionId);
+    assert.equal(signedNoQuestion.status, 'succeeded');
+    assert.equal(signedNoQuestion.acknowledgement.actor, OWNER);
+    assert.equal(signedNoQuestion.acknowledgement.scope,
+      'personal_research_acknowledgement_not_institutional_approval');
+    assert.equal(signedNoQuestion.output_summary, outputBefore, 'sign-off rewrote no output byte');
+    await page.locator(`tr[data-task="${noQuestionId}"] td:first-child`).click();
+    await page.waitForFunction(() => {
+      const detail = document.querySelector('#detail');
+      return detail && !detail.hidden && detail.textContent.includes('个人签收');
+    });
+    await page.screenshot({ path: path.join(shots, '06-a90-signed-no-question.png'), fullPage: true });
+    await page.keyboard.press('Escape');
+    console.log('PASS A90 personal sign-off on a no-question result: scoped acknowledgement, output untouched');
+    // 10c) resubmitting the SAME successful create reuses the task (DUPLICATE).
+    await page.locator('#create-form [name=question]').fill('A90浏览器验收：模型没有待答问题的样本研究？');
+    await page.locator('#create-form [name=symbols]').fill('600519');
+    await page.locator('#create-form button[type=submit]').click();
+    await page.waitForFunction(() => (document.querySelector('#msg') || {}).textContent &&
+      document.querySelector('#msg').textContent.includes('DUPLICATE'));
+    assert.equal(await page.locator(`tr[data-task="${noQuestionId}"]`).count(), 1,
+      'a duplicate submission creates no second row');
+    console.log('PASS duplicate resubmission reuses the existing task (DUPLICATE), queue stays single-task');
+
+    // ---- 10d) A67: the follow-up text reads back at its version ----
+    await page.locator(`tr[data-task="${createdId}"] td:first-child`).click();
+    await page.waitForFunction(id => {
+      const detail = document.querySelector('#detail');
+      return detail && !detail.hidden && detail.textContent.includes(id);
+    }, createdId);
+    const detailAll = await page.locator('#detail').innerText();
+    assert.ok(detailAll.includes('追问原文：' + note),
+      'the typed follow-up is readable at its version in the case detail');
+    assert.ok(detailAll.includes('所选原件：document:sha256:'),
+      'the version names the selected source document');
+    await page.keyboard.press('Escape');
+    console.log('PASS A67 case detail reads back the follow-up text and the selected document per version');
+
+    // ---- 11) page-vs-persistence consistency sweep ----
+    for (const taskId of [createdId, rerunId, cancelId, noQuestionId, followupTaskId]) {
       const persisted = state(taskId);
       const shown = await page.locator(`tr[data-task="${taskId}"] td:nth-child(3)`).innerText();
       assert.equal(shown.trim(), persisted.status, `page status matches the store for ${taskId}`);
@@ -309,12 +404,16 @@ async function main() {
     }
     console.log('PASS page-displayed status/input_version equal the persisted records for every task');
 
-    // ---- 11) logout through the page ----
+    // ---- 12) logout through the page ----
     await page.locator('#logout-btn').click();
     await page.waitForFunction(() => document.querySelector('#login-form'));
     const loggedOut = await page.evaluate(async () => (await (await fetch('/api/v1/personal/session')).json()));
     assert.equal(loggedOut.logged_in, false);
-    console.log('PASS logout through the page; next protected action would fail closed');
+    assert.equal(await page.locator('button[data-ws]').count(), 0,
+      'logged-out pages show no session-gated action buttons');
+    assert.equal(await page.locator('form.ws-feedback').count(), 0,
+      'logged-out pages show no feedback forms');
+    console.log('PASS logout through the page; no session-gated buttons or forms remain');
     await page.screenshot({ path: path.join(shots, '05-logged-out.png'), fullPage: true });
   } finally {
     if (browser) await browser.close();
