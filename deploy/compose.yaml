@@ -36,7 +36,7 @@ services:
       - no-new-privileges:true
     healthcheck:
       test: ["CMD", "python", "-c",
-             "import stock_agent, stock_agent.runtime_layout; stock_agent.runtime_layout.resolve_layout()"]
+             "import sqlite3; from stock_agent.runtime_layout import resolve_layout; resolve_layout(); sqlite3.connect(':memory:').execute('SELECT 1')"]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -1,6 +1,5 @@
-# R08 candidate image (NOT YET BUILT — docker engine unreachable from the
-# authoring session; digests below were fetched from the Docker Hub registry
-# API on 2026-10-22 and MUST be re-verified at the first controlled build).
+# R08 candidate image. The base digests below are pinned to the official
+# Docker Hub manifests; verify any replacement before building.
 #
 # Build contract (GLM_REFACTOR_TASKBOOK R08):
 #   1. Both base images are pinned by sha256 digest — a floating tag is a
@@ -34,12 +33,9 @@ WORKDIR /pi
 COPY pi_runtime/package.json pi_runtime/package-lock.json ./
 RUN npm ci --ignore-scripts --omit=dev
 
-# ---- runtime: node base (Pi subprocess) + python overlay + baked venv --------
-FROM ${NODE_IMAGE}
-# python:3.12-slim and node:22-slim share the Debian bookworm userland, so
-# overlaying the python image's /usr/local (interpreter + stdlib) is a
-# self-consistent runtime.
-COPY --from=python-builder /usr/local /usr/local
+# ---- runtime: Python base with its native libraries + bundled Node ----------
+FROM ${PYTHON_IMAGE} AS runtime
+COPY --from=pi-builder /usr/local/bin/node /usr/local/bin/node
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -65,9 +61,11 @@ RUN groupadd --system app \
                 /var/stock-agent/reports /tmp/stock-agent /app/config \
     && chown -R app:app /var/stock-agent /tmp/stock-agent /app
 USER app
+RUN python -c "import lzma, sqlite3, ssl; sqlite3.connect(':memory:').execute('SELECT 1')" \
+    && node --version
 # The image carries no .git: release identity is the PROVENANCE chain —
 # verified read-only via stock_agent.release_provenance (BLOCKED without the
 # external digest binding; never auto-passed).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["python", "-c", "import stock_agent, stock_agent.runtime_layout; stock_agent.runtime_layout.resolve_layout()"]
+    CMD ["python", "-c", "import sqlite3; from stock_agent.runtime_layout import resolve_layout; resolve_layout(); sqlite3.connect(':memory:').execute('SELECT 1')"]
 CMD ["python", "-m", "stock_agent", "--help"]

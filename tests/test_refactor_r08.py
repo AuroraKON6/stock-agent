@@ -135,7 +135,7 @@ class ImageContractTests(unittest.TestCase):
 
     def test_dockerfile_has_no_runtime_install(self):
         text = (ROOT / "deploy" / "docker" / "Dockerfile").read_text(encoding="utf-8")
-        runtime_part = text.split("runtime: node base", 1)[1]
+        runtime_part = text.split("FROM ${PYTHON_IMAGE} AS runtime", 1)[1]
         # The RUN in the runtime stage only creates the user/dirs.
         pip_hits = re.findall(r"pip install|npm ci|npm install", runtime_part)
         self.assertEqual(pip_hits, [], "A38: no dependency installs at runtime")
