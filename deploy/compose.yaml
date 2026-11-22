@@ -1,27 +1,25 @@
-# R08 candidate compose (NOT YET BUILT — engine unreachable from the
-# authoring session; see REFACTOR_R08 report §3 precheck evidence).
-#
-# A40: the published-image service and the source-build service share one
-# contract — same env, same volumes, same healthcheck — so both forms are
-# verifiable against each other. Pin IMAGE to a digest once the first
-# controlled build exists (deploy/docker/image_binding.json is the authority).
+# R08 runtime contract for a published image or a local image built by
+# scripts/build_image.sh. Supply the manifest and provenance hashes from the
+# trusted build result and mount its external binding.
 
 services:
   research-api:
-    # A39: the tag must be digest-pinned from deploy/docker/image_binding.json
-    # before first use; the intentionally-unset variable makes compose REFUSE
-    # to run a floating candidate.
-    image: stock-agent-research:${STOCK_AGENT_TAG:?set STOCK_AGENT_TAG=<tag>@sha256:<digest> from deploy/docker/image_binding.json}
-    build:
-      context: ..
-      dockerfile: deploy/docker/Dockerfile
+    image: stock-agent-research@sha256:${STOCK_AGENT_IMAGE_SHA256:?set the candidate manifest hash}
     environment:
+      STOCK_AGENT_IMAGE_DIGEST: sha256:${STOCK_AGENT_IMAGE_SHA256:?set the candidate manifest hash}
+      STOCK_AGENT_PROVENANCE_SHA256: ${STOCK_AGENT_PROVENANCE_SHA256:?set the expected provenance hash}
       APP_CONFIG_ROOT: /app/config
       APP_STATE_ROOT: /var/stock-agent/state
       APP_EVIDENCE_ROOT: /var/stock-agent/evidence
       APP_REPORT_ROOT: /var/stock-agent/reports
       APP_TEMP_ROOT: /tmp/stock-agent
     volumes:
+      - type: bind
+        source: ${STOCK_AGENT_BINDING_FILE:-./docker/image_binding.json}
+        target: /app/deploy/docker/image_binding.json
+        read_only: true
+        bind:
+          create_host_path: false
       - stock-agent-state:/var/stock-agent/state
       - stock-agent-evidence:/var/stock-agent/evidence
       - stock-agent-reports:/var/stock-agent/reports
@@ -36,10 +34,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
-             "import stock_agent, stock_agent.runtime_layout; stock_agent.runtime_layout.resolve_layout()"]
+             "import sqlite3; from stock_agent.runtime_layout import resolve_layout; resolve_layout(); sqlite3.connect(':memory:').execute('SELECT 1')"]
       interval: 30s
       timeout: 5s
       retries: 3

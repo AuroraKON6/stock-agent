@@ -816,8 +816,6 @@ def _image_provenance_snapshot(root: Path) -> Dict[str, Any]:
     from .release_provenance import (
         BINDING_FILENAME,
         PROVENANCE_FILENAME,
-        ProvenanceError,
-        provenance_sha256,
         verify_image_provenance,
     )
 
@@ -826,13 +824,11 @@ def _image_provenance_snapshot(root: Path) -> Dict[str, Any]:
     if not shipped.is_file() or not binding_path.is_file():
         return {"verified": False, "problems": ["provenance evidence files absent"]}
     try:
-        import json as _json
-
-        record = _json.loads(shipped.read_text(encoding="utf-8"))
-        binding = _json.loads(binding_path.read_text(encoding="utf-8"))
-        expected = str(binding.get("provenance_sha256") or "")
-        observed = str(binding.get("image_digest") or "")
+        record = json.loads(shipped.read_text(encoding="utf-8"))
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        expected = os.environ.get("STOCK_AGENT_PROVENANCE_SHA256", "")
+        observed = os.environ.get("STOCK_AGENT_IMAGE_DIGEST", "")
         return verify_image_provenance(
             record, expected, observed, binding)
-    except (OSError, ValueError, ProvenanceError) as exc:
+    except (OSError, ValueError) as exc:
         return {"verified": False, "problems": ["provenance evidence unreadable: {0}".format(exc)]}

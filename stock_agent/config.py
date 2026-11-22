@@ -9,6 +9,12 @@ from typing import Any, Callable, Dict, Iterator, Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_RUNTIME_ROOT_ENV = {
+    "config": "APP_CONFIG_ROOT",
+    "data": "APP_STATE_ROOT",
+    "logs": "APP_STATE_ROOT",
+    "reports": "APP_REPORT_ROOT",
+}
 
 # Central project-path override. Modules that captured ``project_path`` at
 # import time still honor an active override because the shared function
@@ -27,6 +33,20 @@ def project_path(path_value: str) -> Path:
     override = _PROJECT_PATH_OVERRIDE.get()
     if override is not None:
         return Path(override(path_value))
+
+    if path.parts[:2] == ("data", "evidence_vault"):
+        evidence_root = os.environ.get("APP_EVIDENCE_ROOT")
+        if evidence_root:
+            return PROJECT_ROOT / evidence_root / Path(*path.parts[2:])
+        # The default evidence root is independent of APP_STATE_ROOT.
+        return PROJECT_ROOT / path
+    if path.parts and path.parts[0] in _RUNTIME_ROOT_ENV:
+        prefix = path.parts[0]
+        runtime_root = os.environ.get(_RUNTIME_ROOT_ENV[prefix])
+        if runtime_root:
+            # Logs share the state volume and retain their own subdirectory.
+            relative = path if prefix == "logs" else Path(*path.parts[1:])
+            return PROJECT_ROOT / runtime_root / relative
     return PROJECT_ROOT / path
 
 

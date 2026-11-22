@@ -27,12 +27,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 PROVENANCE_SCHEMA_VERSION = "1.0"
 PROVENANCE_FILENAME = "PROVENANCE.json"
 BINDING_FILENAME = "image_binding.json"
+_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 
 _PROVENANCE_FIELDS = {
     "schema_version", "source_commit", "source_dirty", "stock_agent_tree_sha256",
@@ -112,7 +114,7 @@ def write_image_binding(binding_path: Path, *, image_digest: str,
     The binding file lives NEXT TO the image (registry note/build log), never
     inside it — writing the digest into the image would change the digest."""
     digest = str(image_digest or "").strip()
-    if not digest.startswith("sha256:"):
+    if not _DIGEST_PATTERN.fullmatch(digest):
         raise ProvenanceError(
             "image digest must be a sha256:<hex> reference; refusing to bind {0!r}".format(digest))
     binding = {
@@ -147,14 +149,17 @@ def verify_image_provenance(shipped_provenance: Dict[str, Any],
     expected = str(expected_provenance_sha256 or "")
     if not expected:
         problems.append("expected provenance hash was not injected into the runtime")
-    binding_digest = str((binding or {}).get("image_digest") or "")
-    binding_hash = str((binding or {}).get("provenance_sha256") or "")
+    if not isinstance(binding, dict) or binding.get("schema_version") != PROVENANCE_SCHEMA_VERSION:
+        problems.append("external binding is missing or malformed")
+        binding = {}
+    binding_digest = str(binding.get("image_digest") or "")
+    binding_hash = str(binding.get("provenance_sha256") or "")
     observed = str(observed_image_digest or "")
     if not problems and expected != provenance_sha256(shipped_provenance):
         problems.append("shipped provenance hash does not match the injected expectation")
     if not problems and binding_hash != expected:
         problems.append("binding pins a different provenance hash")
-    if not problems and (not observed.startswith("sha256:")
+    if not problems and (not _DIGEST_PATTERN.fullmatch(observed)
                          or binding_digest != observed):
         problems.append("binding digest does not match the observed image digest")
     if problems:

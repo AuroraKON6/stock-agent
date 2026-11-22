@@ -13,6 +13,7 @@
 .gitignore
 .gitattributes
 .mimosa
+deploy/docker/image_binding.json
 
 # Host virtual environments (Linux venv is built inside the builder stage)
 .venv*
