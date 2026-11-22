@@ -63,6 +63,16 @@ class LayoutResolutionTests(unittest.TestCase):
                 with project_path_override(lambda value: root / "isolated" / value):
                     self.assertEqual(project_path("data"), root / "isolated/data")
 
+    def test_project_paths_keep_default_evidence_root_with_only_state_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_root = Path(tmp).resolve() / "state"
+            with patch.dict("os.environ", {"APP_STATE_ROOT": str(state_root)}, clear=True):
+                layout = resolve_layout()
+                self.assertEqual(project_path("data/tasks/queue.db"), state_root / "tasks/queue.db")
+                self.assertEqual(project_path("data/evidence_vault"), layout.evidence_root)
+                self.assertEqual(project_path("data/evidence_vault/index.json"),
+                                 layout.evidence_root / "index.json")
+
     def test_env_overrides_win_and_freeze_is_immutable(self):
         with tempfile.TemporaryDirectory() as tmp:
             roots = {name: Path(tmp) / name for name in

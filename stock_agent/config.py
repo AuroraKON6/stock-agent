@@ -38,6 +38,8 @@ def project_path(path_value: str) -> Path:
         evidence_root = os.environ.get("APP_EVIDENCE_ROOT")
         if evidence_root:
             return PROJECT_ROOT / evidence_root / Path(*path.parts[2:])
+        # The default evidence root is independent of APP_STATE_ROOT.
+        return PROJECT_ROOT / path
     if path.parts and path.parts[0] in _RUNTIME_ROOT_ENV:
         prefix = path.parts[0]
         runtime_root = os.environ.get(_RUNTIME_ROOT_ENV[prefix])
