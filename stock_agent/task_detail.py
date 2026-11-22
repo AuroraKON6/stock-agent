@@ -117,6 +117,17 @@ def task_detail(store: Any, task_id: str, *, config: Optional[Dict[str, Any]] = 
         "output": output,
         "output_quality": output.get("quality") if isinstance(output.get("quality"), dict) else {},
         "personal_acknowledgement": acknowledgement,
+        # A67 (readable history): the immutable per-version input chain from
+        # the store — version, reason and timestamp only, never re-derived.
+        "input_versions": [
+            {
+                "input_version": int(item.get("input_version") or 0),
+                "reason": str(item.get("reason") or ""),
+                "created_at": str(item.get("created_at") or ""),
+                "created_by": str(item.get("created_by") or ""),
+            }
+            for item in (store.input_snapshots(task_id) if hasattr(store, "input_snapshots") else [])
+        ],
         "pending_human_questions": questions,
         "last_error": str(task.get("last_error") or ""),
     }

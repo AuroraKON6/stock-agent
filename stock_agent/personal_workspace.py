@@ -5,6 +5,8 @@ future façade share one behavior set:
 
 - **create**: a personal research question becomes a queued task (R01 intake:
   same question+scope+mode deduplicates; the session actor is the owner).
+  Documents selected from the owner's personal namespace (A93) attach as a
+  governed new input version — never a raw payload overwrite.
 - **cancel**: one click on an unfinished task (expected_version optimistic
   lock), for queued/awaiting states it lands immediately, for running ones it
   wins at the next worker checkpoint.
@@ -39,7 +41,8 @@ class WorkspaceError(ValueError):
 def create_personal_research(store: TaskStore, *, actor: str, question: str,
                              symbols: list, execution_mode: str = "replay",
                              config: Optional[Dict[str, Any]] = None,
-                             intent_id: str = "") -> Dict[str, Any]:
+                             intent_id: str = "",
+                             document_ids: Optional[list] = None) -> Dict[str, Any]:
     question = str(question or "").strip()
     symbols = [str(s).strip() for s in (symbols or []) if str(s).strip()]
     if not question:
@@ -50,7 +53,54 @@ def create_personal_research(store: TaskStore, *, actor: str, question: str,
         store, research_question=question, symbols=symbols,
         config=config, actor=actor, execution_mode=execution_mode,
         intent_id=intent_id)
+    attached = _attach_personal_documents(
+        store, result, actor=actor, config=config, document_ids=document_ids)
+    if attached is not None:
+        result["task"] = attached
+        result["documents_attached"] = len(document_ids or [])
     return result
+
+
+def _attach_personal_documents(store: TaskStore, result: Dict[str, Any], *,
+                               actor: str, config: Optional[Dict[str, Any]],
+                               document_ids: Optional[list]) -> Optional[Dict[str, Any]]:
+    """A93 page wiring: documents the user selected at create time ride the
+    task payload as an additional immutable input version (R01 snapshot chain
+    via ``bump_input_version`` — the governed path, never a raw payload edit).
+
+    Only documents verified in the OWNER's personal namespace may attach; a
+    DUPLICATE intake keeps the existing task untouched."""
+    wanted = [str(item).strip() for item in (document_ids or []) if str(item).strip()]
+    if not wanted:
+        return None
+    if str(result.get("status") or "") != "RECORDED":
+        return None  # a retry/dedup hit returns the existing task as-is
+    from .personal_evidence import personal_documents
+
+    available = {}
+    for document in personal_documents(config or {}, actor).get("documents") or []:
+        available[str(document.get("document_id") or "")] = document
+    unknown = [item for item in wanted if item not in available]
+    if unknown:
+        raise WorkspaceError(
+            "unknown_document: not in the personal namespace of {0}: {1}".format(
+                actor, ",".join(unknown)))
+    summaries = {}
+    task = result.get("task") or {}
+    payload = task.get("input_payload") or {}
+    context = payload.get("public_context") if isinstance(payload.get("public_context"), dict) else {}
+    summaries = dict(context.get("evidence_summaries") if isinstance(context.get("evidence_summaries"), dict) else {})
+    for document_id in wanted:
+        document = available[document_id]
+        summaries[document_id] = {
+            "summary": str(document.get("title") or "")[:1000],
+            "sha256": str(document.get("sha256") or ""),
+        }
+    merged_context = dict(context, evidence_summaries=summaries)
+    return store.bump_input_version(
+        str(task.get("task_id") or ""),
+        payload_overrides={"public_context": merged_context},
+        actor=actor, reason="attach_personal_documents")
 
 
 def cancel_personal_task(store: TaskStore, *, actor: str, task_id: str,
