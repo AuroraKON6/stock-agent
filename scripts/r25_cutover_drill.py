@@ -368,19 +368,12 @@ def cmd_seed(queued: int) -> int:
 
     store = open_legacy_store()
     try:
-        seeded_queued = []
-        for index in range(1, queued + 1):
-            spec = _increment_spec(config, index)
-            task, _dedup = store.create_task(
-                title="R25-cutover-queued-{0}".format(index),
-                input_payload=spec, execution_mode="replay")
-            seeded_queued.append(str(task["task_id"]))
-
-        # The legacy scheduler ALREADY ran this slot before cutover: create the
-        # intent and run it through the real claim+worker path (in-image code).
+        # The legacy scheduler ALREADY ran this slot before cutover: create
+        # the intent FIRST (claim_next takes the OLDEST queued task) and run
+        # it through the real claim+worker path (in-image code).
         intent = slot_key(LEGACY_PLANNED_SLOT)
         slot_spec = slot_task_spec(config, LEGACY_PLANNED_SLOT)
-        slot_task, dedup = store.create_task(
+        slot_task, slot_dedup = store.create_task(
             title="R25-cutover-slot-legacy", input_payload=slot_spec,
             execution_mode="replay", business_intent_id=intent)
         slot_task_id = str(slot_task["task_id"])
@@ -398,17 +391,107 @@ def cmd_seed(queued: int) -> int:
             emit({"phase": "seed", "ok": False, "error": "legacy slot task did not succeed",
                   "outcome": str(outcome.get("status")), "final": str(slot_final.get("status"))})
             return 3
+
+        # One synthetic personal-evidence task (same shape as the reviewed
+        # precheck fixture): announcement -> located excerpt -> task whose
+        # approved_facts reference it -> real claim + worker run with the
+        # personal vault view. The reconciliation REQUIRES this chain.
+        evidence = _seed_evidence_task(config)
+        if not evidence.get("ok"):
+            emit({"phase": "seed", "ok": False, "error": "evidence task failed",
+                  "evidence": evidence})
+            return 3
+
+        seeded_queued = []
+        for index in range(1, queued + 1):
+            spec = _increment_spec(config, index)
+            task, _dedup = store.create_task(
+                title="R25-cutover-queued-{0}".format(index),
+                input_payload=spec, execution_mode="replay")
+            seeded_queued.append(str(task["task_id"]))
     finally:
         store.close()
 
     emit({"phase": "seed", "ok": True, "queued_seeded": len(seeded_queued),
           "queued_task_ids": seeded_queued,
+          "slot_dedup": slot_dedup,
+          "evidence": evidence,
           "slot": {"schedule_id": SCHEDULE_ID, "planned_slot": LEGACY_PLANNED_SLOT,
                    "scope_version": SCOPE_VERSION, "intent": intent,
                    "task_id": slot_task_id, "final_status": "succeeded"},
           "registry": {"active": registry["active_scheduler"], "generation": registry["generation"]},
           "accounting": intent_accounting(LEGACY_TASKS_DB, intent)})
     return 0
+
+
+def _seed_evidence_task(config: dict) -> dict:
+    """The reviewed precheck evidence fixture, adapted to this drill's config:
+    one synthetic announcement -> located excerpt -> task referencing it ->
+    real claim + run with the personal vault view."""
+    import hashlib as _hashlib
+
+    from stock_agent.evidence_excerpts import (
+        _document_text, create_excerpt, excerpt_selector)
+    from stock_agent.personal_evidence import (
+        import_personal_document, personal_vault_view)
+    from stock_agent.research_worker import run_research_task
+
+    incoming = DATA / "incoming"
+    incoming.mkdir(parents=True, exist_ok=True)
+    announcement = incoming / "r25_cutover_announcement.html"
+    announcement.write_text(
+        "<html><body><p>合成公告（非真实披露）：营业收入为 1,234.56 万元。</p></body></html>",
+        encoding="utf-8")
+    imported = import_personal_document(
+        config, EVIDENCE_OWNER, str(announcement),
+        source_url="https://www.cninfo.com.cn?r25-cutover-fixture",
+        title="R25 切换演练合成公告（非真实披露）",
+        published_at="2026-11-23T09:00:00+08:00")
+    document = imported["document"]
+    view = personal_vault_view(config, EVIDENCE_OWNER)
+    text, _version = _document_text(view, document)
+    start = text.index("营业收入为")
+    end = text.index("。", start) + 1
+    excerpt = create_excerpt(view, document["document_id"], start, end)
+    selector = excerpt_selector(excerpt)
+
+    spec = slot_task_spec(config, LEGACY_PLANNED_SLOT)  # config-shape only
+    spec["research_question"] = "R25 切换演练证据引用 {0}".format(os.urandom(4).hex())
+    spec["scheduled_slot"] = {}  # plain task, not a scheduled intent
+    spec["public_context"]["evidence_summaries"] = {
+        document["document_id"]: {
+            "summary": "R25 切换演练合成公告正文", "sha256": document["sha256"]}}
+    spec["approved_facts"] = [selector]
+
+    store = open_legacy_store()
+    try:
+        task, _dedup = store.create_task(
+            title="R25-cutover-evidence", input_payload=spec,
+            execution_mode="replay")
+        task_id = str(task["task_id"])
+        claimed = store.claim_next("w-r25-evidence", ttl_seconds=60)
+        if not claimed or str(claimed["task_id"]) != task_id:
+            return {"ok": False, "error": "claim_next did not return the evidence task",
+                    "claimed": str((claimed or {}).get("task_id") or "")}
+        outcome = run_research_task(store, task_id, worker_id="w-r25-evidence",
+                                    config=view, ttl_seconds=60)
+        final = store.get_task(task_id)
+        model_call = final.get("model_call") or {}
+        facts = ((model_call.get("outbound_context") or {}).get("verified_facts") or [])
+        fact = facts[0] if facts else {}
+        fact_content_sha = _hashlib.sha256(
+            str(fact.get("content") or "").encode("utf-8")).hexdigest()
+        ok = (str(outcome.get("status")) == "succeeded"
+              and str(final.get("status")) == "succeeded"
+              and str(fact.get("document_sha256") or "") == document["sha256"]
+              and fact_content_sha == selector["excerpt_sha256"])
+        return {"ok": ok, "task_id": task_id, "owner": EVIDENCE_OWNER,
+                "document_id": document["document_id"],
+                "document_sha256": document["sha256"],
+                "excerpt_sha256": selector["excerpt_sha256"],
+                "final_status": str(final.get("status"))}
+    finally:
+        store.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -779,9 +862,10 @@ def cmd_replay_slot() -> int:
     return 0 if ok else 11
 
 
-def cmd_new_slot(index: int) -> int:
+def cmd_new_slot(index: int, run: bool = True) -> int:
     """Post-cutover incremental slot: a NEW intent on a LATER business day,
-    executed through the in-image worker-service CLI (normal entry)."""
+    executed through the in-image worker-service CLI (normal entry).
+    ``run=False`` only enqueues it (the frozen-drain demo needs one queued)."""
     from stock_agent.scheduler_ownership import (
         CONTAINER_SCHEDULER_ID, assert_intake_allowed, assert_unique_scheduler,
         heartbeat,
@@ -803,17 +887,23 @@ def cmd_new_slot(index: int) -> int:
         task_id = str(task["task_id"])
     finally:
         store.close()
-    result = run_cli(["worker-service", "--config", _rel(NEW_WORK_CONFIG),
-                      "--worker-id", "w-container-{0}".format(index),
-                      "--ttl-seconds", "60", "--idle-sleep-seconds", "0.1",
-                      "--max-tasks", "1"])
+    result = None
+    if run:
+        result = run_cli(["worker-service", "--config", _rel(NEW_WORK_CONFIG),
+                          "--worker-id", "w-container-{0}".format(index),
+                          "--ttl-seconds", "60", "--idle-sleep-seconds", "0.1",
+                          "--max-tasks", "1"])
     accounting = intent_accounting(new_tasks_db(), intent)
-    ok = (dedup == "RECORDED" and result["returncode"] == 0
+    expected_status = "succeeded" if run else "queued"
+    ok = (dedup == "RECORDED" and (result is None or result["returncode"] == 0)
           and accounting["tasks_with_intent"] == 1
-          and accounting["tasks"][0]["status"] == "succeeded")
+          and accounting["tasks"][0]["status"] == expected_status)
     emit({"phase": "new_slot", "ok": ok, "index": index,
           "slot": {"planned_slot": planned, "intent": intent, "task_id": task_id},
-          "dedup": dedup, "worker": result, "accounting": accounting})
+          "dedup": dedup, "worker": result or {"args": ["(enqueued only)"],
+                                               "returncode": 0,
+                                               "stdout_tail": "", "stderr_tail": ""},
+          "accounting": accounting})
     return 0 if ok else 12
 
 
@@ -1007,7 +1097,8 @@ COMMANDS = {
     "switch_refuse_no_marker": lambda args: cmd_switch_refuse_no_marker(),
     "switch_new": lambda args: cmd_switch_new(),
     "replay_slot": lambda args: cmd_replay_slot(),
-    "new_slot": lambda args: cmd_new_slot(int(args[0]) if args else 1),
+    "new_slot": lambda args: cmd_new_slot(int(args[0]) if args else 1,
+                                          run=not (len(args) > 1 and args[1] == "norun")),
     "freeze": lambda args: cmd_freeze(),
     "frozen_refusal": lambda args: cmd_frozen_refusal(),
     "drain_frozen": lambda args: cmd_drain_frozen(),
