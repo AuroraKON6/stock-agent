@@ -23,8 +23,10 @@ BINDING_DIR="${ROOT}/deploy/docker"
 cd "${ROOT}"
 
 # --- base-image pin guard: every FROM must carry @sha256: -------------------
+# -E required: BSD grep (macOS) treats {64} as literal in BRE mode, which
+# made this guard reject correctly-pinned base images on macOS hosts.
 if ! grep -E '^ARG (PYTHON_IMAGE|NODE_IMAGE)=' deploy/docker/Dockerfile \
-        | grep -q '@sha256:[0-9a-f]{64}$'; then
+        | grep -Eq '@sha256:[0-9a-f]{64}$'; then
   echo "BLOCKED: a base image is not pinned by digest (A39 stop condition)" >&2
   exit 2
 fi
