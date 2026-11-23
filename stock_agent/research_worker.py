@@ -47,7 +47,7 @@ from .task_runtime import (
 )
 
 WORKER_SCHEMA_VERSION = "1.0"
-RESEARCH_PROMPT_VERSION = "research_note_v3_rounds"
+RESEARCH_PROMPT_VERSION = "research_note_v3_rounds_citation_contract"
 # Plan budget suggestion (section 4.2): W10 single case, at most 4 model
 # attempts including schema-repair retries; every intermediate round is one
 # attempt, so the cap bounds the whole run, not just the final answer.
@@ -67,7 +67,12 @@ _SYSTEM_PROMPT = (
     "Required JSON fields: schema_version (\"1.0\"), task_id, summary (<=4000 chars), "
     "key_findings (list of strings, each tied to evidence), unknowns (list of strings "
     "for what the context does not establish), evidence_refs (list of context evidence "
-    "ids you relied on; cite ONLY ids present in the context), human_questions (list of "
+    "ids you relied on; evidence_refs accepts ONLY the ids listed in "
+    "citation_contract.allowed_evidence_refs of the user message — the keys of "
+    "public_context.evidence_summaries; never a sha256 hash, a verified_facts "
+    "fact_key, an excerpt id, a quote symbol, or any id you remember from an "
+    "earlier task; when that list is empty return evidence_refs as an empty "
+    "list), human_questions (list of "
     "{question, why_needed, options}) for decisions or evidence only a human can "
     "provide, model_self_assessed_confidence (0-1, self-assessed, not a probability of "
     "being right), and optionally requested_intents (list of intents for approved "
@@ -361,6 +366,42 @@ def govern_egress(task: Dict[str, Any], config: Dict[str, Any]) -> Tuple[bool, s
     return True, "", {"gate": "llm_governance", "decision": "approved"}, safe
 
 
+def allowed_evidence_refs(safe_context: Dict[str, Any]) -> list:
+    """The ONLY ids a report may cite: the documents delivered in THIS
+    request's ``public_context.evidence_summaries``. Both the citation
+    contract written into the prompt and the two ``validate_model_output``
+    calls read this one function, so the advertised set and the enforced set
+    cannot drift apart."""
+
+    return sorted((safe_context.get("evidence_summaries") or {}).keys())
+
+
+def build_citation_contract(safe_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Tell the model, per request, which originals it may cite.
+
+    Derived solely from the round's own context: nothing case-specific lives
+    here. Each delivered fact points at its source document's citable id, so
+    a fact is cited through the document rather than through its own key."""
+
+    evidence = safe_context.get("evidence_summaries") or {}
+    document_by_sha = {str(item.get("sha256") or ""): str(ref) for ref, item in evidence.items()}
+    fact_citations = [
+        {"fact_key": str(fact.get("fact_key") or ""),
+         "evidence_ref": document_by_sha[str(fact.get("document_sha256") or "")]}
+        for fact in (safe_context.get("verified_facts") or [])
+        if isinstance(fact, dict) and document_by_sha.get(str(fact.get("document_sha256") or ""))]
+    return {
+        "allowed_evidence_refs": allowed_evidence_refs(safe_context),
+        "rule": ("evidence_refs must be a subset of allowed_evidence_refs: copy ids "
+                 "character for character, do not shorten, reformat or invent them. "
+                 "Values appearing elsewhere in the context (sha256, fact_key, "
+                 "excerpt ids, quote symbols) are not citable evidence ids. "
+                 "Cite a verified_fact through its evidence_ref from fact_citations. "
+                 "If allowed_evidence_refs is empty, return evidence_refs as []."),
+        "fact_citations": fact_citations,
+    }
+
+
 def build_user_prompt(task: Dict[str, Any], safe_payload: Dict[str, Any], safe_context: Dict[str, Any],
                       prior_rounds: Optional[list] = None) -> str:
     prompt = {
@@ -368,6 +409,7 @@ def build_user_prompt(task: Dict[str, Any], safe_payload: Dict[str, Any], safe_c
         "task_id": task["task_id"],
         "input_version": task["input_version"],
         "research_question": str(safe_payload.get("summary") or (task.get("input_payload") or {}).get("research_question") or ""),
+        "citation_contract": build_citation_contract(safe_context),
         "public_context": safe_context,
     }
     if prior_rounds:
@@ -824,7 +866,7 @@ def run_research_task(
             try:
                 parsed = _parse_llm_json(raw_text)
                 output = parsed[0] if isinstance(parsed, list) and parsed else parsed
-                allowed_refs = sorted(safe_context.get("evidence_summaries", {}).keys())
+                allowed_refs = allowed_evidence_refs(safe_context)
                 output = validate_model_output(output, allowed_evidence_refs=allowed_refs)
                 claimed_task_id = str(output.get("task_id") or task_id)
                 if claimed_task_id != task_id:
@@ -898,7 +940,7 @@ def run_research_task(
                     model_call["fact_bundle"] = bundle
             except FactBundleError as exc:
                 model_call["fact_bundle_error"] = str(exc)[:300]
-            allowed_refs = sorted(safe_context.get("evidence_summaries", {}).keys())
+            allowed_refs = allowed_evidence_refs(safe_context)
             output = validate_model_output(output, allowed_evidence_refs=allowed_refs)
             claimed_task_id = str(output.get("task_id") or task_id)
             if claimed_task_id != task_id and claimed_task_id != "placeholder":
