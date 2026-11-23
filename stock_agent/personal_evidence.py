@@ -77,6 +77,28 @@ def personal_vault_view(config: Dict[str, Any], owner: str) -> Dict[str, Any]:
     return view
 
 
+def task_evidence_views(config: Optional[Dict[str, Any]], owner: str) -> List[Dict[str, Any]]:
+    """Config views for ONE task's evidence resolution, in trusted order.
+
+    The base (institutional) vault always comes first — institutional
+    admission outranks personal retention when the same content sits in both.
+    The task owner's personal namespace joins only when that owner actually
+    OWNS one (the root exists): the owner must come from a trusted record
+    (the store's input-owner), never from the task payload, so a task can
+    never reach into another user's namespace by naming it."""
+    views: List[Dict[str, Any]] = [config or {}]
+    owner = str(owner or "").strip()
+    if not owner:
+        return views
+    try:
+        if not personal_root(config or {}, owner).is_dir():
+            return views
+    except PersonalEvidenceError:
+        return views
+    views.append(personal_vault_view(config or {}, owner))
+    return views
+
+
 def import_personal_document(config: Dict[str, Any], owner: str, file_path: str, *,
                              source_url: str, title: str, published_at: str,
                              content_type: str = "") -> Dict[str, Any]:

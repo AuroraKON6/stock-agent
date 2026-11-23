@@ -251,6 +251,18 @@ class R15PersonalFactsTestCase(unittest.TestCase):
         return run_research_task(self.store, task_id, worker_id="w-r15-facts",
                                  config=view)
 
+    def _run_production_entry(self, task_id):
+        """The production claim path: the CLI ``task-run-next`` handler with
+        the APP config only (no hand-passed owner view) — the worker must
+        resolve the personal namespace from its own trusted records."""
+        from stock_agent.cli import _task_run_next
+
+        config = dict(self.config, task_runtime={"db_path": str(self.store.db_path)})
+        config_file = self.root / "worker-config.json"
+        config_file.write_text(json.dumps(config), encoding="utf-8")
+        _task_run_next(str(config_file), "w-r15-cli", 120)
+        return self.store.get_task(task_id)
+
     # ---------------- the chain ---------------- #
 
     def test_replay_chain_from_normal_entries(self):
@@ -429,6 +441,108 @@ class R15PersonalFactsTestCase(unittest.TestCase):
                          [document_a["document_id"]])
 
     # ---------------- negative controls ---------------- #
+
+    def test_production_claim_entry_resolves_personal_evidence(self):
+        """The planner's rework check, kept as a regression: the production
+        CLI claim handler passes ONLY the app config — the worker resolves
+        the input owner's personal namespace from the store's own v1
+        snapshot record, and the shared signals store still binds the task."""
+        evidence = self._prepare_owner_evidence()
+        document_a = evidence["document_a"]
+        status, created = self._create_research(
+            document_ids=[document_a["document_id"]],
+            fact_selectors=[evidence["selector"]])
+        self.assertEqual(status, 200)
+        task_id = created["task_id"]
+        self._install_replay_answer(task_id, document_a["document_id"])
+        stored = self._run_production_entry(task_id)
+        self.assertEqual(stored["status"], "succeeded", stored.get("last_error"))
+        model_call = stored["model_call"]
+        self.assertIn(document_a["document_id"],
+                      model_call["context_delivery"]["delivered_evidence"])
+        self.assertEqual(len(model_call["fact_bundle"]["facts"]), 1)
+        self.assertEqual(model_call["fact_bundle"]["excluded"], [])
+        self.assertEqual(stored["output"]["evidence_refs"],
+                         [document_a["document_id"]])
+
+    def test_unassociated_document_excerpt_excluded_consistently(self):
+        """A fact selector on a document WITHOUT the task-signal association
+        is excluded with the SAME rule as its evidence summary — in the
+        request, the fact bundle audit, and the case detail."""
+        evidence = self._prepare_owner_evidence()
+        document_b = evidence["document_b"]  # imported, never linked
+        view = personal_vault_view(self.config, OWNER)
+        text, _ = _document_text(view, document_b)
+        start = text.index("对照样本净利润")
+        excerpt = create_excerpt(view, document_b["document_id"],
+                                 start, text.index("。", start) + 1)
+        status, created = self._create_research(
+            document_ids=[document_b["document_id"]],
+            fact_selectors=[excerpt_selector(excerpt)])
+        self.assertEqual(status, 200)
+        task_id = created["task_id"]
+        self._install_replay_answer_no_citation(task_id)
+        result = self._run_replay_worker(task_id, view)
+        self.assertEqual(result["status"], "succeeded", result.get("error"))
+        stored = self.store.get_task(task_id)
+        model_call = stored["model_call"]
+        delivery = model_call["context_delivery"]
+        # The summary and the excerpt tell the SAME story: not associated.
+        self.assertEqual(delivery["delivered_evidence"], [])
+        self.assertIn("{0}:not_associated_with_task".format(document_b["document_id"]),
+                      delivery["dropped_evidence"])
+        bundle = model_call["fact_bundle"]
+        self.assertEqual(bundle["facts"], [])
+        reasons = {item.get("reason") for item in bundle["excluded"]}
+        self.assertIn("not_associated_with_task", reasons)
+        self.assertEqual(bundle["evidence_documents"], [])
+        # The request carries no fact content from the undelivered document.
+        self.assertNotIn("verified_facts", model_call["outbound_context"])
+        self.assertNotIn("999.99", json.dumps(model_call["outbound_context"]))
+        # The case detail reads back the same verdict on all three surfaces.
+        status, detail = self._request("GET", "/api/v1/tasks/{0}".format(task_id))
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["evidence_delivery"]["delivered_evidence"], [])
+        self.assertIn("{0}:not_associated_with_task".format(document_b["document_id"]),
+                      detail["evidence_delivery"]["dropped_evidence"])
+        detail_bundle = detail["model_call"]["fact_bundle"]
+        self.assertEqual(detail_bundle["delivered_facts"], [])
+        self.assertIn("not_associated_with_task",
+                      {item.get("reason") for item in detail_bundle["excluded"]})
+        self.assertNotIn("verified_facts", detail["outbound_context"])
+
+    def _install_replay_answer_no_citation(self, task_id):
+        """A replay answer that cites nothing (nothing was deliverable)."""
+        replay = {
+            "schema_version": "1.0", "task_id": "placeholder",
+            "summary": "REPLAY 草稿：所附原件未关联任务信号，无可引用事实。",
+            "key_findings": [], "unknowns": ["原件未送达，无法核对"],
+            "evidence_refs": [], "human_questions": [],
+            "model_self_assessed_confidence": 0.3,
+        }
+        return self.store.bump_input_version(
+            task_id, payload_overrides={"replay_response": replay},
+            actor="fixture-replay",
+            reason="fixture: replay answer without citations")
+
+    def test_foreign_namespace_selector_alone_rejected(self):
+        """Selector ownership in isolation: a selector minted in ANOTHER
+        owner's namespace is rejected even WITHOUT any document selection,
+        so the earlier unknown_document shortcut never masked it."""
+        foreign = self._import(
+            FOREIGN_OWNER, ANNOUNCEMENT_A, "foreign.html",
+            "他人命名空间样本公告（fixture）")
+        foreign_view = personal_vault_view(self.config, FOREIGN_OWNER)
+        text, _ = _document_text(foreign_view, foreign)
+        start = text.index(FACT_SENTENCE_HEAD)
+        excerpt = create_excerpt(foreign_view, foreign["document_id"],
+                                 start, text.index("。", start) + 1)
+        status, rejected = self._create_research(
+            fact_selectors=[excerpt_selector(excerpt)])
+        self.assertEqual(status, 400)
+        self.assertEqual(rejected["error"], "invalid_fact_selector",
+                         "the selector alone must fail ownership, not via documents")
+        self.assertIsNone(self.store.claim_next("w-r15-facts"))
 
     def test_tampered_selector_rejected_and_queue_untouched(self):
         evidence = self._prepare_owner_evidence()
