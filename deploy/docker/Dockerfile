@@ -38,7 +38,14 @@ RUN npm ci --ignore-scripts --omit=dev
 FROM ${NODE_IMAGE}
 # python:3.12-slim and node:22-slim share the Debian bookworm userland, so
 # overlaying the python image's /usr/local (interpreter + stdlib) is a
-# self-consistent runtime.
+# self-consistent runtime. The overlay's C extensions still link against
+# shared libraries that python:3.12-slim carries but node:22-slim does not:
+# _sqlite3 needs libsqlite3.so.0 and _ssl needs libssl.so.3 — without them
+# `import sqlite3` / `import ssl` fail at image runtime, so the task store,
+# backup/restore and TLS cannot load at all (found by the R25 precheck).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libsqlite3-0 libssl3 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=python-builder /usr/local /usr/local
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
