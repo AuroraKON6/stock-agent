@@ -544,6 +544,100 @@ class R15PersonalFactsTestCase(unittest.TestCase):
                          "the selector alone must fail ownership, not via documents")
         self.assertIsNone(self.store.claim_next("w-r15-facts"))
 
+    def test_accepted_selector_carries_a_citable_source(self):
+        """Excerpt-only submission (no document_ids): every accepted fact
+        rides WITH its source document — the create attaches the selector's
+        document summary, so the delivered context has a citable original
+        and a report citing it succeeds through the production entry."""
+        evidence = self._prepare_owner_evidence()
+        document_a = evidence["document_a"]
+        status, created = self._create_research(
+            execution_mode="live",
+            fact_selectors=[evidence["selector"]])
+        self.assertEqual(status, 200)
+        self.assertEqual(created["facts_attached"], 1)
+        task_id = created["task_id"]
+        # v1 already carries the implied source attachment.
+        payload = self.store.get_task(task_id)["input_payload"]
+        self.assertEqual(
+            payload["public_context"]["evidence_summaries"],
+            {document_a["document_id"]: {"summary": "R15样本公告甲（fixture，非真实披露）",
+                                         "sha256": document_a["sha256"]}})
+        response = {
+            "schema_version": "1.0", "task_id": task_id,
+            "summary": "Fixture citation check.",
+            "key_findings": [{"text": "样本营业收入为 2,345.67 万元。",
+                              "evidence_refs": [document_a["document_id"]]}],
+            "unknowns": [], "evidence_refs": [document_a["document_id"]],
+            "human_questions": [], "model_self_assessed_confidence": 0.5,
+        }
+        from stock_agent.model_operations import LLMResponse
+
+        with patch("stock_agent.pi_runtime.call_pi_agent",
+                   return_value=LLMResponse(
+                       json.dumps(response, ensure_ascii=False),
+                       {"model": "deepseek-flash", "request_id": "req-r15-cite",
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5}})) as stub:
+            stored = self._run_production_entry(task_id)
+        stub.assert_called_once()
+        self.assertEqual(stored["status"], "succeeded", stored.get("last_error"))
+        request = json.loads(stub.call_args.kwargs["user_content"])
+        context = request["public_context"]
+        self.assertIn(document_a["document_id"], context["evidence_summaries"])
+        self.assertEqual(len(context["verified_facts"]), 1)
+        self.assertEqual(stored["output"]["evidence_refs"],
+                         [document_a["document_id"]])
+        stored2 = self.store.get_task(task_id)
+        self.assertEqual(stored2["model_call"]["context_delivery"]["delivered_evidence"],
+                         [document_a["document_id"]])
+
+    def test_same_name_non_personal_task_uses_shared_view_only(self):
+        """Ownership binding: the personal vault view joins ONLY for tasks
+        the personal entry created. A plain-intake task recording the SAME
+        audit actor name — even one whose payload claims the personal
+        document and selector through a governed bump — resolves the SHARED
+        view only: the material drops as not verified, never the owner's
+        namespace."""
+        evidence = self._prepare_owner_evidence()
+        document_a = evidence["document_a"]
+        from stock_agent.task_intake import ensure_question_task
+
+        created = ensure_question_task(
+            self.store, research_question="同名非个人任务：管线口径建研？",
+            symbols=["600519"], config=self.config, actor=OWNER)
+        task_id = created["task"]["task_id"]
+        # A governed bump adds the personal material the way only a
+        # compromised writer could — v1 carries no personal-entry stamp, so
+        # the worker must not resolve the owner's namespace for this task.
+        self.store.bump_input_version(
+            task_id,
+            payload_overrides={
+                "approved_facts": [evidence["selector"]],
+                "public_context": {"evidence_summaries": {
+                    document_a["document_id"]: {
+                        "summary": "R15样本公告甲（fixture，非真实披露）",
+                        "sha256": document_a["sha256"]}}},
+            },
+            actor=OWNER, reason="control: unstamped task claims personal material")
+        self._install_replay_answer_no_citation(task_id)
+        result = self._run_replay_worker(task_id, self.config)
+        self.assertEqual(result["status"], "succeeded", result.get("error"))
+        stored = self.store.get_task(task_id)
+        model_call = stored["model_call"]
+        delivery = model_call["context_delivery"]
+        self.assertEqual(delivery["delivered_evidence"], [],
+                         "the shared view does not know the personal document")
+        self.assertIn("{0}:not_verified_in_vault".format(document_a["document_id"]),
+                      delivery["dropped_evidence"])
+        bundle = model_call["fact_bundle"]
+        self.assertEqual(bundle["facts"], [])
+        reasons = {item.get("reason") for item in bundle["excluded"]}
+        self.assertIn("source_not_verified", reasons)
+        # Counterpart sanity: the personal ENTRY task with the same actor
+        # DOES resolve the owner's namespace (covered by the chain tests);
+        # here the report honestly delivered nothing citable.
+        self.assertNotIn("verified_facts", model_call["outbound_context"])
+
     def test_tampered_selector_rejected_and_queue_untouched(self):
         evidence = self._prepare_owner_evidence()
         document_a = evidence["document_a"]

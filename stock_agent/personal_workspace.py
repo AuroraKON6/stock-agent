@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .models import now_iso
+from .personal_evidence import PERSONAL_ORIGIN_VIA
 from .task_intake import ensure_question_task
 from .task_runtime import TaskStore
 from .task_runtime.store import (
@@ -131,12 +132,35 @@ def create_personal_research(store: TaskStore, *, actor: str, question: str,
     # task (a leftover orphan would swallow the retry as DUPLICATE).
     attachments = _resolve_personal_documents(config, actor, document_ids)
     selectors = _resolve_personal_fact_selectors(config, actor, fact_selectors)
+    if selectors:
+        # Every accepted fact rides WITH its source: a selector's document
+        # joins the delivered evidence summaries (vault projection) even
+        # when the user did not tick it separately, so each delivered fact
+        # has a citable original. Worker-side gates still apply unchanged.
+        from .personal_evidence import personal_documents
+
+        projection = {str(item.get("document_id") or ""): item
+                      for item in personal_documents(config or {}, actor).get("documents") or []}
+        for selector in selectors:
+            document_id = str(selector.get("document_id") or "")
+            if not document_id or document_id in attachments:
+                continue
+            document = projection.get(document_id) or {}
+            attachments[document_id] = {
+                "summary": str(document.get("title") or "")[:1000] or "vault document",
+                "sha256": str(document.get("sha256") or ""),
+            }
     # The selected documents AND facts ride the task's FIRST input version,
     # inside the same create transaction: the task becomes claimable only
     # WITH its complete input, so any worker's first claim already sees the
     # sources. The R01 snapshot chain stays fully intact (v1 snapshot written
     # at creation; every later follow-up keeps bumping immutable versions).
-    overrides: Dict[str, Any] = {}
+    overrides: Dict[str, Any] = {
+        # Personal-entry provenance: the worker joins the owner's personal
+        # vault view ONLY for tasks stamped here (v1 snapshot is immutable,
+        # and only this session-verified entry writes the stamp).
+        "origin": {"created_via": PERSONAL_ORIGIN_VIA},
+    }
     if attachments:
         overrides["public_context"] = {"evidence_summaries": attachments}
     if selectors:
@@ -207,7 +231,8 @@ def rerun_completed_research(store: TaskStore, *, actor: str, task_id: str,
     return ensure_question_task(
         store, research_question=question, symbols=symbols,
         config=config, actor=actor, execution_mode=execution_mode,
-        new_research=True, as_of=now_iso())
+        new_research=True, as_of=now_iso(),
+        spec_overrides={"origin": {"created_via": PERSONAL_ORIGIN_VIA}})
 
 
 def follow_up_completed_research(store: TaskStore, *, actor: str, task_id: str,
@@ -241,6 +266,9 @@ def follow_up_completed_research(store: TaskStore, *, actor: str, task_id: str,
         "prior_task_id": str(task_id),
         "research_occasion": "user_followup",
         "followup_note": note[:2000],
+        # Same personal-entry provenance as create: the follow-up task also
+        # resolves the owner's personal namespace.
+        "created_via": PERSONAL_ORIGIN_VIA,
     }
     intent_id = str(intent_id or "").strip()
     if intent_id:

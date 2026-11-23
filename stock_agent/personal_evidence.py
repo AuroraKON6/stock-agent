@@ -33,6 +33,14 @@ PERSONAL_NAMESPACE = "personal_research"
 PERSONAL_ROOT_DEFAULT = "data/personal_evidence"
 _PERSONAL_ROOT_OVERRIDE = {"personal_evidence": "root"}
 
+# Origin stamp marking a task whose input was created through the PERSONAL
+# workspace entry with a session-verified principal. Only that entry writes
+# it (inside the create transaction), and the worker reads it from the
+# IMMUTABLE v1 input snapshot — so the personal vault view joins only for
+# tasks the personal entry actually owns; pipeline/normal tasks and any
+# later governed payload bump cannot gain it by naming an owner.
+PERSONAL_ORIGIN_VIA = "personal_workspace_session"
+
 # Personal import policy (fixed for the first case; widening needs a review):
 # retained for the owner's own review only, never sent to external models
 # from this namespace (R13 fact bundles decide egress separately).

@@ -376,17 +376,27 @@ def build_user_prompt(task: Dict[str, Any], safe_payload: Dict[str, Any], safe_c
 
 
 def _task_input_owner(store: TaskStore, task_id: str) -> str:
-    """Trusted owner of the task's input: the v1 snapshot's ``created_by``,
-    written server-side inside the create transaction (the session principal
-    for personal research, the pipeline principal otherwise) — never payload
-    data, so a task can never claim another user's namespace."""
+    """Trusted owner of the task's input, ONLY for tasks the personal entry
+    created: the IMMUTABLE v1 snapshot must carry the personal-entry origin
+    stamp (written server-side inside the create transaction by the
+    session-verified workspace route), and the owner is that snapshot's
+    ``created_by``. Normal/pipeline tasks record an audit name in the same
+    column but lack the stamp, so they never resolve a personal vault view —
+    and no later governed payload bump can add one, because v1 never
+    changes."""
+    from .personal_evidence import PERSONAL_ORIGIN_VIA
+
     try:
         snapshots = store.input_snapshots(task_id)
     except TaskRuntimeError:
         return ""
     for snapshot in snapshots:
         if int(snapshot.get("input_version") or 0) == 1:
-            return str(snapshot.get("created_by") or "").strip()
+            origin = (snapshot.get("payload") or {}).get("origin")
+            if (isinstance(origin, dict)
+                    and str(origin.get("created_via") or "") == PERSONAL_ORIGIN_VIA):
+                return str(snapshot.get("created_by") or "").strip()
+            return ""
     return ""
 
 
