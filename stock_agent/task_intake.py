@@ -151,6 +151,7 @@ def ensure_question_task(
     new_research: bool = False,
     as_of: str = "",
     spec_overrides: Optional[Dict[str, Any]] = None,
+    input_owner_binding: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Create a question task with explicit retry/new-research semantics (R01).
 
@@ -237,6 +238,10 @@ def ensure_question_task(
         actor=actor,
         idempotency_key=idempotency_key,
         business_intent_id=business_intent_id,
+        # R15: server-side ownership record — only the calling CODE PATH can
+        # supply it (the personal workspace entry binds its session-verified
+        # principal); the payload/spec above can never write this row.
+        input_owner_binding=input_owner_binding,
     )
     return {
         "task": task,

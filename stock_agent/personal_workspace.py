@@ -155,12 +155,7 @@ def create_personal_research(store: TaskStore, *, actor: str, question: str,
     # WITH its complete input, so any worker's first claim already sees the
     # sources. The R01 snapshot chain stays fully intact (v1 snapshot written
     # at creation; every later follow-up keeps bumping immutable versions).
-    overrides: Dict[str, Any] = {
-        # Personal-entry provenance: the worker joins the owner's personal
-        # vault view ONLY for tasks stamped here (v1 snapshot is immutable,
-        # and only this session-verified entry writes the stamp).
-        "origin": {"created_via": PERSONAL_ORIGIN_VIA},
-    }
+    overrides: Dict[str, Any] = {}
     if attachments:
         overrides["public_context"] = {"evidence_summaries": attachments}
     if selectors:
@@ -172,7 +167,12 @@ def create_personal_research(store: TaskStore, *, actor: str, question: str,
         store, research_question=question, symbols=symbols,
         config=config, actor=actor, execution_mode=execution_mode,
         intent_id=intent_id,
-        spec_overrides=(overrides or None))
+        spec_overrides=(overrides or None),
+        # R15 ownership: the session-verified principal is bound to the task
+        # in a SERVER-SIDE record written inside the create transaction —
+        # business input can never write it, and a deduplicated retry keeps
+        # the original task's binding.
+        input_owner_binding={"owner": actor, "via": PERSONAL_ORIGIN_VIA})
     if str(result.get("status") or "") == "RECORDED":
         if attachments:
             result["documents_attached"] = len(attachments)
@@ -232,7 +232,7 @@ def rerun_completed_research(store: TaskStore, *, actor: str, task_id: str,
         store, research_question=question, symbols=symbols,
         config=config, actor=actor, execution_mode=execution_mode,
         new_research=True, as_of=now_iso(),
-        spec_overrides={"origin": {"created_via": PERSONAL_ORIGIN_VIA}})
+        input_owner_binding={"owner": actor, "via": PERSONAL_ORIGIN_VIA})
 
 
 def follow_up_completed_research(store: TaskStore, *, actor: str, task_id: str,
@@ -266,9 +266,6 @@ def follow_up_completed_research(store: TaskStore, *, actor: str, task_id: str,
         "prior_task_id": str(task_id),
         "research_occasion": "user_followup",
         "followup_note": note[:2000],
-        # Same personal-entry provenance as create: the follow-up task also
-        # resolves the owner's personal namespace.
-        "created_via": PERSONAL_ORIGIN_VIA,
     }
     intent_id = str(intent_id or "").strip()
     if intent_id:
@@ -300,13 +297,15 @@ def follow_up_completed_research(store: TaskStore, *, actor: str, task_id: str,
             config=config, actor=actor,
             execution_mode=str(task.get("execution_mode") or "replay"),
             intent_id=intent_id,
-            spec_overrides={"origin": origin_override})
+            spec_overrides={"origin": origin_override},
+            input_owner_binding={"owner": actor, "via": PERSONAL_ORIGIN_VIA})
     return ensure_question_task(
         store, research_question=note, symbols=symbols,
         config=config, actor=actor,
         execution_mode=str(task.get("execution_mode") or "replay"),
         new_research=True,
-        spec_overrides={"origin": origin_override})
+        spec_overrides={"origin": origin_override},
+        input_owner_binding={"owner": actor, "via": PERSONAL_ORIGIN_VIA})
 
 
 def acknowledge_completed_research(store: TaskStore, *, actor: str, task_id: str,

@@ -593,22 +593,33 @@ class R15PersonalFactsTestCase(unittest.TestCase):
 
     def test_same_name_non_personal_task_uses_shared_view_only(self):
         """Ownership binding: the personal vault view joins ONLY for tasks
-        the personal entry created. A plain-intake task recording the SAME
-        audit actor name — even one whose payload claims the personal
-        document and selector through a governed bump — resolves the SHARED
-        view only: the material drops as not verified, never the owner's
-        namespace."""
+        the personal entry created. A generic-intake task recording the SAME
+        audit actor name — even when its v1 BUSINESS INPUT forges the
+        personal-entry origin stamp, and a governed bump later claims the
+        personal document and selector — has NO server-side binding row, so
+        the worker resolves the SHARED view only: the material drops as not
+        verified, never the owner's namespace."""
         evidence = self._prepare_owner_evidence()
         document_a = evidence["document_a"]
+        from stock_agent.personal_evidence import PERSONAL_ORIGIN_VIA
         from stock_agent.task_intake import ensure_question_task
 
         created = ensure_question_task(
             self.store, research_question="同名非个人任务：管线口径建研？",
-            symbols=["600519"], config=self.config, actor=OWNER)
+            symbols=["600519"], config=self.config, actor=OWNER,
+            # The generic intake accepts caller business input — the v1
+            # snapshot will faithfully record this forged stamp. The worker
+            # must not treat it as ownership: no binding row exists.
+            spec_overrides={"origin": {"created_via": PERSONAL_ORIGIN_VIA}})
         task_id = created["task"]["task_id"]
+        self.assertIsNone(self.store.input_owner_binding(task_id),
+                          "generic business input can never write the binding")
+        v1 = next(s for s in self.store.input_snapshots(task_id)
+                  if s["input_version"] == 1)
+        self.assertEqual(v1["payload"]["origin"]["created_via"], PERSONAL_ORIGIN_VIA,
+                         "control setup: the forged stamp really is in the v1 snapshot")
         # A governed bump adds the personal material the way only a
-        # compromised writer could — v1 carries no personal-entry stamp, so
-        # the worker must not resolve the owner's namespace for this task.
+        # compromised writer could — still no binding row.
         self.store.bump_input_version(
             task_id,
             payload_overrides={
@@ -618,7 +629,7 @@ class R15PersonalFactsTestCase(unittest.TestCase):
                         "summary": "R15样本公告甲（fixture，非真实披露）",
                         "sha256": document_a["sha256"]}}},
             },
-            actor=OWNER, reason="control: unstamped task claims personal material")
+            actor=OWNER, reason="control: unbound task claims personal material")
         self._install_replay_answer_no_citation(task_id)
         result = self._run_replay_worker(task_id, self.config)
         self.assertEqual(result["status"], "succeeded", result.get("error"))
@@ -637,6 +648,41 @@ class R15PersonalFactsTestCase(unittest.TestCase):
         # DOES resolve the owner's namespace (covered by the chain tests);
         # here the report honestly delivered nothing citable.
         self.assertNotIn("verified_facts", model_call["outbound_context"])
+
+    def test_personal_entry_binds_owner_generic_and_dedup_do_not(self):
+        """The binding is established ONLY by the personal entry, and a
+        deduplicated retry keeps the original task's ownership."""
+        evidence = self._prepare_owner_evidence()
+        document_a = evidence["document_a"]
+        from stock_agent.personal_evidence import PERSONAL_ORIGIN_VIA
+        from stock_agent.task_intake import ensure_question_task
+
+        # 1) Personal entry (HTTP route, session actor): binding written in
+        #    the create transaction.
+        status, created = self._create_research(
+            document_ids=[document_a["document_id"]])
+        self.assertEqual(status, 200)
+        personal_id = created["task_id"]
+        binding = self.store.input_owner_binding(personal_id)
+        self.assertEqual(binding["owner"], OWNER)
+        self.assertEqual(binding["via"], PERSONAL_ORIGIN_VIA)
+        self.assertTrue(binding["bound_at"])
+
+        # 2) Generic intake with the same actor name: NO binding.
+        generic = ensure_question_task(
+            self.store, research_question="通用入口任务？", symbols=["600519"],
+            config=self.config, actor=OWNER)
+        self.assertIsNone(self.store.input_owner_binding(generic["task"]["task_id"]))
+
+        # 3) Retry of the SAME personal submission dedups to the same task
+        #    and keeps the original binding untouched.
+        status, retry = self._create_research(
+            document_ids=[document_a["document_id"]])
+        self.assertEqual(status, 200)
+        self.assertEqual(retry["outcome"], "DUPLICATE")
+        self.assertEqual(retry["task_id"], personal_id)
+        binding_again = self.store.input_owner_binding(personal_id)
+        self.assertEqual(binding_again, binding)
 
     def test_tampered_selector_rejected_and_queue_untouched(self):
         evidence = self._prepare_owner_evidence()

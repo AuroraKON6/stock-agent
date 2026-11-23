@@ -377,26 +377,17 @@ def build_user_prompt(task: Dict[str, Any], safe_payload: Dict[str, Any], safe_c
 
 def _task_input_owner(store: TaskStore, task_id: str) -> str:
     """Trusted owner of the task's input, ONLY for tasks the personal entry
-    created: the IMMUTABLE v1 snapshot must carry the personal-entry origin
-    stamp (written server-side inside the create transaction by the
-    session-verified workspace route), and the owner is that snapshot's
-    ``created_by``. Normal/pipeline tasks record an audit name in the same
-    column but lack the stamp, so they never resolve a personal vault view —
-    and no later governed payload bump can add one, because v1 never
-    changes."""
+    created: the SERVER-SIDE binding row the entry wrote inside the create
+    transaction (the session-verified principal, bound by calling-code
+    authority). The v1 snapshot proves payload content stayed unchanged —
+    never that an origin field was issued by the personal session, which is
+    exactly why ownership lives in a record business input cannot write.
+    Normal/pipeline/historical tasks have no binding → shared view only."""
     from .personal_evidence import PERSONAL_ORIGIN_VIA
 
-    try:
-        snapshots = store.input_snapshots(task_id)
-    except TaskRuntimeError:
-        return ""
-    for snapshot in snapshots:
-        if int(snapshot.get("input_version") or 0) == 1:
-            origin = (snapshot.get("payload") or {}).get("origin")
-            if (isinstance(origin, dict)
-                    and str(origin.get("created_via") or "") == PERSONAL_ORIGIN_VIA):
-                return str(snapshot.get("created_by") or "").strip()
-            return ""
+    binding = store.input_owner_binding(task_id)
+    if binding and str(binding.get("via") or "") == PERSONAL_ORIGIN_VIA:
+        return str(binding.get("owner") or "").strip()
     return ""
 
 

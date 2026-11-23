@@ -33,12 +33,13 @@ PERSONAL_NAMESPACE = "personal_research"
 PERSONAL_ROOT_DEFAULT = "data/personal_evidence"
 _PERSONAL_ROOT_OVERRIDE = {"personal_evidence": "root"}
 
-# Origin stamp marking a task whose input was created through the PERSONAL
-# workspace entry with a session-verified principal. Only that entry writes
-# it (inside the create transaction), and the worker reads it from the
-# IMMUTABLE v1 input snapshot — so the personal vault view joins only for
-# tasks the personal entry actually owns; pipeline/normal tasks and any
-# later governed payload bump cannot gain it by naming an owner.
+# The `via` value of the SERVER-SIDE input-owner binding the personal
+# workspace entry writes inside the create transaction (TaskStore's
+# task_input_bindings row): the session-verified principal, bound to the
+# task id by calling-code authority. Business input (the payload) can never
+# write that row, and a deduplicated retry keeps the original task's
+# binding — the worker joins the personal vault view only for tasks that
+# carry this binding; pipeline/normal/historical tasks use the shared view.
 PERSONAL_ORIGIN_VIA = "personal_workspace_session"
 
 # Personal import policy (fixed for the first case; widening needs a review):

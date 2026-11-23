@@ -182,6 +182,12 @@ CREATE TABLE IF NOT EXISTS task_platform_runs (
     recorded_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_platform_runs_task ON task_platform_runs(task_id, recorded_at);
+CREATE TABLE IF NOT EXISTS task_input_bindings (
+    task_id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    via TEXT NOT NULL,
+    bound_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS task_input_snapshots (
     task_id TEXT NOT NULL,
     input_version INTEGER NOT NULL,
@@ -385,6 +391,7 @@ class TaskStore:
         actor: str = "operator",
         consume_event: Optional[Dict[str, Any]] = None,
         platform_run: Optional[Dict[str, Any]] = None,
+        input_owner_binding: Optional[Dict[str, str]] = None,
     ) -> Tuple[Dict[str, Any], str]:
         """Create (or deduplicate) a task; optionally record its event consumption atomically.
 
@@ -460,6 +467,20 @@ class TaskStore:
                 "base_key": str(consume_event.get("base_key") or "").strip(),
                 "signal_id": str(consume_event.get("signal_id") or "").strip(),
             }
+        binding: Optional[Dict[str, str]] = None
+        if input_owner_binding is not None:
+            # R15: a SERVER-SIDE ownership record, written only inside the
+            # create transaction by the calling code path — business input
+            # (the payload) can never produce a row here, and the DUPLICATE
+            # path never writes one, so a deduplicated retry keeps the
+            # original task's ownership exactly as it was bound at creation.
+            if not isinstance(input_owner_binding, dict):
+                raise TaskRuntimeError("input_owner_binding must be an object")
+            binding_owner = str(input_owner_binding.get("owner") or "").strip()
+            binding_via = str(input_owner_binding.get("via") or "").strip()
+            if not binding_owner or not binding_via:
+                raise TaskRuntimeError("input_owner_binding requires owner and via")
+            binding = {"owner": binding_owner, "via": binding_via}
         if not idempotency_key:
             # Default identity: same case/role/prompt/model/mode AND the exact
             # same input content. Independent requests (different question,
@@ -584,6 +605,11 @@ class TaskStore:
             )
             self._write_input_snapshot(task_id, input_version, input_payload,
                                        created_by=actor, reason="created", created_at=created)
+            if binding is not None:
+                self._conn.execute(
+                    "INSERT INTO task_input_bindings (task_id, owner, via, bound_at) VALUES (?,?,?,?)",
+                    (task_id, binding["owner"], binding["via"], created),
+                )
             if run_record is not None:
                 self._record_platform_run(task_id, business_intent_id, run_record)
             if consumption is not None:
@@ -777,6 +803,22 @@ class TaskStore:
             ("{0}::{1}".format(str(platform), str(run_id)),),
         ).fetchone()
         return dict(row) if row is not None else None
+
+    def input_owner_binding(self, task_id: str) -> Optional[Dict[str, str]]:
+        """The task's server-side input-owner binding, or None.
+
+        Written only inside the create transaction when the calling code
+        path supplied one (R15: the personal workspace entry binds its
+        session-verified principal). Business input can never produce a
+        row, and a deduplicated retry keeps the original task's binding."""
+        row = self._conn.execute(
+            "SELECT owner, via, bound_at FROM task_input_bindings WHERE task_id = ?",
+            (str(task_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"owner": str(row["owner"]), "via": str(row["via"]),
+                "bound_at": str(row["bound_at"])}
 
     def input_snapshots(self, task_id: str) -> List[Dict[str, Any]]:
         """Immutable per-version input history (payload decoded, sha preserved)."""
