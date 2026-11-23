@@ -17,15 +17,21 @@ Usage (inside the container, state rooted at /app/data on a temp volume):
 Subcommands:
     seed [count]        write drill config, create the three SQLite sources,
                         seed `count` synthetic replay tasks (unique questions)
+    seed_evidence       import one synthetic personal-evidence announcement,
+                        create a task whose approved_facts reference a located
+                        excerpt of it, and run that task through the real
+                        worker entry with the personal vault view
     status              queue depth + per-status counts + event totals
     heartbeat           A42: claim one task, wrap a synthetic 12s "call" in
                         lease_heartbeat, sample the lease mid-call from a
                         separate connection, then persist the terminal state
     crash               A43: claim one task, persist a claim marker, then
-                        SIGKILL itself (no cleanup path can run)
+                        sleep holding the lease until the HOST sends SIGKILL
+                        (a same-namespace SIGKILL to PID 1 is dropped)
     inspect_crash       A43: task still leased, lease row intact, no new
                         events after the crash, expired-lease visibility (R23)
     recover             A43: store.recover_abandoned requeues the expired task
+                        (or expires it when attempts are exhausted)
     fencing_reject      A43: the dead worker's late completion with the stale
                         fencing token is rejected
     dbbusy_holder secs  hold BEGIN EXCLUSIVE on the task DB, marker when held
@@ -35,9 +41,22 @@ Subcommands:
     probe_client url    A45: probes return 200, task/outbox counts unchanged
     observability       R23: build_observability_status over the drilled store
     integrity           PRAGMA integrity_check + status counts on the task DB
-    diskfull            A44: isolated tmpfs store — seed, fill the volume,
-                        run worker-service as a child, report the failure mode
-    compare live restored   R24: seven-table + task-row + outbox comparison
+    diskfull            A44: REFUSES to run unless /app/data is a drill-bounded
+                        tmpfs mount (zero writes on any other mount); then
+                        seed, fill up to a hard byte cap, run worker-service
+                        as a child, report the failure mode
+    compare live_db restored_root
+                        R24 reconciliation: seven-table counts, FULL-row
+                        research_tasks and task_outbox comparison (every
+                        column incl. payload), and the evidence chain — the
+                        evidence task's selector must resolve, in the given
+                        root, to a personal-evidence object whose bytes hash
+                        to the referenced digest and whose delivered fact
+                        content hashes to the excerpt digest
+    corrupt_copy src_root dst_root outbox-payload|missing-object
+                        R24 negative factory: copy a restored tree and mutate
+                        exactly one thing (one outbox row's payload, or delete
+                        the referenced evidence object)
 """
 from __future__ import annotations
 
@@ -199,6 +218,101 @@ def cmd_status() -> int:
     return 0
 
 
+EVIDENCE_OWNER = "lead-analyst"  # a real-human style owner; automated
+# identities are refused ownership of personal evidence.
+
+
+def cmd_seed_evidence() -> int:
+    """One synthetic announcement -> located excerpt -> task that references
+    it -> the task RUNS through the real worker entry with the personal vault
+    view, so the restored-state reconciliation has a REAL reference chain."""
+    import hashlib as _hashlib
+
+    from stock_agent.evidence_excerpts import (
+        _document_text, create_excerpt, excerpt_selector)
+    from stock_agent.personal_evidence import (
+        import_personal_document, personal_vault_view)
+    from stock_agent.research_worker import run_research_task
+    from stock_agent.task_supply import build_task_spec
+
+    config = load_drill_config()
+    incoming = DATA / "incoming"
+    incoming.mkdir(parents=True, exist_ok=True)
+    announcement = incoming / "r25_announcement.html"
+    announcement.write_text(
+        "<html><body><p>合成公告（非真实披露）：营业收入为 1,234.56 万元。</p></body></html>",
+        encoding="utf-8")
+    imported = import_personal_document(
+        config, EVIDENCE_OWNER, str(announcement),
+        source_url="https://www.cninfo.com.cn/x?r25-precheck-fixture",
+        title="R25 前置检查合成公告（非真实披露）",
+        published_at="2026-11-23T09:00:00+08:00")
+    document = imported["document"]
+    view = personal_vault_view(config, EVIDENCE_OWNER)
+    text, _version = _document_text(view, document)
+    start = text.index("营业收入为")
+    end = text.index("。", start) + 1
+    excerpt = create_excerpt(view, document["document_id"], start, end)
+    selector = excerpt_selector(excerpt)
+
+    spec = build_task_spec(
+        research_question="R25 证据引用合成问题 {0}".format(os.urandom(4).hex()),
+        symbols=["600519"], execution_mode="replay", config=config)
+    spec["bound_signal_ids"] = []
+    spec["public_context"]["evidence_summaries"] = {
+        document["document_id"]: {
+            "summary": "R25 前置检查合成公告正文", "sha256": document["sha256"]}}
+    spec["approved_facts"] = [selector]
+    spec["replay_response"] = {
+        "schema_version": "1.0", "task_id": "placeholder",
+        "summary": "结论",
+        "key_findings": [], "unknowns": [], "evidence_refs": [],
+        "human_questions": [], "model_self_assessed_confidence": 0.3}
+
+    store = open_store()
+    try:
+        task, _dedup = store.create_task(
+            title="R25-drill-evidence", input_payload=spec,
+            execution_mode="replay")
+        task_id = str(task["task_id"])
+        # The worker entry runs one ALREADY-CLAIMED task: claim through the
+        # store's real claim path first (run this before seeding other tasks
+        # so the evidence task is the oldest queued one).
+        claimed = store.claim_next("w-r24-evidence", ttl_seconds=60)
+        if not claimed or str(claimed["task_id"]) != task_id:
+            emit({"phase": "seed_evidence", "ok": False,
+                  "error": "claim_next did not return the evidence task",
+                  "claimed": str((claimed or {}).get("task_id") or "")})
+            return 17
+        outcome = run_research_task(store, task_id,
+                                    worker_id="w-r24-evidence",
+                                    config=view, ttl_seconds=60)
+        final = store.get_task(task_id)
+        model_call = final.get("model_call") or {}
+        facts = ((model_call.get("outbound_context") or {})
+                 .get("verified_facts") or [])
+        fact = facts[0] if facts else {}
+        fact_content_sha = _hashlib.sha256(
+            str(fact.get("content") or "").encode("utf-8")).hexdigest()
+        ok = (str(outcome.get("status")) == "succeeded"
+              and str(final.get("status")) == "succeeded"
+              and str(fact.get("document_sha256") or "") == document["sha256"]
+              and fact_content_sha == selector["excerpt_sha256"])
+        emit({"phase": "seed_evidence", "ok": ok, "task_id": task_id,
+              "owner": EVIDENCE_OWNER,
+              "document_id": document["document_id"],
+              "document_sha256": document["sha256"],
+              "excerpt_sha256": selector["excerpt_sha256"],
+              "excerpt_text": excerpt["text"],
+              "delivered_fact_document_sha256": str(fact.get("document_sha256") or ""),
+              "delivered_fact_content_sha256": fact_content_sha,
+              "outcome_status": str(outcome.get("status")),
+              "final_status": str(final.get("status"))})
+        return 0 if ok else 15
+    finally:
+        store.close()
+
+
 # --------------------------------------------------------------------------- #
 # A42: in-container heartbeat around a synthetic long call
 # --------------------------------------------------------------------------- #
@@ -329,17 +443,24 @@ def cmd_recover() -> int:
         recovered = store.recover_abandoned(ttl_grace_seconds=0)
         task = store.get_task(marker["task_id"])
         status = str(task.get("status"))
-        # Valid recovery outcomes: requeued (attempts left) or expired
-        # (attempts exhausted). Either way the dead worker's lease is gone.
-        ok = (status in ("queued", "expired")
-              and not str(task.get("worker_id") or "")
-              and not str(task.get("lease_expires_at") or ""))
+        # Valid recovery outcomes: requeued (attempts left — dead worker's
+        # lease fully cleared) or expired (terminal; the store intentionally
+        # keeps the last worker attribution on the expired row).
+        if status == "queued":
+            ok = (not str(task.get("worker_id") or "")
+                  and not str(task.get("lease_expires_at") or ""))
+        elif status == "expired":
+            ok = True
+        else:
+            ok = False
         emit({"phase": "recover", "ok": ok, "recovered": recovered,
               "task_id": marker["task_id"], "status": status,
-              "worker_id_cleared": not str(task.get("worker_id") or ""),
+              "worker_id_kept_on_expired": str(task.get("worker_id") or ""),
+              "lease_cleared": not str(task.get("lease_expires_at") or ""),
               "fencing_token": int(task.get("fencing_token") or 0),
               "note": "fencing_token bumps on the NEXT claim, not on requeue;"
-                      " a twice-crashed task legitimately expires"})
+                      " a twice-crashed task legitimately expires with the"
+                      " last worker attribution kept on the terminal row"})
         return 0 if ok else 6
     finally:
         store.close()
@@ -422,7 +543,41 @@ def cmd_integrity() -> int:
     return 0 if ok else 9
 
 
+def _data_mount_info() -> dict:
+    """Longest-prefix mount info for /app/data from /proc/self/mounts."""
+    target = str(DATA)
+    best = {"mountpoint": "", "fstype": "", "source": ""}
+    try:
+        with open("/proc/self/mounts", encoding="utf-8") as handle:
+            for line in handle:
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                mountpoint = fields[1].replace("\\040", " ")
+                if (target == mountpoint
+                        or (target.startswith(mountpoint.rstrip("/") + "/")
+                            and len(mountpoint) > len(best["mountpoint"]))):
+                    best = {"mountpoint": mountpoint, "fstype": fields[2],
+                            "source": fields[0]}
+    except OSError:
+        pass
+    return best
+
+
+# The fill phase never writes more than this, whatever the mount reports.
+DISKFULL_MAX_FILL_BYTES = 32 * 1024 * 1024
+
+
 def cmd_diskfull() -> int:
+    # Boundary: the injection may ONLY touch a drill-bounded tmpfs. On any
+    # other mount (named volume, bind, overlay) refuse BEFORE a single byte
+    # is written — not even the seed/config may land there.
+    mount = _data_mount_info()
+    if mount["fstype"] != "tmpfs":
+        emit({"phase": "diskfull", "ok": False, "refused": True,
+              "reason": "/app/data is not a tmpfs drill mount",
+              "mount": mount, "fill_bytes": 0})
+        return 14
     # Isolated tmpfs-backed store: this subcommand manages its own /app/data.
     cmd_seed(3)
     free_before = os.statvfs(DATA).f_bavail * os.statvfs(DATA).f_frsize
@@ -432,7 +587,7 @@ def cmd_diskfull() -> int:
         chunk = b"x" * 65536
         written = 0
         try:
-            while True:
+            while written < DISKFULL_MAX_FILL_BYTES:
                 free = os.statvfs(DATA).f_bavail * os.statvfs(DATA).f_frsize
                 if free <= leave_free:
                     break
@@ -458,7 +613,8 @@ def cmd_diskfull() -> int:
         store.close()
     half_states = statuses.get("succeeded", 0)  # disk full must not "succeed" a task
     ok = worker.returncode != 0 and integrity == "ok" and half_states == 0
-    emit({"phase": "diskfull", "ok": ok,
+    emit({"phase": "diskfull", "ok": ok, "refused": False,
+          "mount": mount, "max_fill_bytes": DISKFULL_MAX_FILL_BYTES,
           "free_bytes_before": free_before, "free_bytes_filled": free_filled,
           "fill_bytes": written,
           "worker_returncode": worker.returncode,
@@ -548,7 +704,8 @@ def cmd_observability() -> int:
 
 
 # --------------------------------------------------------------------------- #
-# R24: live-vs-restored comparison
+# R24: full reconciliation — counts, FULL rows (incl. outbox payload), and
+# the personal-evidence reference chain, live vs restored
 # --------------------------------------------------------------------------- #
 TABLES = (
     ("research_tasks", "tasks"),
@@ -561,10 +718,118 @@ TABLES = (
 )
 
 
-def cmd_compare(live_db: str, restored_db: str) -> int:
+def _ro_connection(db_path: str) -> sqlite3.Connection:
+    return sqlite3.connect(
+        "file:{0}?mode=ro".format(Path(db_path).resolve()), uri=True)
+
+
+def _evidence_checks(db_path: str, data_root: Path) -> dict:
+    """Verify the evidence reference chain inside ONE root.
+
+    Requires at least one task whose approved_facts carry an excerpt
+    selector; resolves that reference through the root's own bytes: the
+    owner vault's capture event (identity), the content-addressed object
+    (content hash) and the task's own delivered fact (association)."""
+    import hashlib as _hashlib
+
+    result: dict = {"present": False}
+    connection = _ro_connection(db_path)
+    try:
+        rows = connection.execute(
+            "SELECT task_id, input_payload, model_call FROM research_tasks"
+        ).fetchall()
+    finally:
+        connection.close()
+    for task_id, payload_text, model_call_text in rows:
+        try:
+            payload = json.loads(payload_text or "{}")
+            selectors = payload.get("approved_facts") or []
+            selector = selectors[0] if selectors and isinstance(
+                selectors[0], dict) and "excerpt_sha256" in selectors[0] else None
+            if selector is None:
+                continue
+            model_call = json.loads(model_call_text or "{}")
+        except ValueError:
+            continue
+        document_id = str(selector.get("document_id") or "")
+        document_sha = str(selector.get("document_sha256") or "")
+        excerpt_sha = str(selector.get("excerpt_sha256") or "")
+        result = {"present": True, "task_id": task_id,
+                  "document_id": document_id, "document_sha256": document_sha,
+                  "excerpt_sha256": excerpt_sha}
+        # Identity: the owner vault's own capture event names the document.
+        # The namespace sits at <root>/personal_evidence when the root IS the
+        # live data root (/app/data), and at <root>/data/personal_evidence in
+        # a restored tree (manifest paths are project-relative).
+        owner_root = None
+        capture_sha = ""
+        events_seen = 0
+        bases = [data_root / "personal_evidence",
+                 data_root / "data" / "personal_evidence"]
+        for base in bases:
+            if not base.is_dir():
+                continue
+            for index_dir in sorted(base.glob("*/")):
+                events_path = index_dir / "events.jsonl"
+                if not events_path.is_file():
+                    continue
+                for line in events_path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    events_seen += 1
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    if str(record.get("document_id") or "") == document_id:
+                        owner_root = index_dir
+                        capture_sha = str(
+                            (record.get("payload") or {}).get("sha256") or "")
+                        break
+                if owner_root is not None:
+                    break
+            if owner_root is not None:
+                break
+        result["vault_events_scanned"] = events_seen
+        result["capture_event_found"] = owner_root is not None
+        result["capture_sha256_matches_selector"] = capture_sha == document_sha
+        # Content hash: the referenced object's BYTES must hash to the digest.
+        object_path = (owner_root / "objects" / "sha256"
+                       / document_sha[:2] / document_sha) if owner_root else None
+        result["object_path"] = str(object_path or "")
+        result["object_exists"] = bool(object_path and object_path.is_file())
+        object_sha = (_hashlib.sha256(object_path.read_bytes()).hexdigest()
+                      if result["object_exists"] else "")
+        result["object_bytes_sha256_matches"] = object_sha == document_sha
+        # Association: this task's own run record delivered the fact.
+        facts = ((model_call.get("outbound_context") or {})
+                 .get("verified_facts") or [])
+        fact = facts[0] if facts else {}
+        fact_content_sha = _hashlib.sha256(
+            str(fact.get("content") or "").encode("utf-8")).hexdigest()
+        result["delivered_fact_document_sha256"] = str(
+            fact.get("document_sha256") or "")
+        result["delivered_fact_matches_document"] = (
+            str(fact.get("document_sha256") or "") == document_sha)
+        result["delivered_fact_content_sha256_matches_excerpt"] = (
+            fact_content_sha == excerpt_sha)
+        result["ok"] = (result["capture_event_found"]
+                        and result["capture_sha256_matches_selector"]
+                        and result["object_exists"]
+                        and result["object_bytes_sha256_matches"]
+                        and result["delivered_fact_matches_document"]
+                        and result["delivered_fact_content_sha256_matches_excerpt"])
+        return result
+    return result
+
+
+def cmd_compare(live_db: str, restored_root: str) -> int:
+    restored_root_path = Path(restored_root)
+    restored_db = str(restored_root_path / "data/task_runtime/tasks.sqlite3")
+    live_root = Path(live_db).resolve().parents[1]
+
     def snapshot(db_path: str) -> dict:
-        connection = sqlite3.connect(
-            "file:{0}?mode=ro".format(Path(db_path).resolve()), uri=True)
+        connection = _ro_connection(db_path)
         try:
             counts = {}
             for table, _ in TABLES:
@@ -574,11 +839,9 @@ def cmd_compare(live_db: str, restored_db: str) -> int:
                 except sqlite3.OperationalError:
                     counts[table] = None  # table absent on both sides = old schema
             tasks = connection.execute(
-                "SELECT task_id, status, version, fencing_token, worker_id,"
-                " attempt_count FROM research_tasks ORDER BY task_id").fetchall()
+                "SELECT * FROM research_tasks ORDER BY task_id").fetchall()
             outbox = connection.execute(
-                "SELECT sequence, task_id, event_type FROM task_outbox"
-                " ORDER BY sequence").fetchall()
+                "SELECT * FROM task_outbox ORDER BY sequence").fetchall()
             return {"counts": counts, "tasks": tasks, "outbox": outbox}
         finally:
             connection.close()
@@ -588,20 +851,86 @@ def cmd_compare(live_db: str, restored_db: str) -> int:
     counts_equal = live["counts"] == restored["counts"]
     tasks_equal = live["tasks"] == restored["tasks"]
     outbox_equal = live["outbox"] == restored["outbox"]
-    ok = counts_equal and tasks_equal and outbox_equal
+    drift = []
+    if not outbox_equal and len(live["outbox"]) == len(restored["outbox"]):
+        for live_row, restored_row in zip(live["outbox"], restored["outbox"]):
+            if live_row != restored_row:
+                differing = [live_row[index] != restored_row[index]
+                             for index in range(len(live_row))]
+                drift.append({"sequence": live_row[0], "event_id": live_row[1],
+                              "differing_columns": sum(differing)})
+                if len(drift) >= 3:
+                    break
+    live_evidence = _evidence_checks(live_db, live_root)
+    restored_evidence = _evidence_checks(restored_db, restored_root_path)
+    evidence_ok = bool(live_evidence.get("ok")) and bool(restored_evidence.get("ok"))
+    ok = counts_equal and tasks_equal and outbox_equal and evidence_ok
     emit({"phase": "compare", "ok": ok,
           "live_db": live_db, "restored_db": restored_db,
           "counts_live": live["counts"], "counts_restored": restored["counts"],
           "counts_equal": counts_equal,
           "task_rows": len(live["tasks"]),
-          "tasks_equal_row_by_row": tasks_equal,
+          "tasks_equal_full_rows": tasks_equal,
           "outbox_rows": len(live["outbox"]),
-          "outbox_equal_row_by_row": outbox_equal})
+          "outbox_equal_full_rows_incl_payload": outbox_equal,
+          "outbox_drift_sample": drift,
+          "evidence_live": live_evidence,
+          "evidence_restored": restored_evidence})
     return 0 if ok else 13
+
+
+def cmd_corrupt_copy(source_root: str, destination_root: str, mode: str) -> int:
+    import shutil as _shutil
+
+    source = Path(source_root)
+    destination = Path(destination_root)
+    if destination.exists():
+        emit({"phase": "corrupt_copy", "ok": False,
+              "error": "destination already exists"})
+        return 16
+    _shutil.copytree(source, destination)
+    mutated = ""
+    if mode == "outbox-payload":
+        connection = sqlite3.connect(
+            str(destination / "data/task_runtime/tasks.sqlite3"))
+        try:
+            row = connection.execute(
+                "SELECT sequence FROM task_outbox ORDER BY sequence DESC"
+                " LIMIT 1").fetchone()
+            if row is None:
+                emit({"phase": "corrupt_copy", "ok": False,
+                      "error": "no outbox rows to corrupt"})
+                return 16
+            connection.execute(
+                "UPDATE task_outbox SET payload = payload || ? WHERE sequence = ?",
+                ('"r25-tamper"', row[0]))
+            connection.commit()
+            mutated = "outbox sequence {0} payload".format(row[0])
+        finally:
+            connection.close()
+    elif mode == "missing-object":
+        evidence = _evidence_checks(
+            str(destination / "data/task_runtime/tasks.sqlite3"), destination)
+        target = Path(evidence.get("object_path") or "")
+        if not evidence.get("present") or not target.is_file():
+            emit({"phase": "corrupt_copy", "ok": False,
+                  "error": "no referenced evidence object found to delete"})
+            return 16
+        target.unlink()
+        mutated = str(target)
+    else:
+        emit({"phase": "corrupt_copy", "ok": False,
+              "error": "unknown mode: {0}".format(mode)})
+        return 2
+    emit({"phase": "corrupt_copy", "ok": True, "mode": mode,
+          "source_root": source_root, "destination_root": destination_root,
+          "mutated": mutated})
+    return 0
 
 
 COMMANDS = {
     "seed": lambda args: cmd_seed(int(args[0]) if args else 40),
+    "seed_evidence": lambda args: cmd_seed_evidence(),
     "status": lambda args: cmd_status(),
     "heartbeat": lambda args: cmd_heartbeat(),
     "crash": lambda args: cmd_crash(),
@@ -616,6 +945,7 @@ COMMANDS = {
     "integrity": lambda args: cmd_integrity(),
     "diskfull": lambda args: cmd_diskfull(),
     "compare": lambda args: cmd_compare(args[0], args[1]),
+    "corrupt_copy": lambda args: cmd_corrupt_copy(args[0], args[1], args[2]),
 }
 
 

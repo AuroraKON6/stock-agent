@@ -22,14 +22,20 @@ BINDING_DIR="${ROOT}/deploy/docker"
 
 cd "${ROOT}"
 
-# --- base-image pin guard: every FROM must carry @sha256: -------------------
-# -E required: BSD grep (macOS) treats {64} as literal in BRE mode, which
-# made this guard reject correctly-pinned base images on macOS hosts.
-if ! grep -E '^ARG (PYTHON_IMAGE|NODE_IMAGE)=' deploy/docker/Dockerfile \
-        | grep -Eq '@sha256:[0-9a-f]{64}$'; then
-  echo "BLOCKED: a base image is not pinned by digest (A39 stop condition)" >&2
+# --- base-image pin guard: EVERY required FROM must carry @sha256: --------
+# Checked per image (a single aggregate match would let one unpinned base
+# slip through when the other is pinned). -E required: BSD grep (macOS)
+# treats {64} as literal in BRE mode.
+base_pin_blocked() {
+  echo "BLOCKED: ${1} is not pinned by digest (A39 stop condition)" >&2
   exit 2
-fi
+}
+for IMAGE_VAR in PYTHON_IMAGE NODE_IMAGE; do
+  IMAGE_LINE="$(grep -E "^ARG ${IMAGE_VAR}=" deploy/docker/Dockerfile || true)"
+  [ -n "${IMAGE_LINE}" ] || base_pin_blocked "ARG ${IMAGE_VAR} is missing"
+  printf '%s\n' "${IMAGE_LINE}" \
+    | grep -Eq "@sha256:[0-9a-f]{64}$" || base_pin_blocked "${IMAGE_VAR}"
+done
 
 # --- source identity (builder side has .git by definition) -------------------
 COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
