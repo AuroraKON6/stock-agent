@@ -71,6 +71,8 @@ STATE_FILENAME = "state.json"
 EVENTS_FILENAME = "events.jsonl"
 LEGACY_DISABLED_FILENAME = "legacy_disabled.json"
 LOCK_FILENAME = "registry.lock"
+ROLLBACK_MANIFEST_FILENAME = "rollback_increments.json"
+PREVIOUS_ROLLBACK_MANIFEST_FILENAME = "rollback_increments.previous.json"
 
 
 class SchedulerOwnershipError(RuntimeError):
@@ -467,38 +469,60 @@ def _check_rollback_drain(snapshot: Dict[str, Any]) -> None:
             ", ".join("{0}={1}".format(k, v) for k, v in sorted(in_flight.items()))))
 
 
+def _build_rollback_manifest(state: Dict[str, Any], baseline_db_path: Path,
+                             tasks_db_path: Path) -> Dict[str, Any]:
+    if Path(baseline_db_path).resolve() == Path(tasks_db_path).resolve():
+        raise OwnershipConflictError("increment reconciliation requires an independent baseline")
+    baseline = _rollback_snapshot(baseline_db_path)
+    current = _rollback_snapshot(tasks_db_path)
+    _check_rollback_drain(current)
+    manifest = {
+        "generation": state["generation"], "freeze_id": state["freeze_id"],
+        "cutover_id": state["cutover_id"], "task_store_sha256": _snapshot_digest(current),
+        "baseline_sha256": _snapshot_digest(baseline),
+        "baseline_tasks": len(baseline["tasks"]),
+        "baseline_outbox_events": len(baseline["outbox"]),
+    }
+    for table, result_key in (("tasks", "increment_tasks"),
+                              ("outbox", "increment_outbox_sequences")):
+        missing_or_changed = [key for key, row in baseline[table].items()
+                              if current[table].get(key) != row]
+        if missing_or_changed:
+            raise OwnershipConflictError(
+                "baseline {0} differs: {1} missing or changed".format(table, len(missing_or_changed)))
+        manifest[result_key] = sorted(current[table].keys() - baseline[table].keys())
+    return manifest
+
+
 def record_rollback_reconciliation(registry_root, baseline_db_path, tasks_db_path) -> Dict[str, Any]:
-    """Compare baseline rows in full, then record the drained increment."""
+    """Replace rollback authorization with the result of the latest attempt."""
     root = Path(registry_root)
     with _RegistryLock(root):
         state = load_state(root)
         if not state["intake_frozen"] or not state["freeze_id"]:
             raise OwnershipConflictError("increment reconciliation requires frozen intake")
-        if Path(baseline_db_path).resolve() == Path(tasks_db_path).resolve():
-            raise OwnershipConflictError("increment reconciliation requires an independent baseline")
+        manifest_path = root / ROLLBACK_MANIFEST_FILENAME
+        # A switch takes this same lock. Archive the active receipt atomically
+        # before reading either store so any failed refresh leaves no permit.
         try:
-            baseline = _rollback_snapshot(baseline_db_path)
-            current = _rollback_snapshot(tasks_db_path)
-        except (OSError, sqlite3.Error) as exc:
+            manifest_path.replace(root / PREVIOUS_ROLLBACK_MANIFEST_FILENAME)
+        except FileNotFoundError:
+            pass
+        audit = {key: state[key] for key in ("generation", "freeze_id", "cutover_id")}
+        try:
+            manifest = _build_rollback_manifest(state, baseline_db_path, tasks_db_path)
+        except (OwnershipConflictError, OSError, sqlite3.Error) as exc:
+            _append_event(root, dict(audit, event="rollback_reconciliation_failed",
+                                     reason=str(exc), at=_now_iso()))
+            if isinstance(exc, OwnershipConflictError):
+                raise
             raise OwnershipConflictError("cannot read stores for increment reconciliation: {0}".format(exc)) from exc
-        _check_rollback_drain(current)
-        manifest = {
-            "generation": state["generation"], "freeze_id": state["freeze_id"],
-            "cutover_id": state["cutover_id"], "task_store_sha256": _snapshot_digest(current),
-            "baseline_sha256": _snapshot_digest(baseline),
-            "baseline_tasks": len(baseline["tasks"]),
-            "baseline_outbox_events": len(baseline["outbox"]),
-        }
-        for table, result_key in (("tasks", "increment_tasks"),
-                                  ("outbox", "increment_outbox_sequences")):
-            missing_or_changed = [key for key, row in baseline[table].items()
-                                  if current[table].get(key) != row]
-            if missing_or_changed:
-                raise OwnershipConflictError(
-                    "baseline {0} differs: {1} missing or changed".format(table, len(missing_or_changed)))
-            manifest[result_key] = sorted(current[table].keys() - baseline[table].keys())
-        atomic_write_text(root / "rollback_increments.json",
-                          json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        _append_event(root, dict(audit, event="rollback_reconciliation_verified", at=_now_iso(),
+                                 baseline_sha256=manifest["baseline_sha256"],
+                                 task_store_sha256=manifest["task_store_sha256"],
+                                 baseline_tasks=manifest["baseline_tasks"],
+                                 baseline_outbox_events=manifest["baseline_outbox_events"]))
+        atomic_write_text(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
         return manifest
 
 
@@ -506,7 +530,7 @@ def evaluate_rollback_readiness(registry_root, tasks_db_path) -> Dict[str, Any]:
     """Require a drained store and reconciliation of this exact freeze and store."""
     root = Path(registry_root)
     state = load_state(root)
-    manifest_path = root / "rollback_increments.json"
+    manifest_path = root / ROLLBACK_MANIFEST_FILENAME
     blockers = []
     in_flight = {}
     try:

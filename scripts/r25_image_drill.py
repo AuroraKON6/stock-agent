@@ -26,6 +26,8 @@ Subcommands (each prints one JSON object; exit 0 on success):
     provenance <binding-file> <digest>  verify shipped PROVENANCE vs the binding
     wal-fixture <db>               copy a quiescent main DB and uncheckpointed WAL
     wal-fingerprint <db>           hash both files from the read-only cross mount
+    wal-retry-fixture <source> <db> <staged-wal>
+                                  clone a valid baseline and stage its uncheckpointed WAL
 """
 from __future__ import annotations
 
@@ -272,14 +274,17 @@ def _registry_state(root: Path) -> dict:
     events = []
     events_path = root / "events.jsonl"
     if events_path.is_file():
-        events = [json.loads(line).get("event") for line in events_path.read_text(encoding="utf-8").splitlines()]
+        events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines()]
     digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None  # noqa: E731
     return {"owner": state["active_scheduler"], "generation": state["generation"],
             "frozen": state["intake_frozen"], "freeze_id": state.get("freeze_id", ""),
-            "cutover_id": state.get("cutover_id", ""), "audit_events": events,
+            "cutover_id": state.get("cutover_id", ""), "audit_events": [event["event"] for event in events],
+            "reconciliation_events": [event for event in events
+                                      if event["event"].startswith("rollback_reconciliation_")],
             "legacy_disabled_marker": (root / "legacy_disabled.json").is_file(),
             "sha256": {name: digest(root / name) for name in
-                       ("state.json", "events.jsonl", "rollback_increments.json")}}
+                       ("state.json", "events.jsonl", "rollback_increments.json",
+                        "rollback_increments.previous.json")}}
 
 
 def _resolved(config_relative: str) -> dict:
@@ -523,6 +528,29 @@ def cmd_wal_fixture(path_value: str) -> int:
     return 0 if (tasks, outbox) == (1, 1) else 1
 
 
+def cmd_wal_retry_fixture(source_value: str, baseline_value: str, staged_wal_value: str) -> int:
+    baseline = _project_path(baseline_value)
+    staged_wal = _project_path(staged_wal_value)
+    baseline.parent.mkdir(parents=True)
+    with tempfile.TemporaryDirectory() as workspace:
+        scratch = Path(workspace) / baseline.name
+        with closing(_connect(_project_path(source_value))) as source, closing(sqlite3.connect(scratch)) as db:
+            source.backup(db)
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA wal_autocheckpoint=0")
+            db.execute("CREATE TABLE r25_retry_fixture (note TEXT)")
+            db.commit()
+            if db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone() != (0, 0, 0):
+                raise RuntimeError("could not checkpoint the retry fixture")
+            shutil.copyfile(scratch, baseline)
+            db.execute("INSERT INTO r25_retry_fixture VALUES ('committed WAL frames')")
+            db.commit()
+            shutil.copyfile(scratch.with_name(scratch.name + "-wal"), staged_wal)
+    emit({"baseline": str(baseline), "staged_wal": str(staged_wal),
+          "wal_bytes": staged_wal.stat().st_size})
+    return 0 if staged_wal.stat().st_size > 0 else 1
+
+
 def cmd_wal_fingerprint(path_value: str) -> int:
     db = _project_path(path_value)
     wal = db.with_name(db.name + "-wal")
@@ -548,6 +576,7 @@ COMMANDS = {
     "provenance": lambda args: cmd_provenance(args[0], args[1]),
     "wal-fixture": lambda args: cmd_wal_fixture(args[0]),
     "wal-fingerprint": lambda args: cmd_wal_fingerprint(args[0]),
+    "wal-retry-fixture": lambda args: cmd_wal_retry_fixture(*args),
 }
 
 

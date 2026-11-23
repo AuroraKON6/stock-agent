@@ -344,6 +344,10 @@ wal_baseline = json.loads(json.dumps(container))
 wal_baseline["task_runtime"]["db_path"] = "data/restored_readonly/drill/wal_probe/tasks.sqlite3"
 (config_root / "container" / "baseline-wal.json").write_text(
     json.dumps(wal_baseline, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+retry = json.loads(json.dumps(container))
+retry["task_runtime"]["db_path"] = "data/restored_readonly/drill/retry/tasks.sqlite3"
+(config_root / "container" / "baseline-retry.json").write_text(
+    json.dumps(retry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 # The legacy side's working config: same shared registry, recovered store.
 legacy = on_tree(container, "")
 # The evidence the legacy side must see is the RECOVERED evidence: its vault
@@ -372,7 +376,34 @@ stepin 089-wal-inspect-after 0 "$HELPER" CB run --rm -T research-api python -B -
 [ "$(jget sha256)" = "$WAL_BEFORE" ] || FAILED=$((FAILED + 1))
 step 090-rollback-refused-without-reconciliation 21 CB run --rm -T research-api "${CLI[@]}" cutover-switch --config "$DRILL_CONFIG" \
   --to legacy-powershell --actor "$ACTOR" --reason "R25 image verification rollback" --cutover-id "$CUTOVER_ID" --expected-generation 1
-step 091-rollback-reconcile 0 CB run --rm -T research-api "${CLI[@]}" cutover-reconcile-rollback --config "$DRILL_CONFIG" --baseline-config /drill-config/baseline.json
+RETRY_BASELINE=data/drill/retry/tasks.sqlite3
+RETRY_BASELINE_RO=data/restored_readonly/drill/retry/tasks.sqlite3
+RETRY_CONFIG=/drill-config/baseline-retry.json
+stepin 091a-wal-retry-fixture 0 "$HELPER" L run --rm -T research-api python -B - wal-retry-fixture \
+  "$RESTORED/data/task_runtime/tasks.sqlite3" "$RETRY_BASELINE" data/drill/retry.wal
+step 091b-reconcile-before-retry 0 CB run --rm -T research-api "${CLI[@]}" cutover-reconcile-rollback \
+  --config "$DRILL_CONFIG" --baseline-config "$RETRY_CONFIG"
+stepin 091c-registry-before-retry 0 "$HELPER" CB run --rm -T research-api python -B - registry "$DRILL_CONFIG"
+BEFORE_RETRY_STATE="$(jget owner)/$(jget generation)/$(jget freeze_id)"
+step 091d-expose-retry-wal 0 L run --rm -T research-api sh -c \
+  'mv "$APP_STATE_ROOT/drill/retry.wal" "$APP_STATE_ROOT/drill/retry/tasks.sqlite3-wal"'
+stepin 091e-retry-wal-before 0 "$HELPER" CB run --rm -T research-api python -B - wal-fingerprint "$RETRY_BASELINE_RO"
+RETRY_WAL_HASHES="$(jget sha256)"
+step 091f-reconciliation-retry-refused 21 CB run --rm -T research-api "${CLI[@]}" cutover-reconcile-rollback \
+  --config "$DRILL_CONFIG" --baseline-config "$RETRY_CONFIG"
+if ! grep -q 'nonempty WAL could not be read' "$LAST"; then FAILED=$((FAILED + 1)); fi
+stepin 091g-retry-wal-after 0 "$HELPER" CB run --rm -T research-api python -B - wal-fingerprint "$RETRY_BASELINE_RO"
+[ "$(jget sha256)" = "$RETRY_WAL_HASHES" ] || FAILED=$((FAILED + 1))
+stepin 091h-registry-after-retry 0 "$HELPER" CB run --rm -T research-api python -B - registry "$DRILL_CONFIG"
+[ "$(jget owner)/$(jget generation)/$(jget freeze_id)" = "$BEFORE_RETRY_STATE" ] || FAILED=$((FAILED + 1))
+REGISTRY_AFTER_RETRY="$(jget sha256)"
+step 091i-rollback-refused-after-retry 21 CB run --rm -T research-api "${CLI[@]}" cutover-switch --config "$DRILL_CONFIG" \
+  --to legacy-powershell --actor "$ACTOR" --reason "R25 image verification rollback" --cutover-id "$CUTOVER_ID" --expected-generation 1
+if ! grep -q 'rollback switch blocked by readiness checks' "$LAST"; then FAILED=$((FAILED + 1)); fi
+stepin 091j-registry-after-refused-switch 0 "$HELPER" CB run --rm -T research-api python -B - registry "$DRILL_CONFIG"
+[ "$(jget sha256)" = "$REGISTRY_AFTER_RETRY" ] || FAILED=$((FAILED + 1))
+step 091k-rollback-reconcile 0 CB run --rm -T research-api "${CLI[@]}" cutover-reconcile-rollback \
+  --config "$DRILL_CONFIG" --baseline-config /drill-config/baseline.json
 step 092-rollback-switch 0 CB run --rm -T research-api "${CLI[@]}" cutover-switch --config "$DRILL_CONFIG" \
   --to legacy-powershell --actor "$ACTOR" --reason "R25 image verification rollback" --cutover-id "$CUTOVER_ID" --expected-generation 1
 step 093-rollback-thaw 0 L run --rm -T research-api "${CLI[@]}" cutover-thaw --config "$DRILL_CONFIG" --actor "$ACTOR" --reason "R25 image verification: legacy resumed"

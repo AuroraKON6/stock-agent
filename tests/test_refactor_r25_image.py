@@ -314,6 +314,55 @@ class ReadOnlyBaselineSnapshotTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in baseline.parent.iterdir()),
                          sorted((self.source.name, self.wal.name)))
 
+    def test_failed_retry_invalidates_prior_reconciliation_in_same_freeze(self):
+        from stock_agent.scheduler_ownership import (
+            CONTAINER_SCHEDULER_ID,
+            OwnershipConflictError,
+            evaluate_rollback_readiness,
+            freeze_intake,
+            initialize_registry,
+            record_rollback_reconciliation,
+        )
+
+        complete = self.root / "checkpointed.sqlite3"
+        with closing(sqlite3.connect(complete)) as destination:
+            self.connection.backup(destination)
+        unreadable = self.readonly_copy()
+        registry = self.root / "ownership"
+        initialize_registry(registry, first_scheduler=CONTAINER_SCHEDULER_ID, actor="test")
+        freeze = freeze_intake(registry, actor="test", reason="test failed refresh", cutover_id="retry")
+        state_file = registry / "state.json"
+        frozen_state = state_file.read_bytes()
+        active = registry / "rollback_increments.json"
+        previous = registry / "rollback_increments.previous.json"
+
+        first = record_rollback_reconciliation(registry, complete, self.source)
+        self.assertEqual((first["baseline_tasks"], first["baseline_outbox_events"]), (1, 1))
+        self.assertTrue(evaluate_rollback_readiness(registry, self.source)["ok"])
+        first_receipt = active.read_bytes()
+
+        with self.assertRaisesRegex(OwnershipConflictError, "nonempty WAL"):
+            record_rollback_reconciliation(registry, unreadable, self.source)
+        self.assertFalse(evaluate_rollback_readiness(registry, self.source)["ok"])
+        self.assertFalse(active.exists())
+        self.assertEqual(previous.read_bytes(), first_receipt)
+        self.assertEqual(state_file.read_bytes(), frozen_state)
+
+        refreshed = record_rollback_reconciliation(registry, complete, self.source)
+        self.assertEqual(refreshed["freeze_id"], freeze["freeze_id"])
+        self.assertTrue(evaluate_rollback_readiness(registry, self.source)["ok"])
+        self.assertEqual(previous.read_bytes(), first_receipt)
+        self.assertEqual(state_file.read_bytes(), frozen_state)
+
+        events = [json.loads(line) for line in (registry / "events.jsonl").read_text().splitlines()]
+        attempts = events[-3:]
+        self.assertEqual([event["event"] for event in attempts], [
+            "rollback_reconciliation_verified", "rollback_reconciliation_failed",
+            "rollback_reconciliation_verified",
+        ])
+        self.assertTrue(all(event["freeze_id"] == freeze["freeze_id"] for event in attempts))
+        self.assertIn("nonempty WAL", attempts[1]["reason"])
+
     def test_rollback_snapshot_reads_fully_checkpointed_readonly_snapshot(self):
         from stock_agent.scheduler_ownership import _rollback_snapshot
 
