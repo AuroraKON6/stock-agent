@@ -1306,7 +1306,11 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     symbols=[str(s) for s in (body.get("symbols") or [])],
                     execution_mode=str(body.get("execution_mode") or "replay"),
                     config=config,
-                    document_ids=[str(d) for d in (body.get("document_ids") or [])])
+                    document_ids=[str(d) for d in (body.get("document_ids") or [])],
+                    # R15: excerpt selectors the user approved from their own
+                    # namespace; validated against the owner's personal vault
+                    # view by the workspace service before anything is created.
+                    fact_selectors=list(body.get("fact_selectors") or []))
             elif action == "cancel":
                 result = {"task": personal_workspace.cancel_personal_task(
                     store, actor=session.actor,
@@ -1365,6 +1369,9 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                    "task_id": str(task.get("task_id") or "")}
         if "supersedes_task_id" in result:
             payload["prior_task_id"] = result.get("supersedes_task_id")
+        for count_key in ("documents_attached", "facts_attached"):
+            if result.get(count_key) is not None:
+                payload[count_key] = result[count_key]
         if task:
             payload["task"] = task
         self._send_json(200, payload)

@@ -27,6 +27,7 @@ from .agent_protocol import (
     validate_model_output,
 )
 from .config import project_path
+from .fact_bundle import FactBundleError
 from .invocation_runtime import (
     ModelCallNotSent,
     ModelKnownFailure,
@@ -359,6 +360,48 @@ def build_user_prompt(task: Dict[str, Any], safe_payload: Dict[str, Any], safe_c
     return json.dumps(prompt, ensure_ascii=False, default=str)
 
 
+def freeze_approved_fact_bundle(task: Dict[str, Any], config: Dict[str, Any],
+                                safe_context: Dict[str, Any],
+                                delivery: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+    """R13: freeze the attempt's fact bundle over an ASSEMBLED safe context.
+
+    Payload-declared facts with no host-policy basis and registry-denied
+    sources are excluded with recorded reasons (A60/A61); only still-
+    deliverable bundle facts enter the minimized model context. The bundle
+    records the EXACT outbound payload hash (A63) with the SAME canonical
+    digest the delivery record shows. Returns the (possibly extended)
+    context, the (possibly extended) delivery record, and the bound bundle
+    (None when the payload declares no facts). Every caller re-runs this
+    over the CURRENT payload/context — a rebuild that forgets it would let
+    the delivery record claim facts a later round never carried."""
+    payload_facts = (task.get("input_payload") or {}).get("approved_facts") or []
+    fact_selectors = [item for item in payload_facts
+                      if isinstance(item, dict) and "excerpt_sha256" in item]
+    fact_records = [item for item in payload_facts
+                    if isinstance(item, dict) and "excerpt_sha256" not in item]
+    if not fact_selectors and not fact_records:
+        return safe_context, delivery, None
+    from .fact_bundle import bind_outbound_payload, build_research_fact_bundle, payload_digest
+
+    bundle = build_research_fact_bundle(
+        config, task, fact_selectors=fact_selectors,
+        extra_facts=fact_records)
+    # Only STILL-DELIVERABLE bundle facts enter the minimized model context;
+    # exclusions live in the audit, never in the prompt.
+    delivered_facts = [dict(fact, content=str(fact.get("content") or "")[:1000])
+                       for fact in bundle.get("facts") or []]
+    if delivered_facts:
+        safe_context = dict(safe_context)
+        safe_context["verified_facts"] = delivered_facts
+    # A63: bind the payload hash AFTER the final context is assembled, with
+    # the SAME canonical digest the delivery record shows.
+    outbound_hash = payload_digest(safe_context)
+    bundle = bind_outbound_payload(bundle, safe_context)
+    delivery = dict(delivery, fact_bundle_id=bundle["bundle_id"],
+                    outbound_sha256=outbound_hash)
+    return safe_context, delivery, bundle
+
+
 def run_research_task(
     store: TaskStore,
     task_id: str,
@@ -592,33 +635,12 @@ def run_research_task(
     # registry-denied sources are excluded here with recorded reasons
     # (A60/A61); the bundle snapshot rides the model_call audit.
     try:
-        from .fact_bundle import (FactBundleError, bind_outbound_payload,
-                                  build_research_fact_bundle, payload_digest)
-
-        payload_facts = (task.get("input_payload") or {}).get("approved_facts") or []
-        fact_selectors = [item for item in payload_facts
-                          if isinstance(item, dict) and "excerpt_sha256" in item]
-        fact_records = [item for item in payload_facts
-                        if isinstance(item, dict) and "excerpt_sha256" not in item]
-        if fact_selectors or fact_records:
-            bundle = build_research_fact_bundle(
-                config, task, fact_selectors=fact_selectors,
-                extra_facts=fact_records)
-            # Only STILL-DELIVERABLE bundle facts enter the minimized model
-            # context; exclusions live in the audit, never in the prompt.
-            delivered_facts = [dict(fact, content=str(fact.get("content") or "")[:1000])
-                               for fact in bundle.get("facts") or []]
-            if delivered_facts:
-                safe_context = dict(safe_context)
-                safe_context["verified_facts"] = delivered_facts
-            # A63: bind the payload hash AFTER the final context is assembled,
-            # with the SAME canonical digest the delivery record shows.
-            model_call["outbound_context"] = safe_context
-            outbound_hash = payload_digest(safe_context)
-            model_call["fact_bundle"] = bind_outbound_payload(bundle, safe_context)
-            model_call["context_delivery"] = dict(
-                delivery, fact_bundle_id=bundle["bundle_id"],
-                outbound_sha256=outbound_hash)
+        safe_context, delivery, bundle = freeze_approved_fact_bundle(
+            task, config, safe_context, delivery)
+        model_call["context_delivery"] = delivery
+        model_call["outbound_context"] = safe_context
+        if bundle is not None:
+            model_call["fact_bundle"] = bundle
     except FactBundleError as exc:
         model_call["fact_bundle_error"] = str(exc)[:300]
 
@@ -668,6 +690,17 @@ def run_research_task(
                 if not allowed:
                     return _blocked(reason, governance)
                 safe_context, delivery = build_safe_research_context(task.get("input_payload") or {}, config=config)
+                # The fact bundle re-freezes per round (A62: selectors
+                # re-verify against the CURRENT vault), so a later round's
+                # prompt carries the same approved facts — a rebuild without
+                # this would silently drop them after round one.
+                try:
+                    safe_context, delivery, bundle = freeze_approved_fact_bundle(
+                        task, config, safe_context, delivery)
+                    if bundle is not None:
+                        model_call["fact_bundle"] = bundle
+                except FactBundleError as exc:
+                    model_call["fact_bundle_error"] = str(exc)[:300]
                 model_call["context_delivery"] = delivery
                 model_call["outbound_context"] = safe_context
 
@@ -793,7 +826,19 @@ def run_research_task(
         try:
             parsed = _parse_llm_json(raw_text)
             output = parsed[0] if isinstance(parsed, list) and parsed else parsed
-            safe_context, _delivery = build_safe_research_context(task.get("input_payload") or {}, config=config)
+            safe_context, delivery = build_safe_research_context(task.get("input_payload") or {}, config=config)
+            # The re-verified context must include the SAME frozen facts the
+            # delivery record reports, or the quality gate below would judge
+            # the report against a context that dropped them.
+            try:
+                safe_context, delivery, bundle = freeze_approved_fact_bundle(
+                    task, config, safe_context, delivery)
+                model_call["context_delivery"] = delivery
+                model_call["outbound_context"] = safe_context
+                if bundle is not None:
+                    model_call["fact_bundle"] = bundle
+            except FactBundleError as exc:
+                model_call["fact_bundle_error"] = str(exc)[:300]
             allowed_refs = sorted(safe_context.get("evidence_summaries", {}).keys())
             output = validate_model_output(output, allowed_evidence_refs=allowed_refs)
             claimed_task_id = str(output.get("task_id") or task_id)

@@ -43,7 +43,12 @@ from .task_runtime.store import (
 class WorkspaceError(ValueError):
     """reason codes: empty_question, no_symbols, unknown_task, task_terminal,
     not_awaiting, not_succeeded, cancel_terminal, unknown_document,
-    empty_note, already_acknowledged"""
+    invalid_fact_selector, empty_note, already_acknowledged"""
+
+
+# Same cap the R13 fact bundle enforces; the entry rejects instead of letting
+# the bundle silently truncate a user's selection.
+MAX_CREATE_FACT_SELECTORS = 50
 
 
 def _resolve_personal_documents(config: Optional[Dict[str, Any]], actor: str,
@@ -73,11 +78,48 @@ def _resolve_personal_documents(config: Optional[Dict[str, Any]], actor: str,
     }
 
 
+def _resolve_personal_fact_selectors(config: Optional[Dict[str, Any]], actor: str,
+                                     fact_selectors: Optional[list]) -> List[Dict[str, Any]]:
+    """Validate the user's excerpt-selector submission against the OWNER's
+    personal namespace BEFORE anything is created (same fail-closed contract
+    as the document selection): a selector that does not verify against the
+    owner's own vault view — foreign namespace, stale hash, shifted range —
+    never rides a task input, and a rejected create leaves the queue
+    untouched. This grants no egress right: the worker re-verifies every
+    selector against the CURRENT vault and host egress policy when it freezes
+    the attempt's fact bundle (R13/A60–A63)."""
+    wanted = list(fact_selectors or [])
+    if not wanted:
+        return []
+    if len(wanted) > MAX_CREATE_FACT_SELECTORS:
+        raise WorkspaceError(
+            "invalid_fact_selector: at most {0} selectors per research".format(
+                MAX_CREATE_FACT_SELECTORS))
+    from .evidence_excerpts import SELECTOR_FIELDS, EvidenceExcerptError, verify_excerpt_selection
+    from .personal_evidence import personal_vault_view
+
+    view = personal_vault_view(config or {}, actor)
+    resolved: List[Dict[str, Any]] = []
+    for item in wanted:
+        if not isinstance(item, dict) or set(item) != set(SELECTOR_FIELDS):
+            raise WorkspaceError(
+                "invalid_fact_selector: expected exactly the excerpt selector fields")
+        try:
+            verify_excerpt_selection(view, item)
+        except EvidenceExcerptError as exc:
+            raise WorkspaceError(
+                "invalid_fact_selector: not verifiable in the personal namespace of {0}: {1}".format(
+                    actor, exc))
+        resolved.append({field: item[field] for field in SELECTOR_FIELDS})
+    return resolved
+
+
 def create_personal_research(store: TaskStore, *, actor: str, question: str,
                              symbols: list, execution_mode: str = "replay",
                              config: Optional[Dict[str, Any]] = None,
                              intent_id: str = "",
-                             document_ids: Optional[list] = None) -> Dict[str, Any]:
+                             document_ids: Optional[list] = None,
+                             fact_selectors: Optional[list] = None) -> Dict[str, Any]:
     question = str(question or "").strip()
     symbols = [str(s).strip() for s in (symbols or []) if str(s).strip()]
     if not question:
@@ -88,20 +130,30 @@ def create_personal_research(store: TaskStore, *, actor: str, question: str,
     # untouched, so retrying with a corrected selection creates exactly one
     # task (a leftover orphan would swallow the retry as DUPLICATE).
     attachments = _resolve_personal_documents(config, actor, document_ids)
-    # The selected documents ride the task's FIRST input version, inside the
-    # same create transaction: the task becomes claimable only WITH its
-    # complete input, so any worker's first claim already sees the sources.
-    # The R01 snapshot chain stays fully intact (v1 snapshot written at
-    # creation; every later follow-up keeps bumping immutable versions).
+    selectors = _resolve_personal_fact_selectors(config, actor, fact_selectors)
+    # The selected documents AND facts ride the task's FIRST input version,
+    # inside the same create transaction: the task becomes claimable only
+    # WITH its complete input, so any worker's first claim already sees the
+    # sources. The R01 snapshot chain stays fully intact (v1 snapshot written
+    # at creation; every later follow-up keeps bumping immutable versions).
+    overrides: Dict[str, Any] = {}
+    if attachments:
+        overrides["public_context"] = {"evidence_summaries": attachments}
+    if selectors:
+        # R15: the user's approved announcement facts enter as excerpt
+        # SELECTORS — content stays in the vault; the worker rebuilds and
+        # re-verifies everything at attempt time (A62/A63).
+        overrides["approved_facts"] = selectors
     result = ensure_question_task(
         store, research_question=question, symbols=symbols,
         config=config, actor=actor, execution_mode=execution_mode,
         intent_id=intent_id,
-        spec_overrides=(
-            {"public_context": {"evidence_summaries": attachments}}
-            if attachments else None))
-    if attachments and str(result.get("status") or "") == "RECORDED":
-        result["documents_attached"] = len(attachments)
+        spec_overrides=(overrides or None))
+    if str(result.get("status") or "") == "RECORDED":
+        if attachments:
+            result["documents_attached"] = len(attachments)
+        if selectors:
+            result["facts_attached"] = len(selectors)
     return result
 
 
