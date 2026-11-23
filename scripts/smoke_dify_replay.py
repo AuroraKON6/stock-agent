@@ -140,14 +140,22 @@ def run(directory: Path) -> None:
     if not subprocess.check_output(compose + ["ps", "-q", "--status", "running", "nginx"]).strip():
         raise RuntimeError(f"start the disposable {PROJECT} project before exercising its console")
     # Compose can report the worker as running before Celery consumes workflows.
+    worker = subprocess.check_output(compose + ["ps", "-q", "worker"], text=True).strip()
+    if not worker:
+        raise RuntimeError("the disposable Dify worker was not started")
     deadline = time.monotonic() + 180
-    while True:
-        logs = subprocess.check_output(compose + ["logs", "--no-color", "--tail", "80", "worker"], timeout=20)
+    while time.monotonic() < deadline:
+        try:
+            logs = subprocess.check_output(
+                ["docker", "logs", "--tail", "80", worker], stderr=subprocess.STDOUT, timeout=20,
+            )
+        except subprocess.TimeoutExpired:
+            continue
         if any(b"celery@" in line and line.rstrip().endswith(b" ready.") for line in logs.splitlines()):
             break
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Dify Celery worker did not become ready in 180 seconds")
         time.sleep(2)
+    else:
+        raise TimeoutError("Dify Celery worker did not become ready in 180 seconds")
     print("Dify Celery worker ready", flush=True)
     config = json.loads((directory / "console.json").read_bytes())
     console = Console()
