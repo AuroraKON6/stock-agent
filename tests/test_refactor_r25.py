@@ -23,13 +23,16 @@ O-layer coverage of the cutover discipline (GLM_REFACTOR_TASKBOOK R25):
   connections) — converges on ONE task with ONE execution's outbox/billing
   footprint. The cross-RESTART container half stays with the drill.
 """
+import io
 import json
 import sys
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from stock_agent.config import project_path_override
 from stock_agent.scheduler_ownership import (
@@ -638,6 +641,81 @@ class SameSlotNoDuplicateTests(R25TestCase):
         finally:
             store.close()
         self.assertEqual(final["status"], "succeeded")
+
+
+class ScheduledSlotReplayCliTests(R25TestCase):
+    shanghai_slot = "2026-11-20T08:30:00+08:00"
+    utc_slot = "2026-11-20T00:30:00Z"
+    schedule = "legacy-daily-research"
+    scope = "r25-test-v1"
+
+    def setUp(self):
+        super().setUp()
+        from stock_agent.research_worker import run_research_task
+        from stock_agent.worker_service import scheduled_slot_key
+
+        cli_config = self.gate_config(scheduler_id=CONTAINER_SCHEDULER_ID)
+        cli_config["task_runtime"] = {"db_path": str(self.db_path)}
+        self.config_path = self.root / "schedule.json"
+        self.config_path.write_text(json.dumps(cli_config), encoding="utf-8")
+        initialize_registry(self.registry, first_scheduler=CONTAINER_SCHEDULER_ID, actor="test")
+        self.spec = _replay_spec(self.config, "R25 研究一个已执行的旧时隙")
+        self.intent = scheduled_slot_key(self.schedule, self.shanghai_slot, scope_version=self.scope)
+        # Reproduce the original CLI's stored payload, including its raw offset.
+        self.legacy_slot = {"schedule_id": self.schedule, "planned_slot": self.shanghai_slot,
+                            "scope_version": self.scope}
+        with closing(TaskStore(self.db_path)) as store:
+            task, _ = store.create_task(
+                title="Legacy slot", input_payload=dict(self.spec, scheduled_slot=self.legacy_slot),
+                execution_mode="replay", business_intent_id=self.intent)
+            self.task_id = task["task_id"]
+            store.claim_next("w-r25", ttl_seconds=60)
+            outcome = run_research_task(store, self.task_id, worker_id="w-r25",
+                                        config=self.config, ttl_seconds=60)
+            self.assertEqual(outcome["status"], "succeeded")
+
+    def _submit(self, planned_slot, spec):
+        from stock_agent.cli import main
+
+        path = self.root / "spec.json"
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        argv = ["stock_agent", "scheduled-task-submit", "--config", str(self.config_path),
+                "--scheduler", CONTAINER_SCHEDULER_ID, "--schedule-id", self.schedule,
+                "--scope-version", self.scope, "--spec", str(path), "--planned-slot", planned_slot]
+        with patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()) as output:
+            main()
+        return json.loads(output.getvalue())
+
+    def _accounting(self):
+        with closing(TaskStore(self.db_path, read_only=True)) as store:
+            task = store.get_task(self.task_id)
+            self.assertEqual(task["input_payload"]["scheduled_slot"], self.legacy_slot)
+            self.assertEqual(task["status"], "succeeded")
+            return (len(store.list_tasks()), task["attempt_count"], len(store.events_after(0)),
+                    sum(bool(attempt["budget_event_id"])
+                        for attempt in store.invocation_attempts(self.task_id)))
+
+    def test_public_entry_reuses_old_payload_for_both_timezones(self):
+        before = self._accounting()
+        self.assertEqual(before, (1, 1, 4, 0))
+        for planned_slot in (self.shanghai_slot, self.utc_slot):
+            with self.subTest(planned_slot=planned_slot):
+                self.assertEqual(self._submit(planned_slot, self.spec), {
+                    "task_id": self.task_id, "intent": self.intent, "dedup": "DUPLICATE",
+                    "status": "succeeded",
+                })
+                self.assertEqual(self._accounting(), before)
+
+    def test_public_entry_still_rejects_a_different_request_under_the_same_intent(self):
+        before = self._accounting()
+        for planned_slot, spec in (
+            (self.utc_slot, dict(self.spec, research_question="不同的研究问题")),
+            ("2026-11-20T00:30:00.125Z", self.spec),
+        ):
+            with self.subTest(planned_slot=planned_slot):
+                with self.assertRaisesRegex(SystemExit, "already names a different request"):
+                    self._submit(planned_slot, spec)
+                self.assertEqual(self._accounting(), before)
 
 
 class DefaultStateTests(unittest.TestCase):

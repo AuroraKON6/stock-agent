@@ -32,6 +32,7 @@ x-drill-base: &drill-base
     - ../../scripts/r25_precheck_drill.py:/drills/r25_precheck_drill.py:ro
     - ../../stock_agent/scheduler_ownership.py:/app/stock_agent/scheduler_ownership.py:ro
     - ../../stock_agent/cli.py:/app/stock_agent/cli.py:ro
+    - ../../stock_agent/task_runtime/store.py:/app/stock_agent/task_runtime/store.py:ro
     - ../../scripts/run_daily_research.ps1:/app/scripts/run_daily_research.ps1:ro
     - ../../scripts/set_scheduled_tasks_enabled.ps1:/app/scripts/set_scheduled_tasks_enabled.ps1:ro
     - ../../tests/r25_scheduled_tasks_mock.ps1:/drills/r25_scheduled_tasks_mock.ps1:ro

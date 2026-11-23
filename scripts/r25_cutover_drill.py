@@ -10,9 +10,9 @@ touched: the legacy entry's disable is a clearly-marked simulated registry
 record whose real-world effect belongs to
 scripts/set_scheduled_tasks_enabled.ps1 in the real window.
 
-The candidate image provides the task store, worker, and backup/restore.
-The checkout supplies the read-only R25 CLI, ownership module, PowerShell
-entry and drivers (including KONM-27's full-column reconciliation).
+The candidate image provides the worker and backup/restore. The checkout
+supplies the read-only task store, R25 CLI, ownership module, PowerShell entry
+and drivers (including KONM-27's full-column reconciliation).
 
 Every subcommand prints one JSON object to stdout and exits 0 on success /
 non-zero on a failed assertion, so the host-side runner can record real
@@ -139,7 +139,8 @@ def _registry_hash(root: Path) -> dict:
     return files
 
 
-def _scheduled_entry(side: str, planned_slot: str, *, run: bool = True) -> dict:
+def _scheduled_entry(side: str, planned_slot: str, *, run: bool = True,
+                     spec_path: Path | None = None) -> dict:
     """Invoke the actual PowerShell or container scheduled entry in a child process."""
     from stock_agent.config import project_path
 
@@ -153,8 +154,9 @@ def _scheduled_entry(side: str, planned_slot: str, *, run: bool = True) -> dict:
     db_path = project_path(config["task_runtime"]["db_path"])
     root = project_path(config["scheduler_ownership"]["state_dir"])
     before = _store_counts(db_path), _registry_snapshot(root)
-    spec_path = NEW_ROOT / "scheduled_slot_spec.json"
-    spec_path.write_text(json.dumps(slot_task_spec(config, planned_slot)), encoding="utf-8")
+    if spec_path is None:
+        spec_path = NEW_ROOT / "scheduled_slot_spec.json"
+        spec_path.write_text(json.dumps(slot_task_spec(config, planned_slot)), encoding="utf-8")
     if side == "legacy":
         locked_venv = PROJECT_ROOT / ".venv312"
         if not locked_venv.exists():
@@ -816,6 +818,45 @@ def cmd_replay_slot(side: str = "new", planned_slot: str = LEGACY_PLANNED_SLOT) 
     return 0 if ok else 11
 
 
+def cmd_replay_equivalent_slots() -> int:
+    """Replay the restored payload with two equivalent spellings and one changed request."""
+    from contextlib import closing
+
+    utc_slot = "2026-11-20T00:30:00Z"
+    intent = slot_key(LEGACY_PLANNED_SLOT)
+    db_path = new_tasks_db()
+    before = intent_accounting(db_path, intent)
+    task_id = before["tasks"][0]["task_id"]
+    with closing(open_new_store(read_only=True)) as store:
+        saved_spec = store.get_task(task_id)["input_payload"]
+    same_path = NEW_ROOT / "scheduled_slot_restored_spec.json"
+    same_path.write_text(json.dumps(saved_spec), encoding="utf-8")
+    changed_path = NEW_ROOT / "scheduled_slot_changed_spec.json"
+    changed_path.write_text(
+        json.dumps(dict(saved_spec, research_question="R25 changed research request")), encoding="utf-8")
+
+    attempts = []
+    for planned_slot in (LEGACY_PLANNED_SLOT, utc_slot):
+        entry = _scheduled_entry("new", planned_slot, run=False, spec_path=same_path)
+        attempts.append(entry)
+    conflict = _scheduled_entry("new", utc_slot, run=False, spec_path=changed_path)
+    after = intent_accounting(db_path, intent)
+    with closing(open_new_store(read_only=True)) as store:
+        payload_unchanged = store.get_task(task_id)["input_payload"] == saved_spec
+    ok = (saved_spec["scheduled_slot"]["planned_slot"] == LEGACY_PLANNED_SLOT
+          and all(entry["submission"]["returncode"] == 0
+                  and entry["dedup"] == "DUPLICATE"
+                  and entry["task_id"] == task_id
+                  and entry["accounting"] == before for entry in attempts)
+          and conflict["submission"]["returncode"] == 1
+          and "already names a different request" in conflict["submission"]["stderr_tail"]
+          and conflict["no_writes"] and before == after and payload_unchanged)
+    emit({"phase": "replay_equivalent_slots", "ok": ok, "before": before, "after": after,
+          "stored_planned_slot": saved_spec["scheduled_slot"]["planned_slot"],
+          "payload_unchanged": payload_unchanged, "attempts": attempts, "conflict": conflict})
+    return 0 if ok else 11
+
+
 def cmd_new_slot(index: int, run: bool = True) -> int:
     """Post-cutover incremental slot: a NEW intent on a LATER business day,
     submitted and executed through the container side's normal scheduled
@@ -994,6 +1035,7 @@ COMMANDS = {
     "switch_refuse_no_marker": lambda args: cmd_switch_refuse_no_marker(),
     "switch_new": lambda args: cmd_switch_new(),
     "replay_slot": lambda args: cmd_replay_slot(*args),
+    "replay_equivalent_slots": lambda args: cmd_replay_equivalent_slots(),
     "new_slot": lambda args: cmd_new_slot(int(args[0]) if args else 1,
                                           run=not (len(args) > 1 and args[1] == "norun")),
     "freeze": lambda args: cmd_freeze(),
