@@ -40,6 +40,8 @@ from stock_agent.task_runtime import TaskStore
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _vault_fixture import vault_config
 
+# TEST ACCOUNT for this offline class (the browser launcher uses its own,
+# "a93-browser-user"); neither is a real user.
 OWNER = "lead-analyst"
 SIGNAL_ID = "sig-r15-citation-filing"
 # Public disclosure, stored gzip-compressed so git never rewrites its bytes
@@ -47,12 +49,19 @@ SIGNAL_ID = "sig-r15-citation-filing"
 # the byte-identical original, whose digest is asserted in setUp.
 CASE_PATH = Path(__file__).resolve().parent / "fixtures" / "sse_113610_delisting_20261120.html.gz"
 CASE_SHA256 = "41b121c4662329efcf162cc8bdad87dbeaf4dface4a1f20152447faf60c25ed7"
-CASE_URL = "https://www.sse.com.cn/disclosure/announcement/currency/new/2026-11-20/113610_delisting.html"
+# Announcement address verified on the parent task KONM-4.
+CASE_URL = "https://www.sse.com.cn/disclosure/announcement/listing/stock/c/c_20261120_10838548.shtml"
 FACT_SENTENCE_HEAD = "本所将于2026年12月1日"
 # Explicitly NOT a real disclosure: the control document the task attaches
 # but which is never associated, so it must never be delivered.
+# SYNTHETIC control document written for this test — NOT an exchange page.
+# The vault importer only admits reviewed official domains, so the URL below
+# borrows the exchange host under a clearly non-existent /test-fixtures/
+# path; its body and title both say it is a test placeholder.
+CONTROL_URL = "https://www.sse.com.cn/test-fixtures/synthetic-r15-citation-control.html"
 CONTROL_HTML = """<!DOCTYPE html><html><head><title>R15对照样本乙</title></head>
 <body><h1>对照样本公告（测试占位，非真实披露）</h1>
+<p>本文件是自动化测试写入的合成占位内容，不是任何机构或公司的披露。</p>
 <p>对照样本净利润为 999.99 万元。</p></body></html>"""
 
 
@@ -155,19 +164,22 @@ class R15CitationContractTestCase(unittest.TestCase):
         finally:
             conn.close()
 
-    def _import(self, html, name, title):
+    def _import(self, content: bytes, name: str, title: str, source_url: str):
+        """Write the incoming file as raw bytes: text-mode writes would
+        translate "\r\n" on Windows and change what the vault digests."""
         source = self.root / "incoming"
         source.mkdir(parents=True, exist_ok=True)
         path = source / name
-        path.write_text(html, encoding="utf-8")
+        path.write_bytes(content)
         return import_personal_document(
-            self.config, OWNER, str(path), source_url=CASE_URL + "?name=" + name,
+            self.config, OWNER, str(path), source_url=source_url,
             title=title, published_at="2026-11-20T18:00:00+08:00")["document"]
 
     def _prepare_case(self, *, with_control=True):
         """The user's own actions through production APIs on the public case."""
-        case = self._import(CASE_BYTES.decode("utf-8"),
-                            "sse_113610.html", "灵康转债终止上市公告（上交所，公开样本）")
+        self.assertIn(b"\r\n", CASE_BYTES, "the original carries CRLF line endings")
+        case = self._import(CASE_BYTES, "sse_113610.html",
+                            "灵康转债终止上市公告（上交所，公开样本）", CASE_URL)
         view = personal_vault_view(self.config, OWNER)
         from stock_agent.evidence_vault import link_evidence_to_signal
 
@@ -182,7 +194,8 @@ class R15CitationContractTestCase(unittest.TestCase):
         excerpt = create_excerpt(view, case["document_id"], start, end)
         control = None
         if with_control:
-            control = self._import(CONTROL_HTML, "control.html", "对照样本公告乙（占位）")
+            control = self._import(CONTROL_HTML.encode("utf-8"), "control.html",
+                                   "对照样本公告乙（合成占位，非真实披露）", CONTROL_URL)
         return {"case": case, "control": control, "view": view,
                 "excerpt": excerpt, "selector": excerpt_selector(excerpt),
                 "fact": build_fact(view, excerpt_selector(excerpt), fact_type="statement",
