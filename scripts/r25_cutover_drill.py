@@ -10,11 +10,9 @@ touched: the legacy entry's disable is a clearly-marked simulated registry
 record whose real-world effect belongs to
 scripts/set_scheduled_tasks_enabled.ps1 in the real window.
 
-Everything behavioral that the drill relies on (drain, store dedup by
-business intent, backup/restore, worker entry) runs through the IMAGE's own
-code; only this driver, the reviewed precheck driver (reused for the
-full-column reconciliation), and stock_agent/scheduler_ownership.py (the new
-R25 module, bind-mounted read-only) come from the checkout.
+The candidate image provides the task store, worker, and backup/restore.
+The checkout supplies the read-only R25 CLI, ownership module, PowerShell
+entry and drivers (including KONM-27's full-column reconciliation).
 
 Every subcommand prints one JSON object to stdout and exits 0 on success /
 non-zero on a failed assertion, so the host-side runner can record real
@@ -23,7 +21,7 @@ container commands, exit codes and before/after states verbatim.
 State layout:
     /app/data                                  legacy temp state (source tree)
     /app/data/config/watchlist.drill.json      legacy drill config
-    /app/data/scheduler_ownership/             unique-scheduler registry (source copy)
+    /app/r25-new/scheduler_ownership/          shared ownership registry
     /app/r25-new                               new temp state (volume)
     /app/r25-new/watchlist.cutover-new.json    working config of the NEW scheduler
     /app/r25-new/drills/drill_*/restored       restored tree (never over /app/data)
@@ -64,6 +62,8 @@ NEW_ROOT = Path("/app/r25-new")               # new temp state root
 LEGACY_CONFIG_REL = "data/config/watchlist.drill.json"
 NEW_RESTORE_CONFIG = NEW_ROOT / "watchlist.cutover-restore.json"
 NEW_WORK_CONFIG = NEW_ROOT / "watchlist.cutover-new.json"
+LEGACY_RESUME_CONFIG = NEW_ROOT / "watchlist.cutover-legacy-resume.json"
+SHARED_REGISTRY = NEW_ROOT / "scheduler_ownership"
 LEGACY_TASKS_DB = DATA / "task_runtime/tasks.sqlite3"
 
 SCHEDULE_ID = "legacy-daily-research"
@@ -121,13 +121,99 @@ def open_new_store(*, read_only: bool = False):
     return open_store(new_tasks_db(), read_only=read_only)
 
 
-def registry_root(which: str) -> Path:
-    if which == "legacy":
-        return DATA / "scheduler_ownership"
-    cfg = new_work_config()
+def _store_counts(db_path: Path) -> dict:
+    connection = sqlite3.connect("file:{0}?mode=ro".format(db_path.resolve()), uri=True)
+    try:
+        tasks = int(connection.execute("SELECT COUNT(*) FROM research_tasks").fetchone()[0])
+        outbox = int(connection.execute("SELECT COUNT(*) FROM task_outbox").fetchone()[0])
+        return {"tasks": tasks, "outbox": outbox}
+    finally:
+        connection.close()
+
+
+def _registry_hash(root: Path) -> dict:
+    files = {}
+    for name in ("state.json", "events.jsonl"):
+        path = Path(root) / name
+        files[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    return files
+
+
+def _scheduled_entry(side: str, planned_slot: str, *, run: bool = True) -> dict:
+    """Invoke the actual PowerShell or container scheduled entry in a child process."""
     from stock_agent.config import project_path
 
-    return project_path(str((cfg.get("scheduler_ownership") or {}).get("state_dir") or ""))
+    if side == "legacy":
+        config_path = _rel(LEGACY_RESUME_CONFIG) if LEGACY_RESUME_CONFIG.is_file() else LEGACY_CONFIG_REL
+    elif side == "new":
+        config_path = _rel(NEW_WORK_CONFIG)
+    else:
+        raise SystemExit("side must be legacy or new")
+    config = load_config_at(config_path)
+    db_path = project_path(config["task_runtime"]["db_path"])
+    root = project_path(config["scheduler_ownership"]["state_dir"])
+    before = _store_counts(db_path), _registry_snapshot(root)
+    spec_path = NEW_ROOT / "scheduled_slot_spec.json"
+    spec_path.write_text(json.dumps(slot_task_spec(config, planned_slot)), encoding="utf-8")
+    if side == "legacy":
+        locked_venv = PROJECT_ROOT / ".venv312"
+        if not locked_venv.exists():
+            locked_venv.symlink_to(Path(sys.executable).parent.parent)
+        invocation = _run([
+            "/opt/r25-pwsh/pwsh", "-NoProfile", "-NonInteractive", "-File",
+            "/app/scripts/run_daily_research.ps1", "-Mode", "daily", "-TriggerSource", "scheduled",
+            "-Config", config_path, "-ScheduleId", SCHEDULE_ID, "-PlannedSlot", planned_slot,
+            "-ScopeVersion", SCOPE_VERSION, "-ScheduledTaskSpec", str(spec_path),
+            "-ScheduledExecutionMode", "replay"])
+    else:
+        invocation = run_cli([
+            "scheduled-task-submit", "--config", config_path, "--scheduler", "container-worker",
+            "--schedule-id", SCHEDULE_ID, "--planned-slot", planned_slot, "--scope-version", SCOPE_VERSION,
+            "--spec", str(spec_path), "--execution-mode", "replay"])
+    after = _store_counts(db_path), _registry_snapshot(root)
+    accepted = invocation["returncode"] == 0
+    outcome = {"side": side, "planned_slot": planned_slot, "config": config_path,
+               "registry": str(root), "task_db": str(db_path), "accepted": accepted,
+               "submission": invocation, "store_before": before[0], "store_after_submit": after[0],
+               "registry_before": before[1], "registry_after": after[1]}
+    if not accepted:
+        try:
+            outcome.update(json.loads(invocation["stderr_tail"]))
+        except ValueError:
+            pass
+        outcome["no_writes"] = after == before
+        return outcome
+
+    outcome.update(json.loads(invocation["stdout_tail"]))
+    worker = None
+    if run:
+        worker = run_cli(["worker-service", "--config", config_path,
+                          "--worker-id", "w-{0}-{1}".format(side, planned_slot[:10]),
+                          "--ttl-seconds", "60", "--idle-sleep-seconds", "0.1",
+                          "--max-tasks", "1"])
+    outcome["worker"] = worker
+    outcome["accounting"] = intent_accounting(db_path, outcome["intent"])
+    outcome["store_after"] = _store_counts(db_path)
+    return outcome
+
+
+def _registry_snapshot(root: Path) -> dict:
+    from stock_agent.scheduler_ownership import load_state
+
+    state = load_state(root)
+    events_path = root / "events.jsonl"
+    events = [json.loads(line)["event"] for line in events_path.read_text(encoding="utf-8").splitlines()]
+    return {"owner": state["active_scheduler"], "generation": state["generation"],
+            "frozen": state["intake_frozen"], "audit_events": events, "sha256": _registry_hash(root)}
+
+
+def _scheduled_entry_ok(entry: dict, *, expect_status: str) -> bool:
+    if not entry.get("accepted"):
+        return False
+    worker = entry.get("worker") or {"returncode": 0}
+    return (worker.get("returncode") == 0
+            and entry["accounting"]["tasks_with_intent"] == 1
+            and entry["accounting"]["tasks"][0]["status"] == expect_status)
 
 
 def status_counts(store) -> dict:
@@ -240,8 +326,8 @@ def source_fingerprint() -> dict:
         DATA / "stock_agent.sqlite3",
         LEGACY_TASKS_DB,
         DATA / "kimi/query_intake.sqlite3",
-        DATA / "scheduler_ownership/state.json",
-        DATA / "scheduler_ownership/events.jsonl",
+        DATA / "incoming/r25_cutover_announcement.html",
+        *sorted(path for path in (DATA / "personal_evidence").rglob("*") if path.is_file()),
     ]
     files = {}
     for target in targets:
@@ -250,13 +336,15 @@ def source_fingerprint() -> dict:
     return {"root": str(DATA), "files": files}
 
 
+def _run(command: list, *, timeout: int = 300) -> dict:
+    completed = subprocess.run(command, capture_output=True, text=True,
+                               timeout=timeout, cwd=str(PROJECT_ROOT))
+    return {"args": command, "returncode": completed.returncode,
+            "stdout_tail": completed.stdout[-4000:], "stderr_tail": completed.stderr[-4000:]}
+
+
 def run_cli(args: list, *, timeout: int = 300) -> dict:
-    """Run one in-image normal entry (python -m stock_agent ...)."""
-    completed = subprocess.run([sys.executable, "-m", "stock_agent"] + args,
-                               capture_output=True, text=True, timeout=timeout, cwd=str(PROJECT_ROOT))
-    return {"args": args, "returncode": completed.returncode,
-            "stdout_tail": (completed.stdout or "")[-600:],
-            "stderr_tail": (completed.stderr or "")[-600:]}
+    return _run([sys.executable, "-B", "-m", "stock_agent", *args], timeout=timeout)
 
 
 # --------------------------------------------------------------------------- #
@@ -318,7 +406,8 @@ DRILL_BASE_CONFIG = {
     "dify": {"enabled": False},
     "scheduler_ownership": {
         "enabled": True,
-        "state_dir": "data/scheduler_ownership",
+        "scheduler_id": "legacy-powershell",
+        "state_dir": _rel(SHARED_REGISTRY),
         "heartbeat_stale_seconds": 900,
         "rollback_supported_schema": "1.3",
         "min_free_bytes": 1048576,
@@ -347,7 +436,6 @@ def _seed_static_state(config: dict) -> None:
 
 
 def cmd_seed(queued: int) -> int:
-    from stock_agent.research_worker import run_research_task
     from stock_agent.scheduler_ownership import initialize_registry, LEGACY_SCHEDULER_ID
 
     if (DATA / "config" / "watchlist.drill.json").exists():
@@ -363,35 +451,16 @@ def cmd_seed(queued: int) -> int:
     }
     _seed_static_state(config)
     registry = initialize_registry(
-        DATA / "scheduler_ownership", first_scheduler=LEGACY_SCHEDULER_ID,
+        SHARED_REGISTRY, first_scheduler=LEGACY_SCHEDULER_ID,
         actor="r25-drill", reason="cutover rehearsal: legacy state first")
 
+    open_legacy_store().close()
+    legacy_entry = _scheduled_entry("legacy", LEGACY_PLANNED_SLOT)
+    if not _scheduled_entry_ok(legacy_entry, expect_status="succeeded"):
+        emit({"phase": "seed", "ok": False, "legacy_entry": legacy_entry})
+        return 3
     store = open_legacy_store()
     try:
-        # The legacy scheduler ALREADY ran this slot before cutover: create
-        # the intent FIRST (claim_next takes the OLDEST queued task) and run
-        # it through the real claim+worker path (in-image code).
-        intent = slot_key(LEGACY_PLANNED_SLOT)
-        slot_spec = slot_task_spec(config, LEGACY_PLANNED_SLOT)
-        slot_task, slot_dedup = store.create_task(
-            title="R25-cutover-slot-legacy", input_payload=slot_spec,
-            execution_mode="replay", business_intent_id=intent)
-        slot_task_id = str(slot_task["task_id"])
-        claimed = store.claim_next("w-legacy-slot", ttl_seconds=60)
-        if not claimed or str(claimed["task_id"]) != slot_task_id:
-            emit({"phase": "seed", "ok": False,
-                  "error": "claim_next did not return the slot task",
-                  "claimed": str((claimed or {}).get("task_id") or "")})
-            return 3
-        outcome = run_research_task(store, slot_task_id, worker_id="w-legacy-slot",
-                                    config=config, ttl_seconds=60)
-        slot_final = store.get_task(slot_task_id)
-        if not (str(outcome.get("status")) == "succeeded"
-                and str(slot_final.get("status")) == "succeeded"):
-            emit({"phase": "seed", "ok": False, "error": "legacy slot task did not succeed",
-                  "outcome": str(outcome.get("status")), "final": str(slot_final.get("status"))})
-            return 3
-
         # One synthetic personal-evidence task (same shape as the reviewed
         # precheck fixture): announcement -> located excerpt -> task whose
         # approved_facts reference it -> real claim + worker run with the
@@ -414,13 +483,13 @@ def cmd_seed(queued: int) -> int:
 
     emit({"phase": "seed", "ok": True, "queued_seeded": len(seeded_queued),
           "queued_task_ids": seeded_queued,
-          "slot_dedup": slot_dedup,
+          "legacy_entry": legacy_entry,
           "evidence": evidence,
           "slot": {"schedule_id": SCHEDULE_ID, "planned_slot": LEGACY_PLANNED_SLOT,
-                   "scope_version": SCOPE_VERSION, "intent": intent,
-                   "task_id": slot_task_id, "final_status": "succeeded"},
+                   "scope_version": SCOPE_VERSION, "intent": legacy_entry["intent"],
+                   "task_id": legacy_entry["task_id"], "final_status": "succeeded"},
           "registry": {"active": registry["active_scheduler"], "generation": registry["generation"]},
-          "accounting": intent_accounting(LEGACY_TASKS_DB, intent)})
+          "accounting": legacy_entry["accounting"]})
     return 0
 
 
@@ -428,8 +497,6 @@ def _seed_evidence_task(config: dict) -> dict:
     """The reviewed precheck evidence fixture, adapted to this drill's config:
     one synthetic announcement -> located excerpt -> task referencing it ->
     real claim + run with the personal vault view."""
-    import hashlib as _hashlib
-
     from stock_agent.evidence_excerpts import (
         _document_text, create_excerpt, excerpt_selector)
     from stock_agent.personal_evidence import (
@@ -479,7 +546,7 @@ def _seed_evidence_task(config: dict) -> dict:
         model_call = final.get("model_call") or {}
         facts = ((model_call.get("outbound_context") or {}).get("verified_facts") or [])
         fact = facts[0] if facts else {}
-        fact_content_sha = _hashlib.sha256(
+        fact_content_sha = hashlib.sha256(
             str(fact.get("content") or "").encode("utf-8")).hexdigest()
         ok = (str(outcome.get("status")) == "succeeded"
               and str(final.get("status")) == "succeeded"
@@ -529,95 +596,63 @@ def cmd_fingerprint(label: str) -> int:
     return 0
 
 
-def cmd_gate(schema_ceiling: str, min_free_mb: float, tasks_db: str) -> int:
-    from stock_agent.config import project_path
-    from stock_agent.scheduler_ownership import evaluate_cutover_gate
-    from stock_agent.task_runtime.store import TASK_SCHEMA_VERSION
-
-    config = legacy_config()
-    if schema_ceiling:
-        config["scheduler_ownership"]["rollback_supported_schema"] = schema_ceiling
-    if min_free_mb:
-        config["scheduler_ownership"]["min_free_bytes"] = int(min_free_mb * 1024 * 1024)
-    db = project_path(tasks_db) if tasks_db else LEGACY_TASKS_DB
-    verdict = evaluate_cutover_gate(
-        tasks_db_path=db, ownership_root=DATA / "scheduler_ownership",
-        state_root=DATA, runtime_schema_version=TASK_SCHEMA_VERSION, config=config)
-    emit({"phase": "gate", "ok": verdict["ok"], "tasks_db": str(db), **verdict})
-    return 0 if verdict["ok"] else 21
-
-def cmd_inject_unknown() -> int:
-    store = open_legacy_store()
-    try:
-        task = store.claim_next("w-unknown-inject", ttl_seconds=60)
-        if task is None:
-            emit({"phase": "inject_unknown", "ok": False, "error": "queue empty"})
-            return 5
-        task_id = str(task["task_id"])
-        attempt = store.prepare_invocation_attempt(
-            task_id, worker_id="w-unknown-inject",
-            fencing_token=int(task["fencing_token"]), round_index=1,
-            provider="synthetic", request_model="replay",
-            prompt_sha256="0" * 64)
-        store.mark_invocation_dispatched(str(attempt["attempt_id"]),
-                                          worker_id="w-unknown-inject",
-                                          fencing_token=int(task["fencing_token"]))
-        emit({"phase": "inject_unknown", "ok": True, "task_id": task_id,
-              "attempt_id": str(attempt["attempt_id"]),
-              "state": "dispatched", "sent": "unknown",
-              "note": "terminal-less dispatched attempt: the unexplained-unknown"
-                      " gate condition (drill injection only)"})
-        return 0
-    finally:
-        store.close()
+def _public_switch(config_path: str, target: str, generation: int) -> dict:
+    return run_cli(["cutover-switch", "--to", target, "--actor", "r25-drill",
+                    "--reason", "R25 isolated rehearsal", "--cutover-id", CUTOVER_ID,
+                    "--config", config_path, "--expected-generation", str(generation)])
 
 
-def cmd_inject_dual() -> int:
-    """Two evidences of the dual-scheduler stop condition.
-
-    1. Organic refusal: a foreign scheduler's heartbeat is REFUSED while the
-       legacy entry owns scheduling (nothing is recorded).
-    2. Registry detection: a synthetic fresh foreign beat written directly
-       into actors_seen (the state a racing/stale copy leaves behind) must
-       make the cutover gate abort."""
-    from stock_agent.scheduler_ownership import (
-        DualSchedulerError, evaluate_cutover_gate, load_state,
-    )
-    from stock_agent.task_runtime.store import TASK_SCHEMA_VERSION
-
-    refused = False
-    refusal_error = ""
-    try:
-        from stock_agent.scheduler_ownership import heartbeat
-
-        heartbeat(DATA / "scheduler_ownership", "container-worker")
-    except DualSchedulerError as exc:
-        refused = True
-        refusal_error = str(exc)
-    # Synthetic fresh foreign beat (directly into the state file).
-    state_path = DATA / "scheduler_ownership/state.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    state.setdefault("actors_seen", {})["container-worker"] = \
-        _datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+def cmd_switch_blocked(mode: str) -> int:
+    """Inject one condition, then assert both public commands preserve the registry."""
     from stock_agent.audit_log import atomic_write_text
+    from stock_agent.scheduler_ownership import disable_legacy, load_state
 
-    atomic_write_text(state_path,
-                      json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    root = SHARED_REGISTRY
+    disable_legacy(root, actor="r25-drill", cutover_id=CUTOVER_ID, simulated=True)
     config = legacy_config()
-    verdict = evaluate_cutover_gate(
-        tasks_db_path=LEGACY_TASKS_DB, ownership_root=DATA / "scheduler_ownership",
-        state_root=DATA, runtime_schema_version=TASK_SCHEMA_VERSION, config=config)
-    detected = (not verdict["ok"]) and any(
-        "dual scheduler" in str(item) for item in verdict.get("blockers") or [])
-    state_after = load_state(DATA / "scheduler_ownership")
-    ok = refused and detected
-    emit({"phase": "inject_dual", "ok": ok,
-          "heartbeat_refused": refused, "refusal_error": refusal_error[:200],
-          "injected_foreign_heartbeat": True,
-          "gate_blocked_on_dual": detected,
-          "gate_blockers": verdict.get("blockers"),
-          "registry_active_unchanged": state_after.get("active_scheduler")})
-    return 0 if ok else 6
+    injection = {}
+    if mode == "unknown":
+        store = open_legacy_store()
+        try:
+            task = store.claim_next("w-blocked-unknown", ttl_seconds=60)
+            kwargs = {"worker_id": "w-blocked-unknown", "fencing_token": int(task["fencing_token"])}
+            attempt = store.prepare_invocation_attempt(
+                str(task["task_id"]), round_index=1, provider="synthetic",
+                request_model="replay", prompt_sha256="0" * 64, **kwargs)
+            store.mark_invocation_dispatched(str(attempt["attempt_id"]), **kwargs)
+            injection = {"attempt_id": attempt["attempt_id"], "state": "dispatched"}
+        finally:
+            store.close()
+    elif mode == "dual":
+        state = load_state(root)
+        seen_at = _datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+        state["actors_seen"]["container-worker"] = seen_at
+        atomic_write_text(root / "state.json", json.dumps(state))
+        injection = {"foreign_heartbeat": seen_at}
+    elif mode == "schema":
+        config["scheduler_ownership"]["rollback_supported_schema"] = "1.0"
+    elif mode == "capacity":
+        config["scheduler_ownership"]["min_free_bytes"] = 10 ** 15
+    else:
+        raise SystemExit("unknown injection mode: {0}".format(mode))
+
+    config_path = NEW_ROOT / "watchlist.cutover-negative.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    before = _registry_snapshot(root)
+    gate = run_cli(["cutover-gate", "--config", _rel(config_path)])
+    after_gate = _registry_snapshot(root)
+    switch = _public_switch(_rel(config_path), "container-worker", 1)
+    after = _registry_snapshot(root)
+    fragment = {"unknown": "unexplained unknown", "dual": "dual scheduler",
+                "schema": "non-rollbackable schema", "capacity": "insufficient capacity"}[mode]
+    gate_blockers = json.loads(gate["stdout_tail"])["blockers"]
+    ok = (gate["returncode"] == 1 and switch["returncode"] == 21
+          and len(gate_blockers) == 1 and fragment in gate_blockers[0]
+          and fragment in switch["stderr_tail"] and before == after_gate == after)
+    emit({"phase": "switch_blocked", "ok": ok, "mode": mode, "injection": injection,
+          "before": before, "after_gate": after_gate, "after_switch": after,
+          "gate": gate, "switch": switch})
+    return 0 if ok else 18
 
 
 # --------------------------------------------------------------------------- #
@@ -691,14 +726,6 @@ def cmd_restore_new() -> int:
         emit({"phase": "restore_new", "ok": False, "worker": result,
               "restored_root": str(restored) if restored.exists() else ""})
         return 8
-    # The R24 bundle carries business state only: the scheduler-ownership
-    # registry is part of the CUTOVER migration, so it is copied explicitly
-    # (read from legacy, written into the new tree) — never merged back.
-    source_registry = DATA / "scheduler_ownership"
-    target_registry = restored / "data/scheduler_ownership"
-    if target_registry.exists():
-        shutil.rmtree(target_registry)
-    shutil.copytree(source_registry, target_registry)
     # Working config for the NEW scheduler: every data path under the restored tree.
     work = json.loads(json.dumps(DRILL_BASE_CONFIG))
     work["storage"] = {"sqlite_path": _rel(restored / "data/stock_agent.sqlite3")}
@@ -720,7 +747,7 @@ def cmd_restore_new() -> int:
     work["task_runtime"] = {"db_path": _rel(restored / "data/task_runtime/tasks.sqlite3")}
     work["kimi_sources"] = {"query_store_path": _rel(restored / "data/kimi/query_intake.sqlite3")}
     work["scheduler_ownership"] = dict(DRILL_BASE_CONFIG["scheduler_ownership"])
-    work["scheduler_ownership"]["state_dir"] = _rel(target_registry)
+    work["scheduler_ownership"]["scheduler_id"] = "container-worker"
     work["backup_restore"] = dict(restore_config["backup_restore"])
     NEW_WORK_CONFIG.write_text(json.dumps(work, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -728,7 +755,7 @@ def cmd_restore_new() -> int:
     emit({"phase": "restore_new", "ok": True, "worker": result,
           "restored_root": str(restored),
           "new_work_config": str(NEW_WORK_CONFIG),
-          "registry_copied_to": str(target_registry),
+          "shared_registry": str(SHARED_REGISTRY),
           "source_fingerprint_after_restore": source_before,
           "source_untouched_note": "legacy business files hashed before and after"
                                    " are compared in source_intact"})
@@ -750,160 +777,61 @@ def cmd_reconcile() -> int:
 # unique-scheduler switch + same-slot replay
 # --------------------------------------------------------------------------- #
 def cmd_switch_refuse_no_marker() -> int:
-    from stock_agent.scheduler_ownership import OwnershipConflictError, record_switch
-
-    root = registry_root("new")
-    refused = False
-    error = ""
-    try:
-        record_switch(root, to="container-worker", actor="r25-drill",
-                      cutover_id=CUTOVER_ID)
-    except OwnershipConflictError as exc:
-        refused = True
-        error = str(exc)
-    emit({"phase": "switch_refuse_no_marker", "ok": refused,
-          "refused": refused, "error": error[:200],
-          "registry": str(root)})
-    return 0 if refused else 9
+    before = _registry_snapshot(SHARED_REGISTRY)
+    result = _public_switch(_rel(NEW_WORK_CONFIG), "container-worker", 1)
+    after = _registry_snapshot(SHARED_REGISTRY)
+    ok = result["returncode"] == 22 and "legacy entry is not disabled" in result["stderr_tail"] and before == after
+    emit({"phase": "switch_refuse_no_marker", "ok": ok, "switch": result,
+          "before": before, "after": after})
+    return 0 if ok else 9
 
 
 def cmd_switch_new() -> int:
-    from stock_agent.scheduler_ownership import (
-        CONTAINER_SCHEDULER_ID, DualSchedulerError, NotActiveSchedulerError,
-        assert_unique_scheduler, disable_legacy, heartbeat, record_switch,
-    )
+    from stock_agent.scheduler_ownership import disable_legacy
 
-    root = registry_root("new")
-    marker = disable_legacy(root, actor="r25-drill", cutover_id=CUTOVER_ID,
-                            simulated=True,
-                            method="scripts/set_scheduled_tasks_enabled.ps1 -Disable"
-                                   " (NOT RUN in rehearsal; real window step)")
-    state = record_switch(root, to=CONTAINER_SCHEDULER_ID, actor="r25-drill",
-                          reason="R25 cutover rehearsal: forward switch",
-                          cutover_id=CUTOVER_ID)
-    heartbeat(root, CONTAINER_SCHEDULER_ID)
-    guard_ok = True
-    guard_error = ""
-    legacy_refused = False
-    legacy_error = ""
-    try:
-        assert_unique_scheduler(root, CONTAINER_SCHEDULER_ID)
-    except (DualSchedulerError, NotActiveSchedulerError) as exc:
-        guard_ok = False
-        guard_error = str(exc)
-    try:
-        assert_unique_scheduler(root, "legacy-powershell")
-    except (DualSchedulerError, NotActiveSchedulerError):
-        legacy_refused = True
-    ok = state["active_scheduler"] == CONTAINER_SCHEDULER_ID and guard_ok and legacy_refused
-    emit({"phase": "switch_new", "ok": ok,
-          "legacy_disabled_marker": marker,
-          "registry": {"active": state["active_scheduler"],
-                       "generation": state["generation"],
-                       "cutover_id": state.get("cutover_id")},
-          "container_guard_ok": guard_ok, "guard_error": guard_error[:200],
-          "legacy_side_refused": legacy_refused})
+    marker = disable_legacy(SHARED_REGISTRY, actor="r25-drill", cutover_id=CUTOVER_ID, simulated=True)
+    gate = run_cli(["cutover-gate", "--config", _rel(NEW_WORK_CONFIG)])
+    before = _registry_snapshot(SHARED_REGISTRY)
+    result = _public_switch(_rel(NEW_WORK_CONFIG), "container-worker", 1)
+    after = _registry_snapshot(SHARED_REGISTRY)
+    ok = (gate["returncode"] == result["returncode"] == 0
+          and after["owner"] == "container-worker" and after["generation"] == 2)
+    emit({"phase": "switch_new", "ok": ok, "legacy_disabled_marker": marker,
+          "gate": gate, "switch": result, "before": before, "after": after})
     return 0 if ok else 10
 
 
-def cmd_replay_slot() -> int:
-    """The container scheduler replays the SAME slot through the normal
-    store dedup path: no new task, no new execution, no new outbox delivery,
-    no new billing — for the SAME business intent."""
-    from stock_agent.scheduler_ownership import (
-        CONTAINER_SCHEDULER_ID, assert_unique_scheduler, heartbeat,
-    )
-
-    root = registry_root("new")
-    heartbeat(root, CONTAINER_SCHEDULER_ID)
-    assert_unique_scheduler(root, CONTAINER_SCHEDULER_ID)
+def cmd_replay_slot(side: str = "new", planned_slot: str = LEGACY_PLANNED_SLOT) -> int:
+    """Start a fresh scheduler process and compare all per-intent accounting."""
     db = new_tasks_db()
-    intent = slot_key(LEGACY_PLANNED_SLOT)
+    intent = slot_key(planned_slot)
     before = intent_accounting(db, intent)
-
-    config = new_work_config()
-    store = open_new_store()
-    try:
-        spec = slot_task_spec(config, LEGACY_PLANNED_SLOT)
-        task, dedup = store.create_task(
-            title="R25-cutover-slot-replay", input_payload=spec,
-            execution_mode="replay", business_intent_id=intent)
-        replayed_task_id = str(task["task_id"])
-        # A second trigger in the same process must converge identically.
-        task2, dedup2 = store.create_task(
-            title="R25-cutover-slot-replay", input_payload=spec,
-            execution_mode="replay", business_intent_id=intent)
-        same_id = str(task2["task_id"]) == replayed_task_id
-    finally:
-        store.close()
-
+    entry = _scheduled_entry(side, planned_slot, run=False)
     after = intent_accounting(db, intent)
-    no_new_task = after["tasks_with_intent"] == before["tasks_with_intent"] == 1
-    same_legacy_id = replayed_task_id == (before["tasks"][0]["task_id"] if before["tasks"] else "")
-    no_new_outbox = after["outbox_events_per_task"] == before["outbox_events_per_task"]
-    no_new_rounds = after["research_round_events_per_task"] == before["research_round_events_per_task"]
-    no_new_attempts = after["invocation_attempts_total"] == before["invocation_attempts_total"]
-    no_new_billing = after["budget_linked_attempts_total"] == before["budget_linked_attempts_total"]
-    status_kept = (after["tasks"][0]["status"] == before["tasks"][0]["status"] == "succeeded")
-    ok = (dedup == "DUPLICATE" and dedup2 == "DUPLICATE" and same_id
-          and no_new_task and same_legacy_id and no_new_outbox and no_new_rounds
-          and no_new_attempts and no_new_billing and status_kept)
-    emit({"phase": "replay_slot", "ok": ok,
-          "slot": {"schedule_id": SCHEDULE_ID, "planned_slot": LEGACY_PLANNED_SLOT,
-                   "intent": intent},
-          "dedup_results": [dedup, dedup2], "converged_same_task_id": same_id,
-          "before": before, "after": after,
-          "checks": {"no_new_task": no_new_task, "same_legacy_task_id": same_legacy_id,
-                     "no_new_outbox_delivery": no_new_outbox,
-                     "no_new_research_round": no_new_rounds,
-                     "no_new_invocation_attempts": no_new_attempts,
-                     "no_new_budget_billing": no_new_billing,
-                     "status_kept_succeeded": status_kept}})
+    ok = (entry.get("dedup") == "DUPLICATE" and before == after
+          and before["tasks_with_intent"] == 1
+          and before["tasks"][0]["status"] == "succeeded"
+          and entry["task_id"] == before["tasks"][0]["task_id"])
+    emit({"phase": "replay_slot", "ok": ok, "entry": entry, "before": before, "after": after})
     return 0 if ok else 11
 
 
 def cmd_new_slot(index: int, run: bool = True) -> int:
     """Post-cutover incremental slot: a NEW intent on a LATER business day,
-    executed through the in-image worker-service CLI (normal entry).
-    ``run=False`` only enqueues it (the frozen-drain demo needs one queued)."""
-    from stock_agent.scheduler_ownership import (
-        CONTAINER_SCHEDULER_ID, assert_intake_allowed, assert_unique_scheduler,
-        heartbeat,
-    )
-
-    root = registry_root("new")
-    heartbeat(root, CONTAINER_SCHEDULER_ID)
-    assert_unique_scheduler(root, CONTAINER_SCHEDULER_ID)
-    assert_intake_allowed(root)
+    submitted and executed through the container side's normal scheduled
+    entry. ``run=False`` only enqueues it (the frozen-drain demo needs one
+    queued)."""
     planned = "2026-11-2{0}T08:30:00+08:00".format(1 + index)
-    intent = slot_key(planned)
-    config = new_work_config()
-    store = open_new_store()
-    try:
-        spec = slot_task_spec(config, planned)
-        task, dedup = store.create_task(
-            title="R25-cutover-newslot-{0}".format(index), input_payload=spec,
-            execution_mode="replay", business_intent_id=intent)
-        task_id = str(task["task_id"])
-    finally:
-        store.close()
-    result = None
-    if run:
-        result = run_cli(["worker-service", "--config", _rel(NEW_WORK_CONFIG),
-                          "--worker-id", "w-container-{0}".format(index),
-                          "--ttl-seconds", "60", "--idle-sleep-seconds", "0.1",
-                          "--max-tasks", "1"])
-    accounting = intent_accounting(new_tasks_db(), intent)
+    entry = _scheduled_entry("new", planned, run=run)
     expected_status = "succeeded" if run else "queued"
-    ok = (dedup == "RECORDED" and (result is None or result["returncode"] == 0)
-          and accounting["tasks_with_intent"] == 1
-          and accounting["tasks"][0]["status"] == expected_status)
+    ok = _scheduled_entry_ok(entry, expect_status=expected_status)
     emit({"phase": "new_slot", "ok": ok, "index": index,
-          "slot": {"planned_slot": planned, "intent": intent, "task_id": task_id},
-          "dedup": dedup, "worker": result or {"args": ["(enqueued only)"],
-                                               "returncode": 0,
-                                               "stdout_tail": "", "stderr_tail": ""},
-          "accounting": accounting})
+          "slot": {"planned_slot": planned,
+                   "intent": entry.get("intent"),
+                   "task_id": entry.get("task_id")},
+          "dedup": entry.get("dedup"),
+          "worker": entry.get("worker"),
+          "accounting": entry.get("accounting")})
     return 0 if ok else 12
 
 
@@ -911,33 +839,21 @@ def cmd_new_slot(index: int, run: bool = True) -> int:
 # rollback
 # --------------------------------------------------------------------------- #
 def cmd_freeze() -> int:
-    from stock_agent.scheduler_ownership import freeze_intake
-
-    root = registry_root("new")
-    state = freeze_intake(root, actor="r25-drill",
-                          reason="R25 rollback rehearsal: freeze new intake",
-                          cutover_id=CUTOVER_ID)
-    emit({"phase": "freeze", "ok": True,
-          "registry": {"intake_frozen": state["intake_frozen"],
-                       "frozen_reason": state["frozen_reason"],
-                       "generation": state["generation"]}})
-    return 0
+    result = run_cli(["cutover-freeze", "--actor", "r25-drill", "--config", _rel(NEW_WORK_CONFIG),
+                      "--reason", "R25 rollback rehearsal: freeze new intake", "--cutover-id", CUTOVER_ID])
+    emit({"phase": "freeze", "ok": result["returncode"] == 0,
+          "cli": result, "registry": _registry_snapshot(SHARED_REGISTRY)})
+    return result["returncode"]
 
 
-def cmd_frozen_refusal() -> int:
-    from stock_agent.scheduler_ownership import IntakeFrozenError, assert_intake_allowed
-
-    root = registry_root("new")
-    refused = False
-    error = ""
-    try:
-        assert_intake_allowed(root)
-    except IntakeFrozenError as exc:
-        refused = True
-        error = str(exc)
-    emit({"phase": "frozen_refusal", "ok": refused, "refused": refused,
-          "error": error[:200]})
-    return 0 if refused else 13
+def cmd_frozen_submit() -> int:
+    planned = "2026-11-26T08:30:00+08:00"
+    entries = [_scheduled_entry(side, planned, run=False) for side in ("legacy", "new")]
+    ok = all(entry["no_writes"] and entry["submission"]["returncode"] == 20
+             and entry["refusal_kind"] == expected
+             for entry, expected in zip(entries, ("DualSchedulerError", "IntakeFrozenError")))
+    emit({"phase": "frozen_submit", "ok": ok, "entries": entries})
+    return 0 if ok else 13
 
 
 def cmd_drain_frozen() -> int:
@@ -953,79 +869,56 @@ def cmd_drain_frozen() -> int:
 
 
 def cmd_increments() -> int:
-    """Reconcile the new tree against the legacy snapshot: every task/outbox
-    row that exists ONLY on the new side is the rollback increment, recorded
-    in the new tree (the legacy snapshot is never touched)."""
-    def snapshot_ids(db_path: Path) -> dict:
-        connection = sqlite3.connect("file:{0}?mode=ro".format(db_path.resolve()), uri=True)
-        try:
-            tasks = [str(row[0]) for row in connection.execute(
-                "SELECT task_id FROM research_tasks ORDER BY task_id")]
-            outbox_max = int(connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM task_outbox").fetchone()[0])
-            return {"tasks": tasks, "outbox_max_sequence": outbox_max}
-        finally:
-            connection.close()
+    result = run_cli(["cutover-reconcile-rollback", "--config", _rel(NEW_WORK_CONFIG),
+                      "--baseline-config", LEGACY_CONFIG_REL])
+    emit({"phase": "increments", "ok": result["returncode"] == 0, "cli": result,
+          "manifest": json.loads(result["stdout_tail"]) if result["returncode"] == 0 else None})
+    return result["returncode"]
 
-    legacy = snapshot_ids(LEGACY_TASKS_DB)
-    new = snapshot_ids(new_tasks_db())
-    legacy_set = set(legacy["tasks"])
-    new_tasks = [task for task in new["tasks"] if task not in legacy_set]
-    connection = sqlite3.connect("file:{0}?mode=ro".format(new_tasks_db().resolve()), uri=True)
-    try:
-        new_outbox = [int(row[0]) for row in connection.execute(
-            "SELECT sequence FROM task_outbox WHERE sequence > ? ORDER BY sequence",
-            (legacy["outbox_max_sequence"],))]
-        new_intents = [{"task_id": row[0], "intent": row[1], "status": row[2]} for row in
-                       connection.execute(
-                           "SELECT task_id, business_intent_id, status FROM research_tasks"
-                           " WHERE business_intent_id <> '' ORDER BY task_id")]
-    finally:
-        connection.close()
-    manifest = {
-        "schema_version": "1.0", "cutover_id": CUTOVER_ID,
-        "generated_at": _datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-        "baseline": {"legacy_tasks": len(legacy["tasks"]),
-                     "legacy_outbox_max_sequence": legacy["outbox_max_sequence"]},
-        "increment_tasks": new_tasks,
-        "increment_outbox_sequences": new_outbox,
-        "business_intents_new_side": new_intents,
-        "policy": "rollback never overwrites the legacy tree; increments stay"
-                  " recorded here for follow-up replay/forward cutover",
-    }
-    manifest_path = registry_root("new") / "rollback_increments.json"
-    from stock_agent.audit_log import atomic_write_text
 
-    atomic_write_text(manifest_path,
-                      json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
-    ok = bool(new_tasks) and bool(new_outbox)
-    emit({"phase": "increments", "ok": ok, "manifest_path": str(manifest_path),
-          "increment_tasks": len(new_tasks), "increment_outbox_events": len(new_outbox),
-          "manifest": manifest})
-    return 0 if ok else 15
+def cmd_rollback_refused(fragment: str) -> int:
+    before = _registry_snapshot(SHARED_REGISTRY)
+    result = _public_switch(_rel(NEW_WORK_CONFIG), "legacy-powershell", 2)
+    after = _registry_snapshot(SHARED_REGISTRY)
+    ok = result["returncode"] == 21 and fragment in result["stderr_tail"] and before == after
+    emit({"phase": "rollback_refused", "ok": ok, "switch": result, "before": before, "after": after})
+    return 0 if ok else 16
 
 
 def cmd_rollback() -> int:
-    from stock_agent.scheduler_ownership import (
-        enable_legacy, record_switch, thaw_intake,
-    )
+    from stock_agent.scheduler_ownership import enable_legacy
 
-    root = registry_root("new")
-    state = record_switch(root, to="legacy-powershell", actor="r25-drill",
-                          reason="R25 rollback rehearsal: return ownership",
-                          cutover_id=CUTOVER_ID)
-    marker = enable_legacy(root, actor="r25-drill",
-                           reason="rollback rehearsal: legacy entry may resume")
-    thawed = thaw_intake(root, actor="r25-drill",
-                         reason="rollback rehearsal complete")
-    ok = (state["active_scheduler"] == "legacy-powershell"
-          and not thawed["intake_frozen"])
-    emit({"phase": "rollback", "ok": ok,
-          "registry": {"active": state["active_scheduler"],
-                       "generation": state["generation"]},
-          "reenabled_legacy_marker": marker.get("disabled_at"),
-          "intake_frozen": thawed["intake_frozen"]})
+    before = _registry_snapshot(SHARED_REGISTRY)
+    result = _public_switch(_rel(NEW_WORK_CONFIG), "legacy-powershell", 2)
+    if result["returncode"]:
+        emit({"phase": "rollback", "ok": False, "switch": result})
+        return 16
+    # The original state tree remains the rollback reference. Legacy now uses
+    # the reconciled task store, so both intent keys and SSE cursors survive.
+    legacy = new_work_config()
+    legacy["scheduler_ownership"]["scheduler_id"] = "legacy-powershell"
+    LEGACY_RESUME_CONFIG.write_text(json.dumps(legacy), encoding="utf-8")
+    enable_legacy(SHARED_REGISTRY, actor="r25-drill", reason="simulated rollback task restore")
+    thaw = run_cli(["cutover-thaw", "--actor", "r25-drill", "--config", _rel(LEGACY_RESUME_CONFIG),
+                    "--reason", "R25 rollback rehearsal complete"])
+    after = _registry_snapshot(SHARED_REGISTRY)
+    ok = (thaw["returncode"] == 0 and after["owner"] == "legacy-powershell"
+          and after["generation"] == 3 and not after["frozen"])
+    emit({"phase": "rollback", "ok": ok, "switch": result, "thaw": thaw, "before": before,
+          "after": after, "legacy_resume_config": str(LEGACY_RESUME_CONFIG)})
     return 0 if ok else 16
+
+
+def cmd_outbox_after(sequence: int, limit: int, expected: list[int]) -> int:
+    store = open_new_store(read_only=True)
+    try:
+        events = store.events_after(sequence, limit=limit)
+    finally:
+        store.close()
+    actual = [event["sequence"] for event in events]
+    emit({"phase": "outbox_after", "cursor": sequence, "limit": limit,
+          "sequences": actual, "expected": expected, "ok": actual == expected})
+    return 0 if actual == expected else 19
 
 
 def cmd_source_intact() -> int:
@@ -1034,18 +927,9 @@ def cmd_source_intact() -> int:
     saved = json.loads(saved_path.read_text(encoding="utf-8")) if saved_path.is_file() else {}
     files_equal = {name: (saved.get("files") or {}).get(name) == digest
                    for name, digest in current["files"].items()}
-    ok = bool(saved) and all(files_equal.values())
-    legacy_registry = json.loads(
-        (DATA / "scheduler_ownership/state.json").read_text(encoding="utf-8"))
-    emit({"phase": "source_intact", "ok": ok,
-          "current_fingerprint": current,
-          "snapshot_fingerprint": saved,
-          "per_file_equal": files_equal,
-          "legacy_registry": {"active": legacy_registry.get("active_scheduler"),
-                              "generation": legacy_registry.get("generation"),
-                              "intake_frozen": legacy_registry.get("intake_frozen")},
-          "note": "legacy business files (3 SQLite + registry) byte-identical"
-                  " to the quiescent-snapshot moment"})
+    ok = bool(saved) and current == saved and all(current["files"].values())
+    emit({"phase": "source_intact", "ok": ok, "current_fingerprint": current,
+          "snapshot_fingerprint": saved, "per_file_equal": files_equal})
     return 0 if ok else 17
 
 
@@ -1066,14 +950,32 @@ def cmd_final_counts() -> int:
             connection.close()
 
     intent = slot_key(LEGACY_PLANNED_SLOT)
+    # Verify the original source also survives legacy takeover.
+    current = source_fingerprint()
+    saved_path = NEW_ROOT / "snapshot_fingerprint.json"
+    saved = json.loads(saved_path.read_text(encoding="utf-8")) if saved_path.is_file() else {}
+    per_file_equal = {name: (saved.get("files") or {}).get(name) == digest
+                      for name, digest in current["files"].items()}
     emit({"phase": "final_counts",
           "legacy": counts(LEGACY_TASKS_DB),
           "new": counts(new_tasks_db()),
           "legacy_slot_accounting": intent_accounting(LEGACY_TASKS_DB, intent),
           "new_slot_accounting": intent_accounting(new_tasks_db(), intent),
-          "new_registry": json.loads(
-              (registry_root("new") / "state.json").read_text(encoding="utf-8"))})
-    return 0
+          "shared_registry": _registry_snapshot(SHARED_REGISTRY),
+          "post_takeover_fingerprint_equal": per_file_equal})
+    return 0 if saved and current == saved and all(current["files"].values()) else 17
+
+
+def _emit_entry(args) -> int:
+    if not args:
+        emit({"phase": "slot_submit", "ok": False, "error": "side required"})
+        return 2
+    side = args[0]
+    planned = args[1] if len(args) > 1 else "2026-11-27T08:30:00+08:00"
+    entry = _scheduled_entry(side, planned, run=not (len(args) > 2 and args[2] == "norun"))
+    emit({"phase": "slot_submit", "side": side, "entry": entry,
+          "ok": bool(entry.get("accepted"))})
+    return entry["submission"]["returncode"]
 
 
 COMMANDS = {
@@ -1085,27 +987,25 @@ COMMANDS = {
                                     "intent": slot_key(LEGACY_PLANNED_SLOT)}) or 0,
     "drain": lambda args: cmd_drain(),
     "fingerprint": lambda args: cmd_fingerprint(args[0] if args else "unlabeled"),
-    "gate": lambda args: cmd_gate(
-        args[0] if args else "",
-        float(args[1]) if len(args) > 1 else 0,
-        args[2] if len(args) > 2 else ""),
-    "inject_unknown": lambda args: cmd_inject_unknown(),
-    "inject_dual": lambda args: cmd_inject_dual(),
+    "switch_blocked": lambda args: cmd_switch_blocked(args[0]),
     "snapshot": lambda args: cmd_snapshot(),
     "restore_new": lambda args: cmd_restore_new(),
     "reconcile": lambda args: cmd_reconcile(),
     "switch_refuse_no_marker": lambda args: cmd_switch_refuse_no_marker(),
     "switch_new": lambda args: cmd_switch_new(),
-    "replay_slot": lambda args: cmd_replay_slot(),
+    "replay_slot": lambda args: cmd_replay_slot(*args),
     "new_slot": lambda args: cmd_new_slot(int(args[0]) if args else 1,
                                           run=not (len(args) > 1 and args[1] == "norun")),
     "freeze": lambda args: cmd_freeze(),
-    "frozen_refusal": lambda args: cmd_frozen_refusal(),
+    "frozen_submit": lambda args: cmd_frozen_submit(),
     "drain_frozen": lambda args: cmd_drain_frozen(),
     "increments": lambda args: cmd_increments(),
     "rollback": lambda args: cmd_rollback(),
+    "rollback_refused": lambda args: cmd_rollback_refused(args[0]),
+    "outbox_after": lambda args: cmd_outbox_after(int(args[0]), int(args[1]), [int(v) for v in args[2:]]),
     "source_intact": lambda args: cmd_source_intact(),
     "final_counts": lambda args: cmd_final_counts(),
+    "slot_submit": lambda args: _emit_entry(args),
 }
 
 

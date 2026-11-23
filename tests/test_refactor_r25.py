@@ -7,14 +7,17 @@ O-layer coverage of the cutover discipline (GLM_REFACTOR_TASKBOOK R25):
   freeze -> rollback switch (requires the freeze) -> thaw/re-enable, each
   audited in the append-only event log with a monotonic generation and a
   compare-and-set on the expected generation.
+- **Stop conditions CONSTRAIN the switch action**: a forward switch runs the
+  cutover gate against the actual state and refuses (owner/generation/audit
+  untouched) on an unexplained unknown, a dual scheduler, a non-rollbackable
+  schema or insufficient capacity. A rollback switch requires the retiring
+  side to have drained and the increment reconciliation to be recorded.
 - **Unique-scheduler guard**: a foreign or unregistered scheduler is refused;
-  a fresh foreign heartbeat aborts (双调度).
-- **Freeze semantics**: new intake is refused while frozen; the freeze flag
-  itself never blocks reading state.
-- **Cutover gate stop conditions**: unexplained unknown attempts
-  (dispatched-without-terminal, outcome_unknown), dual schedulers, a runtime
-  schema above the pinned rollback ceiling, and insufficient capacity each
-  abort the cutover; a clean state passes all four.
+  a fresh foreign heartbeat aborts the owner too (双调度). A successful
+  switch RETIRES the outgoing scheduler's heartbeat, so the new owner can
+  take over immediately after a rollback (no stale-window deadlock) while
+  the retired side's own beats are refused.
+- **Freeze semantics**: new intake is refused while frozen.
 - **Same-slot no-duplicate (offline half)**: creating the SAME business
   intent twice — in one process and across "restarts" (fresh store
   connections) — converges on ONE task with ONE execution's outbox/billing
@@ -31,6 +34,7 @@ from pathlib import Path
 from stock_agent.config import project_path_override
 from stock_agent.scheduler_ownership import (
     CONTAINER_SCHEDULER_ID,
+    CutoverBlockedError,
     DualSchedulerError,
     IntakeFrozenError,
     LEGACY_SCHEDULER_ID,
@@ -47,7 +51,9 @@ from stock_agent.scheduler_ownership import (
     initialize_registry,
     intake_allowed,
     load_state,
+    record_rollback_reconciliation,
     record_switch,
+    scheduled_intake,
     scheduler_ownership_config,
     thaw_intake,
 )
@@ -80,6 +86,51 @@ class R25TestCase(unittest.TestCase):
         self.enterContext(project_path_override(lambda value: self.root / value))
         self.config = vault_config(self.root, {})
         self.registry = self.root / "scheduler_ownership"
+        self.db_path = self.root / "tasks.sqlite3"
+
+    def make_store(self, *, queued_tasks: int = 0) -> None:
+        store = TaskStore(self.db_path)
+        try:
+            for index in range(queued_tasks):
+                spec = _replay_spec(self.config, "R25 队列问题 {0}-{1}".format(index, id(self)))
+                store.create_task(title="R25-queued-{0}".format(index),
+                                  input_payload=spec, execution_mode="replay")
+        finally:
+            store.close()
+
+    def gate_config(self, **overrides) -> dict:
+        config = {
+            "scheduler_ownership": {
+                "enabled": True,
+                "state_dir": "scheduler_ownership",
+                "heartbeat_stale_seconds": 900,
+                "rollback_supported_schema": TASK_SCHEMA_VERSION,
+                "min_free_bytes": 1,
+            },
+        }
+        config["scheduler_ownership"].update(overrides)
+        return config
+
+    def forward_switch(self, **kwargs):
+        params = dict(to=CONTAINER_SCHEDULER_ID, actor="test",
+                      tasks_db_path=self.db_path, state_root=self.root,
+                      runtime_schema_version=TASK_SCHEMA_VERSION,
+                      config=self.gate_config())
+        params.update(kwargs)
+        return record_switch(self.registry, **params)
+
+    def rollback_switch(self, **kwargs):
+        params = dict(to=LEGACY_SCHEDULER_ID, actor="test",
+                      tasks_db_path=self.db_path, state_root=self.root,
+                      runtime_schema_version=TASK_SCHEMA_VERSION,
+                      config=self.gate_config())
+        params.update(kwargs)
+        return record_switch(self.registry, **params)
+
+    def write_manifest(self):
+        baseline = self.root / "rollback_baseline.sqlite3"
+        TaskStore(baseline).close()
+        return record_rollback_reconciliation(self.registry, baseline, self.db_path)
 
 
 class SchedulerOwnershipConfigTests(R25TestCase):
@@ -113,22 +164,30 @@ class RegistryTransitionTests(R25TestCase):
                                 actor="test", reason="second")
 
     def test_forward_switch_requires_explicit_legacy_disable_marker(self):
+        self.make_store()
         initialize_registry(self.registry, first_scheduler=LEGACY_SCHEDULER_ID,
                             actor="test", reason="first")
         with self.assertRaises(OwnershipConflictError):
-            record_switch(self.registry, to=CONTAINER_SCHEDULER_ID, actor="test")
+            self.forward_switch()
         # State unchanged after the refusal.
         self.assertEqual(load_state(self.registry)["active_scheduler"], LEGACY_SCHEDULER_ID)
 
-    def test_forward_switch_with_marker_and_generation_cas(self):
+    def test_forward_switch_requires_gate_parameters(self):
+        self.make_store()
         initialize_registry(self.registry, first_scheduler=LEGACY_SCHEDULER_ID,
                             actor="test", reason="first")
         disable_legacy(self.registry, actor="test", simulated=True)
         with self.assertRaises(OwnershipConflictError):
-            record_switch(self.registry, to=CONTAINER_SCHEDULER_ID, actor="test",
-                          expected_generation=99)
-        state = record_switch(self.registry, to=CONTAINER_SCHEDULER_ID, actor="test",
-                              expected_generation=1, cutover_id="cutover_x")
+            record_switch(self.registry, to=CONTAINER_SCHEDULER_ID, actor="test")
+
+    def test_forward_switch_with_marker_and_generation_cas(self):
+        self.make_store()
+        initialize_registry(self.registry, first_scheduler=LEGACY_SCHEDULER_ID,
+                            actor="test", reason="first")
+        disable_legacy(self.registry, actor="test", simulated=True)
+        with self.assertRaises(OwnershipConflictError):
+            self.forward_switch(expected_generation=99)
+        state = self.forward_switch(expected_generation=1, cutover_id="cutover_x")
         self.assertEqual(state["active_scheduler"], CONTAINER_SCHEDULER_ID)
         self.assertEqual(state["generation"], 2)
         self.assertEqual(state["cutover_id"], "cutover_x")
@@ -137,23 +196,174 @@ class RegistryTransitionTests(R25TestCase):
         self.assertEqual([e["event"] for e in events], ["initialize", "switch"])
         self.assertEqual(events[-1]["from"], LEGACY_SCHEDULER_ID)
         self.assertEqual(events[-1]["to"], CONTAINER_SCHEDULER_ID)
+        self.assertTrue(events[-1]["gate_ok"])
 
     def test_forward_switch_refuses_while_intake_frozen(self):
+        self.make_store()
         initialize_registry(self.registry, first_scheduler=LEGACY_SCHEDULER_ID,
                             actor="test", reason="first")
         disable_legacy(self.registry, actor="test", simulated=True)
         freeze_intake(self.registry, actor="test", reason="rollback started")
         with self.assertRaises(OwnershipConflictError):
-            record_switch(self.registry, to=CONTAINER_SCHEDULER_ID, actor="test")
+            self.forward_switch()
+
+
+class SwitchConstrainedByStopConditionsTests(R25TestCase):
+    """The stop conditions gate the SWITCH action itself (taskbook R25)."""
+
+    def setUp(self):
+        super().setUp()
+        self.make_store(queued_tasks=2)
+        initialize_registry(self.registry, first_scheduler=LEGACY_SCHEDULER_ID,
+                            actor="test", reason="first")
+        disable_legacy(self.registry, actor="test", simulated=True)
+        self.events_before = len((self.registry / "events.jsonl")
+                                  .read_text(encoding="utf-8").splitlines())
+
+    def _unchanged(self) -> bool:
+        state = load_state(self.registry)
+        events = len((self.registry / "events.jsonl")
+                     .read_text(encoding="utf-8").splitlines())
+        return (state["active_scheduler"] == LEGACY_SCHEDULER_ID
+                and state["generation"] == 1 and events == self.events_before)
+
+    def test_clean_state_switch_succeeds(self):
+        state = self.forward_switch()
+        self.assertEqual(state["generation"], 2)
+
+    def test_unexplained_unknown_attempts_refuse_the_switch(self):
+        store = TaskStore(self.db_path)
+        try:
+            claimed = store.claim_next("w", ttl_seconds=60)
+            attempt = store.prepare_invocation_attempt(
+                str(claimed["task_id"]), worker_id="w",
+                fencing_token=int(claimed["fencing_token"]), round_index=1,
+                provider="synthetic", request_model="replay", prompt_sha256="0" * 64)
+            store.mark_invocation_dispatched(str(attempt["attempt_id"]),
+                                              worker_id="w",
+                                              fencing_token=int(claimed["fencing_token"]))
+        finally:
+            store.close()
+        with self.assertRaises(CutoverBlockedError) as caught:
+            self.forward_switch()
+        self.assertTrue(any("unexplained unknown" in item for item in caught.exception.blockers))
+        self.assertTrue(self._unchanged())
+
+    def test_dual_scheduler_refuses_the_switch(self):
+        state_path = self.registry / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["actors_seen"][CONTAINER_SCHEDULER_ID] = \
+            datetime.now(timezone.utc).isoformat(timespec="seconds")
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaises(CutoverBlockedError) as caught:
+            self.forward_switch()
+        self.assertTrue(any("dual scheduler" in item for item in caught.exception.blockers))
+        self.assertTrue(self._unchanged())
+
+    def test_schema_above_rollback_ceiling_refuses_the_switch(self):
+        with self.assertRaises(CutoverBlockedError) as caught:
+            self.forward_switch(config=self.gate_config(rollback_supported_schema="1.0"))
+        self.assertTrue(any("non-rollbackable schema" in item for item in caught.exception.blockers))
+        self.assertTrue(self._unchanged())
+
+    def test_insufficient_capacity_refuses_the_switch(self):
+        with self.assertRaises(CutoverBlockedError) as caught:
+            self.forward_switch(config=self.gate_config(min_free_bytes=10 ** 15))
+        self.assertTrue(any("insufficient capacity" in item for item in caught.exception.blockers))
+        self.assertTrue(self._unchanged())
+
+
+class RollbackReadinessTests(R25TestCase):
+    def setUp(self):
+        super().setUp()
+        self.make_store(queued_tasks=1)
+        initialize_registry(self.registry, first_scheduler=LEGACY_SCHEDULER_ID,
+                            actor="test", reason="first")
+        disable_legacy(self.registry, actor="test", simulated=True)
+        self.forward_switch()
+
+    def test_rollback_requires_freeze_drain_and_manifest(self):
+        # Not frozen yet.
+        with self.assertRaises(OwnershipConflictError):
+            self.rollback_switch()
+        freeze_intake(self.registry, actor="test", reason="rollback")
+        # Still a queued task on the retiring side.
+        with self.assertRaises(CutoverBlockedError) as caught:
+            self.rollback_switch()
+        self.assertTrue(any("not drained" in item for item in caught.exception.blockers))
+        # Drained (task succeeded) but no increment manifest yet.
+        store = TaskStore(self.db_path)
+        try:
+            claimed = store.claim_next("w-drain", ttl_seconds=60)
+            from stock_agent.research_worker import run_research_task
+
+            run_research_task(store, str(claimed["task_id"]),
+                              worker_id="w-drain", config=self.config, ttl_seconds=60)
+        finally:
+            store.close()
+        with self.assertRaises(CutoverBlockedError) as caught:
+            self.rollback_switch()
+        self.assertTrue(any("increment reconciliation not recorded"
+                            in item for item in caught.exception.blockers))
+        # Manifest recorded -> the switch goes through.
+        self.write_manifest()
+        state = self.rollback_switch()
+        self.assertEqual(state["active_scheduler"], LEGACY_SCHEDULER_ID)
+        self.assertEqual(state["generation"], 3)
+
+    def test_stale_or_changed_reconciliation_refuses_switch(self):
+        import sqlite3
+
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("UPDATE research_tasks SET status = 'succeeded'")
+        freeze_intake(self.registry, actor="test", reason="first freeze")
+        self.write_manifest()
+        thaw_intake(self.registry, actor="test")
+        freeze_intake(self.registry, actor="test", reason="second freeze")
+        with self.assertRaises(CutoverBlockedError) as caught:
+            self.rollback_switch()
+        self.assertTrue(any("no longer matches" in blocker for blocker in caught.exception.blockers))
+        self.write_manifest()
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute("UPDATE task_outbox SET payload = '{}'")
+        with self.assertRaises(CutoverBlockedError) as caught:
+            self.rollback_switch()
+        self.assertTrue(any("no longer matches" in blocker for blocker in caught.exception.blockers))
+        self.assertEqual(load_state(self.registry)["generation"], 2)
+
+    def test_rollback_switch_retires_outgoing_heartbeat(self):
+        heartbeat(self.registry, CONTAINER_SCHEDULER_ID)
+        freeze_intake(self.registry, actor="test", reason="rollback")
+        # Drain the queued task first (readiness requires it).
+        store = TaskStore(self.db_path)
+        try:
+            claimed = store.claim_next("w-drain", ttl_seconds=60)
+            from stock_agent.research_worker import run_research_task
+
+            run_research_task(store, str(claimed["task_id"]),
+                              worker_id="w-drain", config=self.config, ttl_seconds=60)
+        finally:
+            store.close()
+        self.write_manifest()
+        self.rollback_switch()
+        # The container's pre-switch beat was retired: the OLD owner passes
+        # immediately — no stale-window deadlock.
+        state = assert_unique_scheduler(self.registry, LEGACY_SCHEDULER_ID)
+        self.assertEqual(state["active_scheduler"], LEGACY_SCHEDULER_ID)
+        heartbeat(self.registry, LEGACY_SCHEDULER_ID)
+        # The retired container's own heartbeat is refused.
+        with self.assertRaises(DualSchedulerError):
+            heartbeat(self.registry, CONTAINER_SCHEDULER_ID)
 
 
 class UniqueSchedulerGuardTests(R25TestCase):
     def setUp(self):
         super().setUp()
+        self.make_store()
         initialize_registry(self.registry, first_scheduler=LEGACY_SCHEDULER_ID,
                             actor="test", reason="first")
         disable_legacy(self.registry, actor="test", simulated=True)
-        record_switch(self.registry, to=CONTAINER_SCHEDULER_ID, actor="test")
+        self.forward_switch()
 
     def test_owner_passes_and_foreign_scheduler_is_refused(self):
         state = assert_unique_scheduler(self.registry, CONTAINER_SCHEDULER_ID)
@@ -166,6 +376,16 @@ class UniqueSchedulerGuardTests(R25TestCase):
             heartbeat(self.registry, LEGACY_SCHEDULER_ID)
         seen = load_state(self.registry)["actors_seen"]
         self.assertNotIn(LEGACY_SCHEDULER_ID, seen)
+
+    def test_owner_heartbeat_refuses_fresh_foreign_beat(self):
+        heartbeat(self.registry, CONTAINER_SCHEDULER_ID)
+        state_path = self.registry / "state.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["actors_seen"][LEGACY_SCHEDULER_ID] = \
+            datetime.now(timezone.utc).isoformat(timespec="seconds")
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaises(DualSchedulerError):
+            heartbeat(self.registry, CONTAINER_SCHEDULER_ID)
 
     def test_fresh_foreign_heartbeat_aborts_the_guard(self):
         heartbeat(self.registry, CONTAINER_SCHEDULER_ID)
@@ -192,6 +412,17 @@ class UniqueSchedulerGuardTests(R25TestCase):
 
 
 class FreezeIntakeTests(R25TestCase):
+    def test_scheduled_intake_refuses_non_owner_and_freeze_without_mutation(self):
+        for scheduler, error in ((LEGACY_SCHEDULER_ID, DualSchedulerError),
+                                 (CONTAINER_SCHEDULER_ID, IntakeFrozenError)):
+            if scheduler == CONTAINER_SCHEDULER_ID:
+                freeze_intake(self.registry, actor="test", reason="test freeze")
+            before = (self.registry / "state.json").read_bytes()
+            with self.assertRaises(error):
+                with scheduled_intake(self.registry, scheduler):
+                    self.fail("refused scheduler reached the write section")
+            self.assertEqual((self.registry / "state.json").read_bytes(), before)
+
     def setUp(self):
         super().setUp()
         initialize_registry(self.registry, first_scheduler=CONTAINER_SCHEDULER_ID,
@@ -217,16 +448,18 @@ class FreezeIntakeTests(R25TestCase):
 
 class RollbackSequenceTests(R25TestCase):
     def test_rollback_requires_freeze_then_switch_then_reenable(self):
+        self.make_store()
         initialize_registry(self.registry, first_scheduler=LEGACY_SCHEDULER_ID,
                             actor="test", reason="first")
         marker = disable_legacy(self.registry, actor="test", simulated=True)
         self.assertTrue(marker["simulated"])
-        record_switch(self.registry, to=CONTAINER_SCHEDULER_ID, actor="test")
+        self.forward_switch()
         # Rollback without freeze is refused.
         with self.assertRaises(OwnershipConflictError):
-            record_switch(self.registry, to=LEGACY_SCHEDULER_ID, actor="test")
+            self.rollback_switch()
         freeze_intake(self.registry, actor="test", reason="rollback")
-        state = record_switch(self.registry, to=LEGACY_SCHEDULER_ID, actor="test")
+        self.write_manifest()
+        state = self.rollback_switch()
         self.assertEqual(state["active_scheduler"], LEGACY_SCHEDULER_ID)
         self.assertEqual(state["generation"], 3)
         reenabled = enable_legacy(self.registry, actor="test", reason="rollback done")
@@ -247,35 +480,15 @@ class RollbackSequenceTests(R25TestCase):
 class CutoverGateTests(R25TestCase):
     def setUp(self):
         super().setUp()
-        self.db_path = self.root / "tasks.sqlite3"
-        store = TaskStore(self.db_path)
-        try:
-            spec = _replay_spec(self.config, "R25 门检问题 {0}".format(id(self)))
-            task, _ = store.create_task(title="R25-gate", input_payload=spec,
-                                        execution_mode="replay")
-            self.task_id = str(task["task_id"])
-        finally:
-            store.close()
+        self.make_store(queued_tasks=1)
         initialize_registry(self.registry, first_scheduler=LEGACY_SCHEDULER_ID,
                             actor="test", reason="first")
-        self.gate_config = {
-            "scheduler_ownership": {
-                "enabled": True,
-                "state_dir": "scheduler_ownership",
-                "heartbeat_stale_seconds": 900,
-                "rollback_supported_schema": TASK_SCHEMA_VERSION,
-                "min_free_bytes": 1,  # effectively unconstrained by default here
-            },
-        }
 
     def gate(self, **overrides):
-        config = json.loads(json.dumps(self.gate_config))
-        for key, value in overrides.items():
-            config["scheduler_ownership"][key] = value
         return evaluate_cutover_gate(
             tasks_db_path=self.db_path, ownership_root=self.registry,
             state_root=self.root, runtime_schema_version=TASK_SCHEMA_VERSION,
-            config=config)
+            config=self.gate_config(**overrides))
 
     def test_clean_state_passes_all_four_checks(self):
         verdict = self.gate()
@@ -317,7 +530,7 @@ class CutoverGateTests(R25TestCase):
         empty.mkdir()
         verdict = evaluate_cutover_gate(
             tasks_db_path=self.db_path, ownership_root=empty, state_root=self.root,
-            runtime_schema_version=TASK_SCHEMA_VERSION, config=self.gate_config)
+            runtime_schema_version=TASK_SCHEMA_VERSION, config=self.gate_config())
         self.assertFalse(verdict["ok"])
         self.assertTrue(any("dual scheduler" in item for item in verdict["blockers"]))
 
@@ -342,7 +555,7 @@ class CutoverGateTests(R25TestCase):
         verdict = evaluate_cutover_gate(
             tasks_db_path=self.root / "missing.sqlite3", ownership_root=self.registry,
             state_root=self.root, runtime_schema_version=TASK_SCHEMA_VERSION,
-            config=self.gate_config)
+            config=self.gate_config())
         self.assertFalse(verdict["ok"])
 
 
@@ -351,7 +564,6 @@ class SameSlotNoDuplicateTests(R25TestCase):
 
     def setUp(self):
         super().setUp()
-        self.db_path = self.root / "tasks.sqlite3"
         from stock_agent.research_worker import run_research_task
         from stock_agent.worker_service import scheduled_slot_key
 

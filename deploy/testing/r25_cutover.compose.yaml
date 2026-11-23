@@ -6,33 +6,36 @@
 # record; the real effect belongs to scripts/set_scheduled_tasks_enabled.ps1
 # in the real window).
 #
-# Base image: the KONM-27-accepted r25-precheck image (runtime code from the
-# clean commit fee7795, digest below). Everything the drill adds on top comes
-# read-only from the checkout: this driver, the reviewed precheck driver
-# (reused for the full-column reconciliation), and the new R25 module
-# stock_agent/scheduler_ownership.py. Shipping that module inside a rebuilt
-# image + rebinding the digest is a precondition of the REAL cutover, not of
-# this rehearsal.
+# Use the accepted KONM-27 image with the checkout's cutover and scheduler
+# entry points mounted read-only. PowerShell runs the legacy entry on Linux
+# and uses mocks for the separate Windows task state test.
 name: r25-cutover-74f4813
 
 x-drill-base: &drill-base
-  image: ${R25_IMAGE:-r25-precheck-74f4813:latest}
+  image: ${R25_IMAGE:-r25-precheck-74f4813@sha256:acad75a8f2e23c80e76edb33d7614d79d8145dd5f10cb720f1e9b56091270acd}
   user: root
   working_dir: /app
-  environment: &drill-env
+  environment:
+    PYTHONDONTWRITEBYTECODE: "1"
+    POWERSHELL_TELEMETRY_OPTOUT: "1"
+    DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "1"
     APP_CONFIG_ROOT: /app/data/config
     APP_STATE_ROOT: /app/data
     APP_EVIDENCE_ROOT: /app/data/evidence_vault
     APP_REPORT_ROOT: /app/data/reports
     APP_TEMP_ROOT: /tmp/stock-agent
-  volumes: &drill-volumes
+  volumes:
     # Two independent temp state roots (R25: legacy source tree + new tree).
     - r25-legacy:/app/data
     - r25-new:/app/r25-new
     - ../../scripts/r25_cutover_drill.py:/drills/r25_cutover_drill.py:ro
     - ../../scripts/r25_precheck_drill.py:/drills/r25_precheck_drill.py:ro
-    # The R25 module under test, mounted read-only into the image's package.
     - ../../stock_agent/scheduler_ownership.py:/app/stock_agent/scheduler_ownership.py:ro
+    - ../../stock_agent/cli.py:/app/stock_agent/cli.py:ro
+    - ../../scripts/run_daily_research.ps1:/app/scripts/run_daily_research.ps1:ro
+    - ../../scripts/set_scheduled_tasks_enabled.ps1:/app/scripts/set_scheduled_tasks_enabled.ps1:ro
+    - ../../tests/r25_scheduled_tasks_mock.ps1:/drills/r25_scheduled_tasks_mock.ps1:ro
+    - ${R25_PWSH_DIR:?Set R25_PWSH_DIR to the extracted Linux PowerShell runtime}:/opt/r25-pwsh:ro
     # R24 REQUIRED_STATIC_PATHS are not shipped in the candidate image
     # (precheck finding); mounted read-only so backup-create can run.
     - ../../pyproject.toml:/app/pyproject.toml:ro

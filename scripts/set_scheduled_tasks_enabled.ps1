@@ -1,99 +1,145 @@
-# Explicitly disable or re-enable the Stock Agent legacy Windows Scheduled Tasks.
-#
-# R25 cutover contract (docs/GLM_REFACTOR_TASKBOOK_20261020.md R25):
-#   - The old PowerShell entry is only ever EXPLICITLY disabled/restored.
-#     This script is that explicit step; it never unregisters or overwrites
-#     a task definition (uninstall_scheduled_tasks.ps1 stays the removal path).
-#   - Forward cutover:  run with -Disable BEFORE `stock_agent cutover-switch
-#     --to container-worker`, and record the same fact in the ownership
-#     registry (disable_legacy / the cutover runbook does that).
-#   - Rollback:         run with -Enable AFTER the registry switch back to
-#     legacy-powershell and the increment reconciliation recorded.
-#
-# Usage:
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\set_scheduled_tasks_enabled.ps1 -Disable -DryRun
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\set_scheduled_tasks_enabled.ps1 -Disable
-#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\set_scheduled_tasks_enabled.ps1 -Enable
-
+# Explicitly disable or restore the legacy Stock Agent Windows Scheduled Tasks.
+# Retain the Record path printed by -Disable and pass it to -Enable after rollback.
 param(
     [Parameter(Mandatory = $true, ParameterSetName = "Disable")]
     [switch]$Disable,
     [Parameter(Mandatory = $true, ParameterSetName = "Enable")]
     [switch]$Enable,
+    [Parameter(ParameterSetName = "Disable")]
+    [Parameter(Mandatory = $true, ParameterSetName = "Enable")]
+    [string]$RecordPath,
     [switch]$DryRun,
     [string]$Reason = ""
 )
 
 $ErrorActionPreference = "Stop"
-$ProjectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$RecordDir = Join-Path $ProjectRoot "logs\scheduled_task_state"
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
 $TaskNames = @(
     "StockAgent_DailyResearch",
     "StockAgent_DailyDashboard",
     "StockAgent_PilotReconcile",
     "StockAgent_WeeklyReview"
 )
-$Action = if ($Disable) { "disable" } else { "enable" }
 
-Write-Host "=== Stock Agent Scheduled Tasks: $Action ==="
-Write-Host "Project root: $ProjectRoot"
-Write-Host ""
-
-$changed = 0
-$missing = 0
-foreach ($name in $TaskNames) {
-    $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-    if ($null -eq $task) {
-        Write-Host "[MISSING] $name (nothing to $Action)"
-        $missing++
-        continue
+function Get-LegacyTask {
+    param([string]$Name)
+    try {
+        Get-ScheduledTask -TaskPath '\' -TaskName $Name -ErrorAction Stop
+    } catch {
+        if ($_.CategoryInfo.Category -ne 'ObjectNotFound') { throw }
     }
-    $already = if ($Disable) { $task.State -eq "Disabled" } else { $task.State -ne "Disabled" }
-    if ($already) {
-        Write-Host "[SKIP] $name already in the requested state ($($task.State))"
-        continue
-    }
-    if ($DryRun) {
-        Write-Host "[DRY RUN] would $Action $name (state: $($task.State))"
-        continue
-    }
-    if ($Disable) {
-        $task | Disable-ScheduledTask -ErrorAction Stop | Out-Null
-    } else {
-        $task | Enable-ScheduledTask -ErrorAction Stop | Out-Null
-    }
-    Write-Host "[OK] $name -> $((Get-ScheduledTask -TaskName $name).State)"
-    $changed++
 }
 
+function Get-LegacyState {
+    param($Task)
+    if ($null -eq $Task) { return "missing" }
+    if ($Task.State -eq "Disabled") { return "disabled" }
+    return "enabled"
+}
+
+function Save-DisableRecord {
+    param($Record)
+    $TempPath = "$RecordPath.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $Json = $Record | ConvertTo-Json -Depth 5
+        [IO.File]::WriteAllText($TempPath, $Json, [Text.UTF8Encoding]::new($false))
+        if ([IO.File]::Exists($RecordPath)) {
+            # File.Replace requires a backup path on some .NET implementations.
+            [IO.File]::Replace($TempPath, $RecordPath, "$TempPath.backup")
+        } else {
+            [IO.File]::Move($TempPath, $RecordPath)
+        }
+    } finally {
+        foreach ($Path in @($TempPath, "$TempPath.backup")) {
+            if ([IO.File]::Exists($Path)) { [IO.File]::Delete($Path) }
+        }
+    }
+}
+
+if (-not $RecordPath) {
+    $RecordDir = Join-Path $ProjectRoot "logs/scheduled_task_state"
+    $RecordPath = Join-Path $RecordDir ("disable_{0}.json" -f [guid]::NewGuid().ToString("N"))
+}
+$RecordPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RecordPath)
+
+# Hold a file lock through each read/modify/write sequence. The record path
+# identifies one cutover and can be reused to resume a partially applied action.
 if (-not $DryRun) {
-    New-Item -ItemType Directory -Path $RecordDir -Force | Out-Null
-    $RecordPath = Join-Path $RecordDir "${Action}_$Stamp.json"
-    [pscustomobject]@{
-        action    = $Action
-        at        = (Get-Date).ToString("o")
-        reason    = $Reason
-        changed   = $changed
-        missing   = $missing
-        task_names = $TaskNames
-        states    = ($TaskNames | ForEach-Object {
-            $t = Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue
-            if ($null -eq $t) { "$_=missing" } else { "$_=$($t.State)" }
-        })
-    } | ConvertTo-Json | Out-File -LiteralPath $RecordPath -Encoding utf8
-    Write-Host ""
-    Write-Host "Record: $RecordPath"
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $RecordPath)) | Out-Null
+    $Lock = [IO.File]::Open("$RecordPath.lock", 'OpenOrCreate', 'ReadWrite', 'None')
 }
-
-Write-Host ""
-if ($DryRun) {
-    Write-Host "[DRY RUN] No task state was changed."
-} else {
-    Write-Host "Done. $changed task(s) $Action`d, $missing missing."
-    if ($Disable) {
-        Write-Host "Next (forward cutover): record the disable marker in the ownership registry and run cutover-switch --to container-worker."
+try {
+    if ([IO.File]::Exists($RecordPath)) {
+        $Record = Get-Content -Raw -LiteralPath $RecordPath -Encoding UTF8 | ConvertFrom-Json
+        if ($Record.schema_version -ne 1 -or $Record.action -ne "disable" -or
+            (@($Record.tasks.name) -join ',') -cne ($TaskNames -join ',')) {
+            throw "Invalid disable record: $RecordPath"
+        }
+    } elseif ($Enable) {
+        throw "Disable record missing: $RecordPath"
     } else {
-        Write-Host "Rollback complete: the legacy entry may resume scheduling."
+        $Record = [pscustomobject]@{
+            schema_version = 1
+            action = "disable"
+            at = (Get-Date).ToString("o")
+            reason = $Reason
+            restore_started_at = $null
+            restore_reason = $null
+            tasks = @($TaskNames | ForEach-Object {
+                [pscustomobject]@{
+                    name = $_
+                    before = Get-LegacyState (Get-LegacyTask $_)
+                    status = "unchanged"
+                }
+            })
+        }
+        if (-not $DryRun) { Save-DisableRecord $Record }
     }
+
+    Write-Host "Record: $RecordPath"
+    if ($Disable -and $Record.restore_started_at) { throw "Restore already started for this record." }
+    if ($Enable -and -not $DryRun -and -not $Record.restore_started_at) {
+        $Record.restore_started_at = (Get-Date).ToString("o")
+        $Record.restore_reason = $Reason
+        Save-DisableRecord $Record
+    }
+
+    foreach ($Entry in $Record.tasks) {
+        $Task = Get-LegacyTask $Entry.name
+        $State = Get-LegacyState $Task
+        $Action = "leave"
+        if ($Disable -and $Entry.before -eq "enabled" -and
+            $State -eq "enabled" -and $Entry.status -eq "unchanged") {
+            $Action = "disable"
+            if (-not $DryRun) {
+                $Entry.status = "disable_pending"
+                Save-DisableRecord $Record
+            }
+        } elseif ($Disable -and $Entry.status -eq "disable_pending" -and $State -eq "enabled") {
+            $Action = "disable"
+        } elseif ($Enable -and $Entry.before -eq "enabled" -and
+            $Entry.status -eq "disabled" -and $State -eq "disabled") {
+            $Action = "enable"
+        }
+        Write-Host ("{0}: before={1} now={2} -> {3}" -f $Entry.name, $Entry.before, $State, $Action)
+        if ($DryRun) { continue }
+        if ($Action -eq "disable") {
+            $Task | Disable-ScheduledTask -ErrorAction Stop | Out-Null
+            $State = Get-LegacyState (Get-LegacyTask $Entry.name)
+            if ($State -ne "disabled") { throw "Unable to confirm disable: $($Entry.name)" }
+        } elseif ($Action -eq "enable") {
+            $Task | Enable-ScheduledTask -ErrorAction Stop | Out-Null
+            $State = Get-LegacyState (Get-LegacyTask $Entry.name)
+            if ($State -ne "enabled") { throw "Unable to confirm restore: $($Entry.name)" }
+        }
+        if ($Disable -and $Entry.status -eq "disable_pending" -and $State -eq "disabled") {
+            $Entry.status = "disabled"
+            Save-DisableRecord $Record
+        } elseif ($Enable -and $Entry.status -eq "disabled" -and $State -eq "enabled") {
+            $Entry.status = "restored"
+            Save-DisableRecord $Record
+        }
+    }
+} finally {
+    if ($Lock) { $Lock.Dispose() }
 }

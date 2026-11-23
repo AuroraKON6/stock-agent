@@ -4,8 +4,8 @@ The taskbook's cutover (GLM_REFACTOR_TASKBOOK R25) switches the ONE writer
 that may schedule research runs from the legacy Windows PowerShell entry
 (``scripts/run_daily_research.ps1`` driven by ``StockAgent_*`` scheduled
 tasks) to the container worker. Both sides must be able to see who owns
-scheduling, so the registry is plain JSON on disk inside the state tree
-(the same tree backup/restore already moves):
+scheduling through a single shared registry, which stays outside the restored
+business snapshot:
 
 - ``<state_dir>/state.json``  — the current record (one active scheduler,
   a monotonic generation, the intake-freeze flag).
@@ -26,9 +26,8 @@ Discipline:
   requires the disable marker; nothing here unregisters or overwrites the
   legacy scheduled tasks — that is ``scripts/set_scheduled_tasks_enabled.ps1``
   run by a human in the real window.
-- The registry is per state tree: after restore, the NEW tree's copy is
-  authoritative and the legacy tree stays untouched (the rollback reference
-  — R24's "never overwrite the source" rule).
+- Both scheduler configurations refer to the same registry from the start.
+  Business snapshots and restores do not copy the ownership registry.
 
 ``evaluate_cutover_gate`` implements the taskbook's stop conditions as one
 pre-switch verdict: unexplained unknown attempts, dual schedulers, a schema
@@ -40,13 +39,17 @@ must be re-evaluated whenever either side changes.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import time
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from .audit_log import atomic_write_text
 from .config import project_path
@@ -90,6 +93,14 @@ class OwnershipConflictError(SchedulerOwnershipError):
     """A transition was attempted against stale/missing preconditions."""
 
 
+class CutoverBlockedError(SchedulerOwnershipError):
+    """A switch was refused by the stop conditions / readiness checks."""
+
+    def __init__(self, message: str, blockers: Optional[List[str]] = None):
+        super().__init__(message)
+        self.blockers = list(blockers or [])
+
+
 def scheduler_ownership_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Normalized settings; disabled until the config opts in."""
     value = config or {}
@@ -99,6 +110,7 @@ def scheduler_ownership_config(config: Optional[Dict[str, Any]] = None) -> Dict[
     return {
         "enabled": bool(raw.get("enabled", False)),
         "state_dir": str(raw.get("state_dir") or "data/scheduler_ownership"),
+        "scheduler_id": str(raw.get("scheduler_id") or "").strip(),
         "heartbeat_stale_seconds": max(5, int(raw.get("heartbeat_stale_seconds")
                                           or DEFAULT_HEARTBEAT_STALE_SECONDS)),
         "min_free_bytes": max(0, int(raw.get("min_free_bytes") or DEFAULT_MIN_FREE_BYTES)),
@@ -124,6 +136,7 @@ def default_state() -> Dict[str, Any]:
         "generation": 0,
         "intake_frozen": False,
         "frozen_reason": "",
+        "freeze_id": "",
         "cutover_id": "",
         "actors_seen": {},
         "updated_at": "",
@@ -249,6 +262,11 @@ def heartbeat(root: Path, scheduler_id: str, *,
             raise DualSchedulerError(
                 "scheduler {0} is not the active owner ({1}); a second scheduler"
                 " must never run".format(scheduler_id, active))
+        foreign = _require_fresh_foreign_heartbeat(state, scheduler_id, stale_seconds)
+        if foreign:
+            raise DualSchedulerError(
+                "fresh heartbeat from second scheduler {0} (within {1}s); aborting".format(
+                    foreign, stale_seconds))
         actors = dict(state.get("actors_seen") or {})
         actors[str(scheduler_id)] = _now_iso()
         state["actors_seen"] = actors
@@ -276,6 +294,23 @@ def assert_unique_scheduler(root: Path, scheduler_id: str, *,
     return state
 
 
+@contextmanager
+def scheduled_intake(root: Path, scheduler_id: str, *,
+                     stale_seconds: int = DEFAULT_HEARTBEAT_STALE_SECONDS):
+    """Serialize scheduled submission against freeze and owner changes."""
+    root = Path(root)
+    if not (root / STATE_FILENAME).is_file():
+        raise NotActiveSchedulerError("no active scheduler is registered")
+    with _RegistryLock(root):
+        state = assert_unique_scheduler(root, scheduler_id, stale_seconds=stale_seconds)
+        assert_intake_allowed(root)
+        if scheduler_id == LEGACY_SCHEDULER_ID and legacy_disabled_path(root).is_file():
+            raise OwnershipConflictError("legacy entry is disabled for cutover")
+        yield
+        state["actors_seen"][scheduler_id] = _now_iso()
+        _save_state(root, state)
+
+
 def intake_allowed(root: Path) -> bool:
     state = load_state(root)
     return not bool(state.get("intake_frozen"))
@@ -297,6 +332,7 @@ def freeze_intake(root: Path, *, actor: str, reason: str, cutover_id: str = "") 
             raise OwnershipConflictError("intake is already frozen")
         state["intake_frozen"] = True
         state["frozen_reason"] = str(reason)
+        state["freeze_id"] = uuid4().hex
         state["cutover_id"] = str(cutover_id)
         _save_state(root, state)
         _append_event(root, {
@@ -315,6 +351,7 @@ def thaw_intake(root: Path, *, actor: str, reason: str = "") -> Dict[str, Any]:
             raise OwnershipConflictError("intake is not frozen")
         state["intake_frozen"] = False
         state["frozen_reason"] = ""
+        state["freeze_id"] = ""
         _save_state(root, state)
         _append_event(root, {
             "event": "thaw", "generation": int(state["generation"]),
@@ -349,21 +386,25 @@ def disable_legacy(root: Path, *, actor: str, cutover_id: str = "",
         "method": str(method) or "{0} -Disable".format(LEGACY_DISABLE_SCRIPT),
         "simulated": bool(simulated),
     }
-    atomic_write_text(legacy_disabled_path(root),
-                      json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    with _RegistryLock(root):
+        atomic_write_text(legacy_disabled_path(root),
+                          json.dumps(marker, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     return marker
 
 
 def enable_legacy(root: Path, *, actor: str, reason: str = "") -> Dict[str, Any]:
     """Remove the disable marker (rollback re-enables the legacy entry)."""
     path = legacy_disabled_path(root)
-    if not path.is_file():
-        raise OwnershipConflictError("legacy entry is not marked disabled")
-    marker = json.loads(path.read_text(encoding="utf-8"))
-    path.unlink()
     with _RegistryLock(root):
+        state = load_state(root)
+        if not path.is_file():
+            raise OwnershipConflictError("legacy entry is not marked disabled")
+        if state["active_scheduler"] != LEGACY_SCHEDULER_ID:
+            raise OwnershipConflictError("legacy entry can only be restored after ownership returns")
+        marker = json.loads(path.read_text(encoding="utf-8"))
+        path.unlink()
         _append_event(root, {
-            "event": "legacy_enabled", "generation": int(load_state(root).get("generation") or 0),
+            "event": "legacy_enabled", "generation": state["generation"],
             "actor": str(actor), "reason": str(reason), "at": _now_iso(),
         })
     return marker
@@ -372,19 +413,124 @@ def enable_legacy(root: Path, *, actor: str, reason: str = "") -> Dict[str, Any]
 # --------------------------------------------------------------------------- #
 # Ownership switch (forward and rollback)
 # --------------------------------------------------------------------------- #
+def _rollback_snapshot(db_path: Path) -> Dict[str, Any]:
+    with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+        connection.execute("BEGIN")
+        tasks = {row[0]: tuple(row[1:]) for row in connection.execute(
+            "SELECT task_id, * FROM research_tasks ORDER BY task_id")}
+        outbox = {row[0]: tuple(row[1:]) for row in connection.execute(
+            "SELECT sequence, * FROM task_outbox ORDER BY sequence")}
+        in_flight = dict(connection.execute(
+            "SELECT status, COUNT(*) FROM research_tasks"
+            " WHERE status IN ('queued', 'leased', 'running') GROUP BY status"))
+    return {"tasks": tasks, "outbox": outbox, "in_flight": in_flight}
+
+
+def _snapshot_digest(snapshot: Dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(snapshot, sort_keys=True,
+                                    ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _check_rollback_drain(snapshot: Dict[str, Any]) -> None:
+    in_flight = snapshot["in_flight"]
+    if in_flight:
+        raise OwnershipConflictError("retiring side not drained: {0}".format(
+            ", ".join("{0}={1}".format(k, v) for k, v in sorted(in_flight.items()))))
+
+
+def record_rollback_reconciliation(registry_root, baseline_db_path, tasks_db_path) -> Dict[str, Any]:
+    """Compare baseline rows in full, then record the drained increment."""
+    root = Path(registry_root)
+    with _RegistryLock(root):
+        state = load_state(root)
+        if not state["intake_frozen"] or not state["freeze_id"]:
+            raise OwnershipConflictError("increment reconciliation requires frozen intake")
+        if Path(baseline_db_path).resolve() == Path(tasks_db_path).resolve():
+            raise OwnershipConflictError("increment reconciliation requires an independent baseline")
+        try:
+            baseline = _rollback_snapshot(baseline_db_path)
+            current = _rollback_snapshot(tasks_db_path)
+        except sqlite3.Error as exc:
+            raise OwnershipConflictError("cannot read stores for increment reconciliation: {0}".format(exc)) from exc
+        _check_rollback_drain(current)
+        manifest = {
+            "generation": state["generation"], "freeze_id": state["freeze_id"],
+            "cutover_id": state["cutover_id"], "task_store_sha256": _snapshot_digest(current),
+            "baseline_sha256": _snapshot_digest(baseline),
+            "baseline_tasks": len(baseline["tasks"]),
+            "baseline_outbox_events": len(baseline["outbox"]),
+        }
+        for table, result_key in (("tasks", "increment_tasks"),
+                                  ("outbox", "increment_outbox_sequences")):
+            missing_or_changed = [key for key, row in baseline[table].items()
+                                  if current[table].get(key) != row]
+            if missing_or_changed:
+                raise OwnershipConflictError(
+                    "baseline {0} differs: {1} missing or changed".format(table, len(missing_or_changed)))
+            manifest[result_key] = sorted(current[table].keys() - baseline[table].keys())
+        atomic_write_text(root / "rollback_increments.json",
+                          json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        return manifest
+
+
+def evaluate_rollback_readiness(registry_root, tasks_db_path) -> Dict[str, Any]:
+    """Require a drained store and reconciliation of this exact freeze and store."""
+    root = Path(registry_root)
+    state = load_state(root)
+    manifest_path = root / "rollback_increments.json"
+    blockers = []
+    in_flight = {}
+    try:
+        snapshot = _rollback_snapshot(tasks_db_path)
+        in_flight = snapshot["in_flight"]
+        _check_rollback_drain(snapshot)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (not isinstance(manifest, dict) or not state["freeze_id"]
+                or manifest.get("freeze_id") != state["freeze_id"]
+                or manifest.get("generation") != state["generation"]
+                or manifest.get("cutover_id") != state["cutover_id"]
+                or manifest.get("task_store_sha256") != _snapshot_digest(snapshot)):
+            blockers.append("increment reconciliation no longer matches this freeze and task store")
+    except FileNotFoundError:
+        blockers.append("increment reconciliation not recorded (rollback_increments.json missing)")
+    except (OSError, ValueError, sqlite3.Error, OwnershipConflictError) as exc:
+        blockers.append(str(exc))
+    return {"ok": not blockers, "blockers": blockers, "in_flight": in_flight,
+            "increment_manifest": str(manifest_path),
+            "increment_manifest_present": manifest_path.is_file()}
+
+
 def record_switch(root: Path, *, to: str, actor: str, reason: str = "",
-                  cutover_id: str = "", expected_generation: Optional[int] = None) -> Dict[str, Any]:
+                  cutover_id: str = "", expected_generation: Optional[int] = None,
+                  tasks_db_path: Any = None, state_root: Any = None,
+                  runtime_schema_version: str = "",
+                  config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Move the unique-scheduler ownership to ``to`` (generation +1).
 
-    Direction-derived preconditions, never optional:
+    Direction-derived preconditions, never optional — the taskbook's stop
+    conditions CONSTRAIN the switch itself, not just a separate gate run:
+
     - FORWARD (legacy -> container): the legacy entry must carry the explicit
-      disable marker (no dual-scheduler window may open), and the intake must
-      NOT be frozen (a forward switch must not race a rollback).
-    - ROLLBACK (container -> legacy): the intake must be frozen first; the
-      legacy disable marker is cleared by the caller right after via
-      ``enable_legacy``."""
+      disable marker (no dual-scheduler window may open); the intake must NOT
+      be frozen (a forward switch must not race a rollback); and the cutover
+      gate must pass over the SAME state (``tasks_db_path``/``state_root``/
+      ``runtime_schema_version`` are required — unexplained unknowns, a dual
+      scheduler, a non-rollbackable schema or insufficient capacity each
+      refuse the switch and leave owner/generation/events untouched).
+    - ROLLBACK (container -> legacy): the intake must be frozen first, the
+      same gate must pass, the retiring side must have drained (no
+      queued/leased/running tasks against ``tasks_db_path``), and the increment
+      reconciliation must match the current freeze and task store. The legacy disable marker is cleared by the caller
+      right after via ``enable_legacy``.
+
+    On success the OUTGOING scheduler's heartbeat is retired from
+    ``actors_seen``: the switch is the authoritative statement that it is no
+    longer a legitimate presence, so its pre-switch beat must not veto the
+    new owner inside the heartbeat-stale window (its future beats are
+    refused organically by ``heartbeat``)."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
+    forward = str(to) != LEGACY_SCHEDULER_ID
     with _RegistryLock(root):
         state = load_state(root)
         generation = int(state.get("generation") or 0)
@@ -394,27 +540,50 @@ def record_switch(root: Path, *, to: str, actor: str, reason: str = "",
             raise OwnershipConflictError(
                 "generation moved: expected {0}, found {1}".format(expected_generation, generation))
         active = str(state.get("active_scheduler") or "")
+        if str(to) not in (LEGACY_SCHEDULER_ID, CONTAINER_SCHEDULER_ID):
+            raise OwnershipConflictError("unknown scheduler: {0}".format(to))
         if active == str(to):
             raise OwnershipConflictError(
                 "scheduler {0} is already the active owner".format(to))
-        forward = str(to) != LEGACY_SCHEDULER_ID
-        if forward and not legacy_disabled_path(root).is_file():
-            raise OwnershipConflictError(
-                "legacy entry is not disabled; refusing to create a dual-scheduler window"
-                " (record it with disable_legacy / the PowerShell disable script first)")
-        if forward and state.get("intake_frozen"):
-            raise OwnershipConflictError(
-                "intake is frozen; a forward switch must not race a rollback")
-        if not forward and not state.get("intake_frozen"):
+        if forward:
+            if not legacy_disabled_path(root).is_file():
+                raise OwnershipConflictError(
+                    "legacy entry is not disabled; refusing to create a dual-scheduler window"
+                    " (record it with disable_legacy / the PowerShell disable script first)")
+            if state.get("intake_frozen"):
+                raise OwnershipConflictError(
+                    "intake is frozen; a forward switch must not race a rollback")
+        elif not state.get("intake_frozen"):
             raise OwnershipConflictError(
                 "rollback switch requires frozen intake first (freeze_intake)")
+        if not tasks_db_path or not state_root or not runtime_schema_version:
+            raise OwnershipConflictError(
+                "switch requires tasks_db_path, state_root and runtime_schema_version"
+                " so the cutover gate can check the actual store")
+        gate_verdict = evaluate_cutover_gate(
+            tasks_db_path=tasks_db_path, ownership_root=root, state_root=state_root,
+            runtime_schema_version=runtime_schema_version, config=config)
+        if not gate_verdict["ok"]:
+            raise CutoverBlockedError("cutover switch blocked by stop conditions",
+                                      gate_verdict["blockers"])
+        if not forward:
+            rollback_readiness = evaluate_rollback_readiness(root, tasks_db_path)
+            if not rollback_readiness["ok"]:
+                raise CutoverBlockedError("rollback switch blocked by readiness checks",
+                                          rollback_readiness["blockers"])
         state["active_scheduler"] = str(to)
         state["generation"] = generation + 1
         state["cutover_id"] = str(cutover_id)
+        actors = {key: value for key, value in (state.get("actors_seen") or {}).items()
+                  if key != active}  # retire the outgoing owner's heartbeat
+        state["actors_seen"] = actors
         _save_state(root, state)
         _append_event(root, {
             "event": "switch", "generation": generation + 1, "from": active, "to": str(to),
             "actor": str(actor), "reason": str(reason), "cutover_id": str(cutover_id),
+            "gate_ok": True,
+            "rollback_readiness_ok": None if forward else True,
+            "outgoing_heartbeat_retired": active,
             "at": state["updated_at"],
         })
         return state
@@ -431,7 +600,7 @@ def _unexplained_unknown_attempts(db_path: Path) -> Dict[str, Any]:
     Both abort the cutover until reconciled."""
     connection = None
     try:
-        connection = sqlite3.connect("file:{0}?mode=ro".format(Path(db_path).resolve()), uri=True)
+        connection = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
         dispatched = int(connection.execute(
             "SELECT COUNT(*) FROM task_invocation_attempts WHERE state = 'dispatched'").fetchone()[0])
         outcome_unknown = int(connection.execute(
@@ -456,7 +625,7 @@ def _schema_rollback_check(db_path: Path, runtime_schema_version: str,
                 " the cutover plan must pin the schema pair"}
     connection = None
     try:
-        connection = sqlite3.connect("file:{0}?mode=ro".format(Path(db_path).resolve()), uri=True)
+        connection = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
         tables = int(connection.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN"
             " ('research_tasks','task_outbox','task_invocation_attempts')").fetchone()[0])
@@ -475,10 +644,12 @@ def _schema_rollback_check(db_path: Path, runtime_schema_version: str,
     def _key(version: str) -> tuple:
         try:
             return tuple(int(part) for part in str(version).split("."))
-        except ValueError:
-            return (str(version),)
 
-    rollbackable = _key(runtime_schema_version) <= _key(supported)
+        except ValueError:
+            return ()
+
+    runtime_key, supported_key = _key(runtime_schema_version), _key(supported)
+    rollbackable = bool(runtime_key and supported_key and runtime_key <= supported_key)
     return {"ok": rollbackable,
             "runtime_schema_version": str(runtime_schema_version),
             "rollback_supported_schema": supported}
@@ -487,8 +658,7 @@ def _schema_rollback_check(db_path: Path, runtime_schema_version: str,
 def _capacity_check(state_root: Path, min_free_bytes: int) -> Dict[str, Any]:
     root = Path(state_root)
     try:
-        stats = os.statvfs(root)
-        free = int(stats.f_bavail) * int(stats.f_frsize)
+        free = shutil.disk_usage(root).free
     except OSError as exc:
         return {"ok": False, "error": "cannot stat state root {0}: {1}".format(root, exc),
                 "free_bytes": None, "min_free_bytes": int(min_free_bytes)}
@@ -560,10 +730,10 @@ __all__ = [
     "SCHEDULER_OWNERSHIP_VERSION", "LEGACY_SCHEDULER_ID", "CONTAINER_SCHEDULER_ID",
     "LEGACY_TASK_NAMES", "LEGACY_DISABLE_SCRIPT",
     "SchedulerOwnershipError", "NotActiveSchedulerError", "DualSchedulerError",
-    "IntakeFrozenError", "OwnershipConflictError",
+    "IntakeFrozenError", "OwnershipConflictError", "CutoverBlockedError",
     "scheduler_ownership_config", "default_state", "load_state",
     "initialize_registry", "heartbeat", "assert_unique_scheduler",
     "intake_allowed", "assert_intake_allowed", "freeze_intake", "thaw_intake",
     "disable_legacy", "enable_legacy", "legacy_disabled_path", "record_switch",
-    "evaluate_cutover_gate", "ownership_status",
+    "evaluate_rollback_readiness", "evaluate_cutover_gate", "ownership_status",
 ]
