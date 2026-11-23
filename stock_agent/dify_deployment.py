@@ -13,7 +13,6 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -30,11 +29,12 @@ _FORBIDDEN_KEY_MARKERS = ("api_key", "apikey", "password", "secret", "token")
 _R16_RELEASE = "1.17.1"
 _R16_RELEASE_COMMIT = "8387590ace4a094de812b7847fc6a4c3a27cd52b"
 _R16_ORIGIN = "http://stock-agent-r16-gateway:8770/api/dify/v1/"
-_R16_OPERATIONS = frozenset({"create-research", "research-status"})
-_R16_NODE_TYPES = frozenset({"start", "http-request", "code", "if-else", "end"})
 _R16_ENVIRONMENT = {
-    "STOCK_AGENT_SERVICE_SECRET": "secret",
-    "STOCK_AGENT_WORKFLOW_VERSION": "string",
+    "STOCK_AGENT_SERVICE_SECRET": ("secret", ""),
+    "STOCK_AGENT_WORKFLOW_VERSION": ("string", ""),
+    "R16_CREATE_UNCONFIRMED": ("string", "create_unconfirmed"),
+    "R16_STATUS_UNCONFIRMED": ("string", "status_unconfirmed"),
+    "R16_CASE_PATH_DEFAULT": ("string", "/"),
 }
 _R16_AUTH = {
     "type": "api-key",
@@ -49,30 +49,79 @@ class DeploymentCandidateError(ValueError):
 def _validate_replay_graph(graph: dict) -> None:
     nodes = graph["nodes"]
     by_id = {node["id"]: node["data"] for node in nodes}
-    if len(nodes) != len(by_id) or {node["type"] for node in by_id.values()} - _R16_NODE_TYPES:
-        raise DeploymentCandidateError("workflow has duplicate IDs or unapproved node types")
-    calls = [node for node in by_id.values() if node["type"] == "http-request"]
-    if len(calls) != 2 or {node["url"] for node in calls} != {_R16_ORIGIN + op for op in _R16_OPERATIONS}:
-        raise DeploymentCandidateError("workflow must call each approved route exactly once")
-    for call in calls:
+    if len(nodes) != len(by_id) or {key: node["type"] for key, node in by_id.items()} != {
+        "16001": "start", "16003": "http-request", "16005": "if-else",
+        "16006": "http-request", "16007": "if-else", "16008": "end",
+        "16009": "end", "16010": "end",
+    }:
+        raise DeploymentCandidateError("workflow must use only its reviewed native nodes")
+    edges = [(edge["source"], edge["sourceHandle"], edge["target"]) for edge in graph["edges"]]
+    if sorted(edges) != [
+        ("16001", "source", "16003"), ("16003", "source", "16005"),
+        ("16005", "false", "16009"), ("16005", "true", "16006"),
+        ("16006", "source", "16007"), ("16007", "false", "16010"), ("16007", "true", "16008"),
+    ]:
+        raise DeploymentCandidateError("workflow must create once and query only after a receipt")
+    for node_id, operation, fields in (
+        ("16003", "create-research", {
+            "title": "{{#16001.title#}}",
+            "case_id": "{{#16001.case_id#}}",
+            "research_question": "{{#16001.research_question#}}",
+            "input_version": "{{#16001.input_version#}}",
+            "business_intent_id": "{{#16001.business_intent_id#}}",
+            "dify_run_id": "{{#sys.workflow_run_id#}}",
+            "workflow_version": "{{#env.STOCK_AGENT_WORKFLOW_VERSION#}}",
+            "execution_mode": "replay",
+        }),
+        ("16006", "research-status", {
+            "task_id": "{{#16003.headers.r16_task_id#}}",
+            "status_only": "true",
+        }),
+    ):
+        call = by_id[node_id]
         if call.get("authorization") != _R16_AUTH or call.get("headers") != "" or call.get("params") != "":
             raise DeploymentCandidateError("HTTP node must use the runtime bearer secret and no custom headers or query")
-        if (call.get("method") != "POST"
+        if (call.get("url") != _R16_ORIGIN + operation or call.get("method") != "POST"
                 or call.get("retry_config") != {"retry_enabled": False, "max_retries": 0, "retry_interval": 0}
                 or call.get("timeout") != {"connect": 2, "read": 3, "write": 2}):
-            raise DeploymentCandidateError("HTTP method, retry or timeout exceeds the replay policy")
-    order = TopologicalSorter()
-    for node_id in by_id:
-        order.add(node_id)
-    for edge in graph["edges"]:
-        source, target = edge["source"], edge["target"]
-        if source not in by_id or target not in by_id:
-            raise DeploymentCandidateError("workflow edge references an unknown node")
-        order.add(target, source)
-    try:
-        order.prepare()
-    except CycleError as exc:
-        raise DeploymentCandidateError("workflow must be acyclic") from exc
+            raise DeploymentCandidateError("HTTP destination, method, retry or timeout exceeds the replay policy")
+        if call.get("body") != {"type": "x-www-form-urlencoded", "data": [
+            {"type": "text", "key": key, "value": value} for key, value in fields.items()
+        ]}:
+            raise DeploymentCandidateError("HTTP node must send the reviewed replay form")
+        if call.get("error_strategy") != "default-value" or call.get("default_value") != [
+            {"key": "body", "type": "string", "value": "{}"},
+            {"key": "status_code", "type": "number", "value": 0},
+            {"key": "headers", "type": "object", "value": "{}"},
+        ]:
+            raise DeploymentCandidateError("HTTP errors must route to an unconfirmed receipt")
+
+    for branch, reply, header in (("16005", "16003", "r16_task_id"), ("16007", "16006", "r16_status")):
+        cases = by_id[branch]["cases"]
+        if len(cases) != 1 or cases[0]["case_id"] != "true" or cases[0]["logical_operator"] != "and":
+            raise DeploymentCandidateError("workflow must gate the confirmed receipt branch")
+        conditions = [(item["variable_selector"], item["comparison_operator"], item["value"])
+                      for item in cases[0]["conditions"]]
+        if conditions != [
+            ([reply, "status_code"], "=", "200"),
+            ([reply, "body"], "contains", '{"ok": true, "data": {"task_id": "task_'),
+            ([reply, "headers", header], "not empty", ""),
+        ]:
+            raise DeploymentCandidateError("HTTP status alone cannot confirm a replay receipt")
+
+    for node_id, status, task_id, path in (
+        ("16008", ["16006", "headers", "r16_status"],
+         ["16003", "headers", "r16_task_id"], ["16003", "headers", "r16_case_path"]),
+        ("16009", ["env", "R16_CREATE_UNCONFIRMED"], [], ["env", "R16_CASE_PATH_DEFAULT"]),
+        ("16010", ["env", "R16_STATUS_UNCONFIRMED"],
+         ["16003", "headers", "r16_task_id"], ["16003", "headers", "r16_case_path"]),
+    ):
+        outputs = [(item["variable"], item["value_selector"]) for item in by_id[node_id]["outputs"]]
+        if outputs != [
+            ("status", status), ("task_id", task_id), ("case_path", path),
+            ("case_id", ["16001", "case_id"]), ("business_intent_id", ["16001", "business_intent_id"]),
+        ]:
+            raise DeploymentCandidateError("workflow outputs must use the reviewed receipt projection")
 
 
 def validate_replay_workflow(manifest_path: Path, *, approved_version: str | None = None) -> str:
@@ -110,9 +159,8 @@ def validate_replay_workflow(manifest_path: Path, *, approved_version: str | Non
         workflow = document["workflow"]
         variables = workflow["environment_variables"]
         if (len(variables) != len(_R16_ENVIRONMENT)
-                or {item["name"]: item["value_type"] for item in variables} != _R16_ENVIRONMENT
-                or any(item.get("value") != "" for item in variables)):
-            raise DeploymentCandidateError("workflow environment may only declare empty runtime variables")
+                or {item["name"]: (item["value_type"], item["value"]) for item in variables} != _R16_ENVIRONMENT):
+            raise DeploymentCandidateError("workflow environment must use empty runtime values and fixed fallbacks")
         if any(isinstance(feature, dict) and feature.get("enabled") for feature in workflow["features"].values()):
             raise DeploymentCandidateError("workflow features must be disabled for replay")
         _validate_replay_graph(workflow["graph"])

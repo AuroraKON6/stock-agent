@@ -37,7 +37,7 @@ def main():
         # DifyGateway resolves its ledger and credential paths at construction.
         with project_path_override(root.joinpath):
             gateway = ReplayGateway(store, config)
-        serve_dify_api(gateway, host="127.0.0.1", port=8771)
+        serve_dify_api(gateway, host="127.0.0.1", port=8771, replay_forms=True)
     finally:
         store.close()
 

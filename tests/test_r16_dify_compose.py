@@ -97,8 +97,11 @@ class R16ComposeTests(unittest.TestCase):
             env = self.services[name]["environment"]
             for scheme in ("HTTP", "HTTPS"):
                 self.assertEqual(env[f"SSRF_PROXY_{scheme}_URL"], "http://ssrf_proxy:3128")
-            self.assertEqual(env["SSRF_DEFAULT_MAX_RETRIES"], "0")
+            self.assertEqual(env["SSRF_DEFAULT_MAX_RETRIES"], "1")
         self.assertEqual(self.services["sandbox"]["environment"]["ENABLE_NETWORK"], "false")
+        plugin = self.services["plugin_daemon"]["environment"]
+        self.assertEqual(plugin["PLUGIN_REMOTE_INSTALLING_HOST"], "127.0.0.1")
+        self.assertEqual(plugin["PLUGIN_REMOTE_INSTALLING_PORT"], "5003")
 
         proxy = (DEPLOY / "squid-replay.conf").read_text(encoding="utf-8")
         gateway = (DEPLOY / "nginx-replay.conf").read_text(encoding="utf-8")

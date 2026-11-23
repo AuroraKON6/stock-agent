@@ -24,7 +24,9 @@ x-core-env: &core-env
   CODE_EXECUTION_API_KEY: ${R16_SANDBOX_KEY:?set a Dify-only sandbox key}
   SSRF_PROXY_HTTP_URL: http://ssrf_proxy:3128
   SSRF_PROXY_HTTPS_URL: http://ssrf_proxy:3128
-  SSRF_DEFAULT_MAX_RETRIES: "0"
+  # 1.17.1 requires a positive global default. Its HTTP Request node passes
+  # max_retries=0 to the SSRF client and the DSL disables node-level retries.
+  SSRF_DEFAULT_MAX_RETRIES: "1"
   PLUGIN_DAEMON_URL: http://plugin_daemon:5002
   PLUGIN_DAEMON_KEY: ${R16_PLUGIN_KEY:?set a Dify-only plugin key}
   INNER_API_KEY_FOR_PLUGIN: ${R16_PLUGIN_INNER_KEY:?set a Dify-only inner plugin key}
@@ -189,6 +191,8 @@ services:
       SERVER_KEY: ${R16_PLUGIN_KEY:?set a Dify-only plugin key}
       DIFY_INNER_API_URL: http://api:5001
       DIFY_INNER_API_KEY: ${R16_PLUGIN_INNER_KEY:?set a Dify-only inner plugin key}
+      PLUGIN_REMOTE_INSTALLING_HOST: 127.0.0.1
+      PLUGIN_REMOTE_INSTALLING_PORT: "5003"
       FORCE_VERIFYING_SIGNATURE: "true"
       PLUGIN_WORKING_PATH: /app/storage/cwd
       PLUGIN_STORAGE_TYPE: local
