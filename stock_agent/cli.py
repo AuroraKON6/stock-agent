@@ -1075,6 +1075,52 @@ def main() -> None:
     manifest_bind_parser.add_argument("--config", default="config/watchlist.local.json")
     manifest_bind_parser.add_argument("--summary", required=True, help="调度运行 summary JSON 路径")
 
+    cutover_status_parser = subparsers.add_parser(
+        "cutover-status", help="R25 唯一调度者注册表只读状态（generation/冻结/旧入口标记）")
+    cutover_status_parser.add_argument("--config", default="config/watchlist.local.json")
+    cutover_status_parser.add_argument("--state-dir", default="",
+                                       help="覆盖注册表目录（默认取配置 scheduler_ownership.state_dir）")
+
+    cutover_switch_parser = subparsers.add_parser(
+        "cutover-switch", help="R25 切换唯一调度者（需先显式停用旧入口；回退方向需先冻结新接单）")
+    cutover_switch_parser.add_argument("--config", default="config/watchlist.local.json")
+    cutover_switch_parser.add_argument("--to", required=True,
+                                       choices=["legacy-powershell", "container-worker"])
+    cutover_switch_parser.add_argument("--actor", required=True)
+    cutover_switch_parser.add_argument("--reason", default="")
+    cutover_switch_parser.add_argument("--cutover-id", default="")
+    cutover_switch_parser.add_argument("--expected-generation", type=int, default=0)
+    cutover_switch_parser.add_argument("--state-dir", default="")
+
+    cutover_freeze_parser = subparsers.add_parser(
+        "cutover-freeze", help="R25 回退第 1 步：冻结新接单（在途任务继续排空）")
+    cutover_freeze_parser.add_argument("--config", default="config/watchlist.local.json")
+    cutover_freeze_parser.add_argument("--actor", required=True)
+    cutover_freeze_parser.add_argument("--reason", required=True)
+    cutover_freeze_parser.add_argument("--cutover-id", default="")
+    cutover_freeze_parser.add_argument("--state-dir", default="")
+
+    cutover_thaw_parser = subparsers.add_parser(
+        "cutover-thaw", help="R25 回退收尾：解除接单冻结（仅注册表操作，不触碰任务库）")
+    cutover_thaw_parser.add_argument("--config", default="config/watchlist.local.json")
+    cutover_thaw_parser.add_argument("--actor", required=True)
+    cutover_thaw_parser.add_argument("--reason", default="")
+    cutover_thaw_parser.add_argument("--state-dir", default="")
+
+    cutover_heartbeat_parser = subparsers.add_parser(
+        "cutover-heartbeat", help="R25 调度者心跳（非唯一调度者或双调度时拒绝）")
+    cutover_heartbeat_parser.add_argument("--config", default="config/watchlist.local.json")
+    cutover_heartbeat_parser.add_argument("--scheduler-id", required=True)
+    cutover_heartbeat_parser.add_argument("--state-dir", default="")
+
+    cutover_gate_parser = subparsers.add_parser(
+        "cutover-gate", help="R25 切换门检：未解释 unknown/双调度/不可回退 schema/容量不足任一即中止")
+    cutover_gate_parser.add_argument("--config", default="config/watchlist.local.json")
+    cutover_gate_parser.add_argument("--tasks-db", default="",
+                                     help="覆盖任务库路径（默认取配置 task_runtime.db_path）")
+    cutover_gate_parser.add_argument("--state-root", default="",
+                                     help="覆盖容量检查根目录（默认取注册表目录上级）")
+
     args = parser.parse_args()
     if args.command == "task-summary":
         _task_summary(args)
@@ -1457,6 +1503,18 @@ def main() -> None:
         _task_board(args.config, args.port)
     elif args.command == "run-manifest-bind":
         _run_manifest_bind(args.config, args.summary)
+    elif args.command == "cutover-status":
+        _cutover_status(args.config, args.state_dir)
+    elif args.command == "cutover-switch":
+        _cutover_switch(args)
+    elif args.command == "cutover-freeze":
+        _cutover_freeze(args)
+    elif args.command == "cutover-thaw":
+        _cutover_thaw(args)
+    elif args.command == "cutover-heartbeat":
+        _cutover_heartbeat(args)
+    elif args.command == "cutover-gate":
+        _cutover_gate(args)
 
 
 def _task_summary(args) -> None:
@@ -1813,6 +1871,85 @@ def _run_manifest_bind(config_path: str, summary_path: str) -> None:
         print("run_id: {0} status: {1} eligible: {2}".format(
             manifest.get("run_id"), manifest.get("status"), manifest.get("eligible_for_pilot")))
     if result.get("status") != "PASS":
+        raise SystemExit(1)
+
+
+def _cutover_registry_root(config_path: str, state_dir_override: str):
+    """Resolve the ownership registry root; the override wins when given."""
+    from .scheduler_ownership import scheduler_ownership_config
+
+    config = load_config(config_path)
+    cfg = scheduler_ownership_config(config)
+    root = str(state_dir_override or "").strip() or cfg["state_dir"]
+    return project_path(root), config
+
+
+def _cutover_status(config_path: str, state_dir_override: str) -> None:
+    from .scheduler_ownership import ownership_status
+
+    root, _config = _cutover_registry_root(config_path, state_dir_override)
+    print(json.dumps(ownership_status(root), ensure_ascii=False, default=str, indent=2))
+
+
+def _cutover_switch(args) -> None:
+    from .scheduler_ownership import OwnershipConflictError, record_switch
+
+    root, _config = _cutover_registry_root(args.config, args.state_dir)
+    expected = int(args.expected_generation) if args.expected_generation else None
+    state = record_switch(root, to=args.to, actor=args.actor, reason=args.reason,
+                          cutover_id=args.cutover_id, expected_generation=expected)
+    print("switched unique scheduler -> {0} (generation {1})".format(
+        state["active_scheduler"], state["generation"]))
+
+
+def _cutover_freeze(args) -> None:
+    from .scheduler_ownership import freeze_intake
+
+    root, _config = _cutover_registry_root(args.config, args.state_dir)
+    state = freeze_intake(root, actor=args.actor, reason=args.reason,
+                          cutover_id=args.cutover_id)
+    print("intake frozen at generation {0}: {1}".format(
+        state["generation"], state["frozen_reason"]))
+
+
+def _cutover_thaw(args) -> None:
+    from .scheduler_ownership import thaw_intake
+
+    root, _config = _cutover_registry_root(args.config, args.state_dir)
+    state = thaw_intake(root, actor=args.actor, reason=args.reason)
+    print("intake thawed at generation {0}".format(state["generation"]))
+
+
+def _cutover_heartbeat(args) -> None:
+    from .scheduler_ownership import heartbeat
+
+    root, _config = _cutover_registry_root(args.config, args.state_dir)
+    heartbeat(root, args.scheduler_id)
+    print("heartbeat recorded for {0}".format(args.scheduler_id))
+
+
+def _cutover_gate(args) -> None:
+    from .scheduler_ownership import evaluate_cutover_gate, scheduler_ownership_config
+    from .task_runtime import TaskStore
+    from .task_runtime.store import TASK_SCHEMA_VERSION
+
+    config = load_config(args.config)
+    cfg = scheduler_ownership_config(config)
+    tasks_db = str(args.tasks_db or "").strip() or str(
+        (config.get("task_runtime") or {}).get("db_path") or "data/task_runtime/tasks.sqlite3")
+    registry_root = str(args.state_dir or "").strip() or cfg["state_dir"]
+    registry_path = project_path(registry_root)
+    state_root = project_path(str(args.state_root or "").strip() or ".")
+    probe = TaskStore(project_path(tasks_db), read_only=True)
+    try:
+        runtime_schema = str(probe.summary().get("schema_version") or TASK_SCHEMA_VERSION)
+    finally:
+        probe.close()
+    verdict = evaluate_cutover_gate(
+        tasks_db_path=project_path(tasks_db), ownership_root=registry_path,
+        state_root=state_root, runtime_schema_version=runtime_schema, config=config)
+    print(json.dumps(verdict, ensure_ascii=False, default=str, indent=2))
+    if not verdict["ok"]:
         raise SystemExit(1)
 
 
