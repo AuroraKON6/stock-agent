@@ -18,7 +18,10 @@ ALLOW_DIRTY="${1:-}"
 if [ "${ALLOW_DIRTY}" = "--allow-dirty" ]; then shift; else ALLOW_DIRTY=""; fi
 TAG="${1:-stock-agent-research:candidate}"
 LOCK="requirements.linux-py312.lock.txt"
-BINDING_DIR="${ROOT}/deploy/docker"
+# The provenance steps need a Python 3 interpreter on the builder. macOS and
+# most Linux hosts ship no bare `python`, so fall back to python3.
+PYTHON_BIN="${PYTHON:-$(command -v python || command -v python3 || true)}"
+[ -n "${PYTHON_BIN}" ] || { echo "BLOCKED: no python interpreter on the builder" >&2; exit 2; }
 
 cd "${ROOT}"
 
@@ -49,7 +52,12 @@ if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
 fi
 
 # --- frozen provenance into the build context --------------------------------
-python - "$ROOT" "$COMMIT" "$DIRTY" <<'PY'
+if [ -e PROVENANCE.json ]; then
+  echo "BLOCKED: PROVENANCE.json already exists in the build context" >&2
+  exit 2
+fi
+trap 'rm -f PROVENANCE.json' EXIT
+"${PYTHON_BIN}" - "$ROOT" "$COMMIT" "$DIRTY" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
 
@@ -80,15 +88,14 @@ PY
 docker build -f deploy/docker/Dockerfile -t "${TAG}" .
 
 # --- external digest binding (NEVER inside the image) ------------------------
-DIGEST="$(docker image inspect "${TAG}" --format '{{index .RepoDigests 0}}' \
+DIGEST="$(docker image inspect "${TAG}" --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' \
           | sed 's/.*@//')"
-if [ -z "${DIGEST}" ] || [ "${DIGEST}" = "@" ]; then
-  # Locally built images have no RepoDigest until pushed; fall back to the
-  # config digest (identical content, different namespace) and label it.
-  DIGEST="sha256:$(docker image inspect "${TAG}" --format '{{.Id}}' | sed 's/.*://')"
-  echo "NOTE: image not pushed; binding uses the config digest ${DIGEST}" >&2
+if ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] \
+   || ! docker image inspect "${TAG}@${DIGEST}" >/dev/null; then
+  echo "BLOCKED: the local image store has no runnable manifest digest for ${TAG}" >&2
+  exit 2
 fi
-python - "$ROOT" "${DIGEST}" <<'PY'
+"${PYTHON_BIN}" - "$ROOT" "${DIGEST}" <<'PY'
 import json, sys
 from pathlib import Path
 
@@ -103,5 +110,4 @@ binding = write_image_binding(
     builder="scripts/build_image.sh")
 print("binding:", binding["image_digest"], binding["provenance_sha256"])
 PY
-rm -f PROVENANCE.json   # keep the working tree clean; it lives in the image + binding
 echo "OK: ${TAG} ${DIGEST}"

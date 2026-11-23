@@ -1,0 +1,22 @@
+# R25 image verification — READ-ONLY view of the container side (KONM-38).
+#
+# Add this file (-f deploy/testing/r25_image.compose.yaml -f <this file>) only
+# for steps that must read the container side's volumes from another side: the
+# restore target reads its backup bundles, the rollback reconciliation reads the
+# recovered store as its independent baseline, and the comparison reads its
+# evidence volume. Both mounts are read-only, so no step can write to the
+# container side through them.
+#
+#   R25_OTHER_VOL  cstate  -> at <state>/legacy_source (bundle source)
+#                  rstate  -> at <state>/restored_readonly (reconcile baseline)
+services:
+  research-api:
+    volumes:
+      - r25-other:/var/stock-agent/state/${R25_OTHER_PATH:?set R25_OTHER_PATH to legacy_source or restored_readonly}:ro
+      - r25-other-evidence:/live-evidence:ro
+
+volumes:
+  r25-other:
+    name: ${COMPOSE_PROJECT_NAME:?set an isolated Compose project}-${R25_OTHER_VOL:?set R25_OTHER_VOL to cstate or rstate}
+  r25-other-evidence:
+    name: ${COMPOSE_PROJECT_NAME:?set an isolated Compose project}-cevidence

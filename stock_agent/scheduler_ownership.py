@@ -413,8 +413,37 @@ def enable_legacy(root: Path, *, actor: str, reason: str = "") -> Dict[str, Any]
 # --------------------------------------------------------------------------- #
 # Ownership switch (forward and rollback)
 # --------------------------------------------------------------------------- #
+def _open_readonly(db_path: Path) -> sqlite3.Connection:
+    """Use SQLite's WAL-aware read first, including for a live task store."""
+    resolved = Path(db_path).resolve()
+    uri = resolved.as_uri()
+    connection = sqlite3.connect(uri + "?mode=ro", uri=True)
+    try:
+        connection.execute("PRAGMA schema_version").fetchone()
+        return connection
+    except sqlite3.Error as exc:
+        connection.close()
+        code = getattr(exc, "sqlite_errorcode", 0)
+        if (code & 0xff) not in (sqlite3.SQLITE_READONLY, sqlite3.SQLITE_CANTOPEN):
+            raise
+
+    # A quiescent baseline on a read-only mount may lack the shared memory
+    # sidecar SQLite needs. Immutable mode can ignore the WAL entirely, so
+    # only use it for snapshots without any WAL frames to recover.
+    wal = resolved.with_name(resolved.name + "-wal")
+    try:
+        wal_size = wal.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0
+    if wal_size:
+        raise OwnershipConflictError(
+            "cannot read rollback snapshot {0}: nonempty WAL could not be read; "
+            "use a fully checkpointed snapshot or a SQLite backup".format(resolved))
+    return sqlite3.connect(uri + "?mode=ro&immutable=1", uri=True)
+
+
 def _rollback_snapshot(db_path: Path) -> Dict[str, Any]:
-    with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+    with closing(_open_readonly(db_path)) as connection:
         connection.execute("BEGIN")
         tasks = {row[0]: tuple(row[1:]) for row in connection.execute(
             "SELECT task_id, * FROM research_tasks ORDER BY task_id")}
@@ -450,7 +479,7 @@ def record_rollback_reconciliation(registry_root, baseline_db_path, tasks_db_pat
         try:
             baseline = _rollback_snapshot(baseline_db_path)
             current = _rollback_snapshot(tasks_db_path)
-        except sqlite3.Error as exc:
+        except (OSError, sqlite3.Error) as exc:
             raise OwnershipConflictError("cannot read stores for increment reconciliation: {0}".format(exc)) from exc
         _check_rollback_drain(current)
         manifest = {
