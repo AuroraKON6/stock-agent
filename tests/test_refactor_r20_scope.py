@@ -639,6 +639,39 @@ class ReportTimeSourceTests(ScopeTestCase):
         self.assertEqual([r["live_evidence_shas"] for r in result["results"]], [[], []])
         self.assertEqual(default["result_count"], 0)
 
+    def test_old_record_without_source_field_needs_review_when_ledgers_disagree(self):
+        """Cross-version: a personal task written by the previous worker
+        (no ``evidence_namespaces``) while both vaults held the same bytes.
+        The shared original is then withdrawn and only the personal copy
+        survives. The record cannot say which copy the report used."""
+        document_id, sha, content = self._personal_document(ALICE, "跨版本同字节原件。", "跨版本原件")
+        import_document(self.config, self.root, content=content, title="共享侧同字节")
+        task = self._personal(ALICE, "跨版本研究", document_ids=[document_id])
+        model_call = dict(task["model_call"])
+        model_call["context_delivery"] = {k: v for k, v in model_call["context_delivery"].items()
+                                          if k != "evidence_namespaces"}
+        self.store._conn.execute("UPDATE research_tasks SET model_call = ? WHERE task_id = ?",
+                                 (json.dumps(model_call, ensure_ascii=False), task["task_id"]))
+        self.store._conn.commit()
+        cached = build_library_index(self.store)
+        self.assertEqual(cached["entries"][0]["evidence_sources"], {sha: "unrecorded"})
+        self.assertEqual(query_library(cached, self.config, ALICE, query="跨版本")["result_count"], 1,
+                         "both copies verified: the report is backed either way")
+        self._withdraw(content)   # the shared original; the personal copy stays
+        result = query_library(cached, self.config, ALICE, query="跨版本")
+        self.assertEqual(result["result_count"], 0, "the source cannot be proven: excluded by default")
+        self._roster([{"actor_id": ALICE, "principal_type": "human", "active": True,
+                       "roles": ["quality_reviewer"], "information_side": "public"}])
+        audit = query_library(cached, self.config, ALICE, query="跨版本", include_stale=True)
+        self.assertEqual([(r["stale_reason"], r["unverified_sources"]) for r in audit["results"]],
+                         [("source_unverified", [sha])])
+        # Had ONLY the personal namespace ever held the bytes, the source is
+        # proven and the personal copy keeps the report live.
+        only, only_sha, only_content = self._personal_document(BOB, "仅个人金库持有。", "仅个人原件")
+        self._personal(BOB, "仅个人研究", document_ids=[only])
+        index = build_library_index(self.store)
+        self.assertEqual(query_library(index, self.config, BOB, query="仅个人")["result_count"], 1)
+
     def test_historical_record_without_source_fails_closed(self):
         sha = "c" * 64
         index = {"schema_version": LIBRARY_SCHEMA, "entry_count": 1, "entries": [
@@ -758,11 +791,26 @@ class TimeWindowTests(ScopeTestCase):
                 self._count(until=bad)
         with self.assertRaises(LibraryTimeWindowError):
             self._count(since="2999-01-01", until="2000-01-01")
-        # Mixed granularity has no defined order: refused both ways round.
+        # Mixed granularity is refused only when the window is empty in
+        # every offset; any other mixed pair is a legal window.
         for since, until in (("2026-11-24", "2026-11-23T00:00:00+00:00"),
-                             ("2026-11-24T00:00:00+08:00", "2026-11-25")):
+                             ("2026-11-24", "2026-11-22T09:59:59+00:00"),
+                             ("2026-11-26T14:00:00+00:00", "2026-11-25"),
+                             ("2026-11-24T00:00:00+08:00", "2026-11-21")):
             with self.subTest(since=since, until=until), self.assertRaises(LibraryTimeWindowError):
                 self._count(since=since, until=until)
+        completed = datetime.fromisoformat(self.task["updated_at"])
+        day = self.task["updated_at"][:10]
+        mixed_ok = {
+            "date_then_same_instant": ((day, completed.isoformat()), 1),
+            "date_then_instant_before_it": ((day, (completed - timedelta(seconds=1)).isoformat()), 0),
+            "instant_then_date": (((completed - timedelta(seconds=1)).isoformat(), day), 1),
+            "instant_after_then_date": (((completed + timedelta(seconds=1)).isoformat(), day), 0),
+            "date_then_utc_next_day": ((day, (completed + timedelta(hours=8)).astimezone(timezone.utc).isoformat()), 1),
+        }
+        for name, ((since, until), expected) in mixed_ok.items():
+            with self.subTest(window=name):
+                self.assertEqual(self._count(since=since, until=until), expected)
 
 
 class StandardStartTests(ScopeTestCase):
@@ -851,8 +899,12 @@ class StandardStartTests(ScopeTestCase):
         self.assertEqual(status, 200)
         self.assertEqual((body["filters"]["since"], body["filters"]["until"]), (day, day))
         self.assertEqual(body["result_count"], 3)  # shared, Alice's own, Alice's rerun
-        # A calendar date and a timestamp have no defined order: 400, not a
-        # silently empty or inverted window.
+        # A calendar date plus a timestamp is a legal window and is echoed
+        # as applied; the certainly inverted pair is 400.
+        instant = shared["updated_at"]
+        status, body, _ = self._call(
+            server, "GET", base + "&until=" + quote(instant), cookie=alice_cookie)
+        self.assertEqual((status, body["filters"]["until"], body["result_count"]), (200, instant, 3))
         status, body, _ = self._call(
             server, "GET", base + "&until=2026-11-23T00:00:00%2B00:00", cookie=alice_cookie)
         self.assertEqual((status, body["error"]), (400, "invalid_time_window"))

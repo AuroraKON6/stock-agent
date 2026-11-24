@@ -41,7 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 from .evidence_context import verified_evidence_documents
@@ -230,6 +230,33 @@ def _bound(text: str, name: str):
         "or 2026-11-24T09:08:52Z) or a calendar date (2026-11-24)".format(name))
 
 
+def _day_start(day):
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+
+
+def _day_end(day):
+    return _day_start(day + timedelta(days=1)) - timedelta(seconds=1)
+
+
+def _inverted(since, until) -> bool:
+    """Whether the window is empty. Two timestamps: plain instant order. A
+    calendar date is read in the completion's own offset, so against a
+    timestamp it is only certainly inverted when no offset in the full
+    UTC-14..+14 range leaves a match: the EARLIEST possible start of the
+    ``since`` day is still after ``until``, or ``since`` is already after
+    the LATEST possible end of the ``until`` day. Any other mixed pair is
+    a legal window and is evaluated per completion."""
+    if since is None or until is None:
+        return False
+    if isinstance(since, datetime) and isinstance(until, datetime):
+        return since > until
+    if isinstance(since, datetime):           # until is a date
+        return since > _day_end(until) + timedelta(hours=12)
+    if isinstance(until, datetime):           # since is a date
+        return _day_start(since) - timedelta(hours=10) > until
+    return since > until
+
+
 def _in_window(completed_at: str, since, until) -> bool:
     """Window test on real instants. ``since``/``until`` are ``None``, an
     aware ``datetime`` or a ``date``. A completion without an offset-bearing
@@ -265,10 +292,13 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
     vault therefore cannot keep a withdrawn original answering, in either
     direction.
 
-    Historical records that do not name a source (``unrecorded``) are
-    resolved from the task's own namespace — a personal research in its
-    owner's namespace, anything else in the shared vault — and fail closed:
-    an original that namespace does not verify is treated as withdrawn.
+    Historical records that do not name a source (``unrecorded``) recover
+    it from what the ledgers can prove. Exactly one namespace ever held the
+    bytes: that one authorized them. Held nowhere: judged in the task's own
+    namespace, which fails. Both the shared vault and the owner's namespace
+    hold them and disagree on whether they are still verified: no record can
+    say which copy the report used, so the entry is ``source_unverified`` —
+    excluded by default, kept for the audit view with ``unverified_sources``.
 
     An entry whose evidence fully left its authorizing projection is
     ``evidence_revoked``; one that lost part of it is
@@ -276,35 +306,70 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
     ``live_evidence_shas``. BOTH are stale and excluded by default: the
     summary may rest on the revoked original. An explicit ``include_stale``
     (audit) still shows them, labelled."""
-    live_cache: Dict[str, set] = {}
+    state_cache: Dict[str, tuple] = {}
 
-    def live_in(owner: str) -> set:
-        if owner not in live_cache:
+    def namespace_state(owner: str):
+        """(SHAs the namespace HOLDS in any status, SHAs it verifies now).
+        ``owner`` empty names the shared vault."""
+        if owner not in state_cache:
             try:
                 view = config if not owner else personal_vault_view(config, owner)
-            except Exception:  # no resolvable namespace: nothing is verified there
-                view = None
-            live_cache[owner] = set(verified_evidence_documents(view or {}).keys())
-        return live_cache[owner]
+                vault = load_evidence_vault(view or {})
+                held = {str(document["sha256"]) for document in (vault.get("documents") or {}).values()
+                        if isinstance(document, dict) and document.get("sha256")}
+                live = set(verified_evidence_documents(view or {}).keys())
+            except Exception:  # an unresolvable namespace holds and verifies nothing
+                held, live = set(), set()
+            state_cache[owner] = (held, live)
+        return state_cache[owner]
 
     checked = []
     for entry in index.get("entries", []):
         shas = entry.get("evidence_shas") or []
-        fallback = NAMESPACE_PERSONAL if entry.get("namespace") == NAMESPACE_PERSONAL else NAMESPACE_SHARED
+        personal = entry.get("namespace") == NAMESPACE_PERSONAL
+        owner = str(entry.get("owner") or "")
         sources = entry.get("evidence_sources") or {}
-        owner = str(entry.get("owner") or "") if fallback == NAMESPACE_PERSONAL else ""
 
-        def verified(sha, _owner=owner, _fallback=fallback, _sources=sources):
+        def judge(sha, _owner=owner, _sources=sources, _personal=personal):
             source = _sources.get(sha)
             if source not in ("shared", "personal"):
-                source = _fallback
-            return sha in live_in(_owner if source == "personal" else "")
+                # Historical record: recover the source from what the ledgers
+                # can prove. Exactly one namespace ever held these bytes ->
+                # that one authorized them. Both hold them and disagree on
+                # whether they are still verified -> the record cannot say
+                # which copy the report used: needs review, excluded by
+                # default. Held nowhere -> judged (and failing) in the task's
+                # own namespace.
+                namespaces = [("shared", *namespace_state(""))] if not _personal else [
+                    ("shared", *namespace_state("")), ("personal", *namespace_state(_owner))]
+                holders = [name for name, held, _ in namespaces if sha in held]
+                if len(holders) == 1:
+                    source = holders[0]
+                elif not holders:
+                    source = NAMESPACE_PERSONAL if _personal else NAMESPACE_SHARED
+                elif all(sha in live for _, _, live in namespaces):
+                    return True, False
+                elif not any(sha in live for _, _, live in namespaces):
+                    return False, False
+                else:
+                    return False, True
+            return sha in namespace_state(_owner if source == "personal" else "")[1], False
 
-        live = [sha for sha in shas if verified(sha)]
+        live, unverified = [], []
+        for sha in shas:
+            ok, needs_review = judge(sha)
+            if ok:
+                live.append(sha)
+            if needs_review:
+                unverified.append(sha)
         entry = dict(entry)
         entry["live_evidence_shas"] = live
-        if shas and not live:
+        entry.pop("unverified_sources", None)
+        if shas and not live and not unverified:
             entry["stale_reason"] = "evidence_revoked"
+        elif unverified:
+            entry["stale_reason"] = "source_unverified"
+            entry["unverified_sources"] = unverified
         elif len(live) < len(shas):
             entry["stale_reason"] = "evidence_partially_revoked"
         else:
@@ -357,13 +422,7 @@ def query_library(index: Dict[str, Any], config: Dict[str, Any], actor: str, *,
     if not actor:
         raise LibraryError("library queries are scoped: an authenticated actor is required")
     since_at, until_at = _bound(since, "since"), _bound(until, "until")
-    # Both bounds must use the same granularity: a calendar date has no
-    # single instant to order against a timestamp, so a mixed pair is
-    # refused instead of being compared in one direction only.
-    if since_at is not None and until_at is not None and type(since_at) is not type(until_at):
-        raise LibraryTimeWindowError(
-            "invalid time window: since and until must both be calendar dates or both be timestamps")
-    if since_at is not None and until_at is not None and since_at > until_at:
+    if _inverted(since_at, until_at):
         raise LibraryTimeWindowError("invalid time window: since is after until")
     checked = annotate_revocation(index, config, actor=actor)
     scoped = [entry for entry in checked["entries"] if _authorized(entry, actor)]
