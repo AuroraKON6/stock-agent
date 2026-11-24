@@ -357,8 +357,13 @@ def query_library(index: Dict[str, Any], config: Dict[str, Any], actor: str, *,
     if not actor:
         raise LibraryError("library queries are scoped: an authenticated actor is required")
     since_at, until_at = _bound(since, "since"), _bound(until, "until")
-    if (since_at is not None and until_at is not None and type(since_at) is type(until_at)
-            and since_at > until_at):
+    # Both bounds must use the same granularity: a calendar date has no
+    # single instant to order against a timestamp, so a mixed pair is
+    # refused instead of being compared in one direction only.
+    if since_at is not None and until_at is not None and type(since_at) is not type(until_at):
+        raise LibraryTimeWindowError(
+            "invalid time window: since and until must both be calendar dates or both be timestamps")
+    if since_at is not None and until_at is not None and since_at > until_at:
         raise LibraryTimeWindowError("invalid time window: since is after until")
     checked = annotate_revocation(index, config, actor=actor)
     scoped = [entry for entry in checked["entries"] if _authorized(entry, actor)]

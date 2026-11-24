@@ -535,6 +535,49 @@ class AuthorizingVaultTests(ScopeTestCase):
 
 
 class ReportTimeSourceTests(ScopeTestCase):
+    def _delivered_personal_source(self):
+        """A personal report whose ORIGINAL the worker actually delivered:
+        the shared copy is withdrawn first, the personal copy is linked to
+        the signal the task binds, and the delivery record names it."""
+        from stock_agent.evidence_vault import link_evidence_to_signal
+        from stock_agent.models import AnalyzedSignal, now_iso
+        from stock_agent.storage import SignalStore
+
+        signal_id = "sig-source-0001"
+        database = SignalStore(Path(self.config["storage"]["sqlite_path"]))
+        try:
+            database.upsert_many([AnalyzedSignal(
+                signal_id=signal_id, source="manual", source_type="filing", title="来源信号",
+                summary="Synthetic fixture only", url="https://www.cninfo.com.cn/disclosure/fixture",
+                published_at=now_iso(), collected_at=now_iso(), symbols=["600519"],
+                payload={"data_classification": "public"})])
+        finally:
+            database.close()
+        _, sha = import_document(self.config, self.root, content=self.CONTENT, title="共享原件",
+                                 signal_ids=[signal_id])
+        self._withdraw(self.CONTENT)  # the SHARED original is withdrawn first
+        document_id, personal_sha, _ = self._personal_document(ALICE, self.CONTENT, "个人副本")
+        self.assertEqual(personal_sha, sha)
+        link_evidence_to_signal(personal_vault_view(self.config, ALICE), document_id=document_id,
+                                signal_id=signal_id, actor="test-evidence-collector",
+                                actor_role="information_analyst")
+        task = self._personal(ALICE, "真实交付研究", document_ids=[document_id])
+        return task, sha
+
+    def test_live_personal_original_delivered_after_shared_withdrawal_stays_visible(self):
+        task, sha = self._delivered_personal_source()
+        delivery = task["model_call"]["context_delivery"]
+        self.assertIn("document:sha256:{0}".format(sha), delivery["delivered_evidence"],
+                      "the worker delivered the personal original: {0}".format(delivery["dropped_evidence"]))
+        self.assertEqual(delivery["evidence_namespaces"]["document:sha256:{0}".format(sha)], "personal")
+        cached = build_library_index(self.store)
+        self.assertEqual(cached["entries"][0]["evidence_sources"], {sha: "personal"})
+        self.assertEqual(query_library(cached, self.config, ALICE, query="真实交付")["result_count"], 1)
+        # ... and it is that personal original's own withdrawal, not the
+        # shared copy's, that later hides the report.
+        self._withdraw(self.CONTENT, personal_vault_view(self.config, ALICE))
+        self.assertEqual(query_library(cached, self.config, ALICE, query="真实交付")["result_count"], 0)
+
     """The authorizing namespace is fixed when the report is made."""
 
     CONTENT = "个人来源原件正文。"
@@ -715,6 +758,11 @@ class TimeWindowTests(ScopeTestCase):
                 self._count(until=bad)
         with self.assertRaises(LibraryTimeWindowError):
             self._count(since="2999-01-01", until="2000-01-01")
+        # Mixed granularity has no defined order: refused both ways round.
+        for since, until in (("2026-11-24", "2026-11-23T00:00:00+00:00"),
+                             ("2026-11-24T00:00:00+08:00", "2026-11-25")):
+            with self.subTest(since=since, until=until), self.assertRaises(LibraryTimeWindowError):
+                self._count(since=since, until=until)
 
 
 class StandardStartTests(ScopeTestCase):
@@ -798,13 +846,16 @@ class StandardStartTests(ScopeTestCase):
         self.assertEqual(self._call(server, "GET", "/api/v1/library?actor=" + BOB, cookie=alice_cookie)[0], 403)
         # The response names the bounds that were actually applied.
         day = shared["updated_at"][:10]
-        status, body, _ = self._call(
-            server, "GET",
-            "/api/v1/library?since={0}T00:00:00%2B08:00&until={0}".format(day), cookie=alice_cookie)
+        base = "/api/v1/library?since={0}".format(day)
+        status, body, _ = self._call(server, "GET", base + "&until=" + day, cookie=alice_cookie)
         self.assertEqual(status, 200)
-        self.assertEqual((body["filters"]["since"], body["filters"]["until"]),
-                         ("{0}T00:00:00+08:00".format(day), day))
+        self.assertEqual((body["filters"]["since"], body["filters"]["until"]), (day, day))
         self.assertEqual(body["result_count"], 3)  # shared, Alice's own, Alice's rerun
+        # A calendar date and a timestamp have no defined order: 400, not a
+        # silently empty or inverted window.
+        status, body, _ = self._call(
+            server, "GET", base + "&until=2026-11-23T00:00:00%2B00:00", cookie=alice_cookie)
+        self.assertEqual((status, body["error"]), (400, "invalid_time_window"))
 
     def test_sessions_explicitly_disabled_fails_closed(self):
         server = self._serve(sessions_enabled=False)
