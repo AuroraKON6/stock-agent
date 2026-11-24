@@ -38,17 +38,46 @@ SSE_POLL_SECONDS = 1.0
 SSE_KEEPALIVE_SECONDS = 15.0
 
 
-def _board_state(store: TaskStore, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _visible_tasks(store: TaskStore, actor: str) -> list:
+    """The session's readable task rows: shared research plus its OWN
+    personal research.
+
+    Ownership is the server-side ``task_input_bindings`` row the personal
+    workspace entry writes inside the create transaction (R15). A task with
+    no trusted binding — generic entry, pipeline, historical legacy personal
+    cases created before the binding existed — is shared research and stays
+    readable; a bound personal task belongs to exactly one owner. This is the
+    same boundary the R20 library and the worker already use."""
+    from .personal_evidence import visible_task_ids
+
+    actor = str(actor or "").strip()
+    if not actor:
+        return []
+    visible = visible_task_ids(store, actor)
+    return [task for task in store.list_tasks()
+            if str(task.get("task_id") or "") in (visible or set())]
+
+
+def _board_state(store: TaskStore, config: Optional[Dict[str, Any]] = None, *,
+                 actor: Optional[str] = None) -> Dict[str, Any]:
+    """Board snapshot. ``actor=None`` is the legacy unscoped projection (no
+    session store attached — the documented rollback path); a string scopes
+    rows and counts to that session principal ("" = logged out: nothing)."""
     from .summary_review import review_state
 
-    tasks = store.list_tasks()
+    if actor is None:
+        tasks = store.list_tasks()
+        summary = store.summary()
+    else:
+        tasks = _visible_tasks(store, actor)
+        summary = store.summary(task_ids=[task["task_id"] for task in tasks])
     for task in tasks:
         task["is_replay"] = str(task.get("execution_mode") or "live") == "replay"
         task["summary_review"] = review_state(store, task["task_id"], config=config or {})
     return {
         "schema_version": _BOARD_VERSION,
         "generated_at": now_iso(),
-        "summary": store.summary(),
+        "summary": summary,
         "tasks": tasks,
     }
 
@@ -1129,6 +1158,19 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
         except PersonalSessionError:
             return None
 
+    def _read_scope(self) -> Tuple[bool, Optional[str]]:
+        """(session_mode, actor) for every read projection.
+
+        ``(False, None)`` = no session store attached: the documented legacy
+        rollback keeps the original unscoped reads. ``(True, None)`` = session
+        mode WITHOUT a valid session: the caller must be rejected (absent and
+        revoked sessions share this path). ``(True, actor)`` = scope reads to
+        shared + this principal's own personal research."""
+        if getattr(self.server, "session_store", None) is None:
+            return False, None
+        session = self._resolve_session()
+        return True, (session.actor if session is not None else None)
+
     def _handle_personal_session(self) -> None:
         """Read-only login state for the page (A93): never mutates anything."""
         if getattr(self.server, "session_store", None) is None:
@@ -1357,6 +1399,11 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     task_id=str(body.get("task_id") or ""),
                     config=config,
                     execution_mode=str(body.get("execution_mode") or "replay"))
+        except personal_workspace.WorkspaceForbidden as exc:
+            # Authorization denial: the code names the rule, the body carries
+            # no task content (no title, summary, report or document ids).
+            self._send_json(403, {"error": str(exc).split(":", 1)[0]})
+            return
         except personal_workspace.WorkspaceError as exc:
             self._send_json(400, {"error": str(exc).split(":", 1)[0],
                                   "detail": str(exc)})
@@ -1395,15 +1442,26 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "pid": __import__("os").getpid(), "board_version": _BOARD_VERSION})
             return
         if parsed.path == "/api/v1/tasks":
+            scoped, actor = self._read_scope()
+            if scoped and actor is None:
+                self._send_json(403, {"error": "session_required"})
+                return
             with self.server.board_lock:
-                self._send_json(200, _board_state(store, self.server.board_config))
+                state = (_board_state(store, self.server.board_config, actor=actor)
+                         if scoped else _board_state(store, self.server.board_config))
+            self._send_json(200, state)
             return
         if parsed.path == "/api/v1/overview":
             from .overview import build_overview
 
+            scoped, actor = self._read_scope()
+            if scoped and actor is None:
+                self._send_json(403, {"error": "session_required"})
+                return
             with self.server.board_lock:
                 try:
-                    payload = build_overview(self.server.board_config, store=store)
+                    payload = build_overview(self.server.board_config, store=store,
+                                             actor=actor if scoped else None)
                 except Exception as exc:  # overview is a projection; degrade honestly
                     self._send_json(503, {"error": "overview unavailable: {0}".format(type(exc).__name__)})
                     return
@@ -1412,9 +1470,14 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v1/ops":
             from .ops_view import build_ops_view
 
+            scoped, actor = self._read_scope()
+            if scoped and actor is None:
+                self._send_json(403, {"error": "session_required"})
+                return
             with self.server.board_lock:
                 try:
-                    payload = build_ops_view(self.server.board_config, store=store)
+                    payload = build_ops_view(self.server.board_config, store=store,
+                                             actor=actor if scoped else None)
                 except Exception as exc:  # projection; degrade honestly
                     self._send_json(503, {"error": "ops view unavailable: {0}".format(type(exc).__name__)})
                     return
@@ -1423,9 +1486,14 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v1/todo":
             from .todo_view import build_todo_view
 
+            scoped, actor = self._read_scope()
+            if scoped and actor is None:
+                self._send_json(403, {"error": "session_required"})
+                return
             with self.server.board_lock:
                 try:
-                    payload = build_todo_view(self.server.board_config, store=store)
+                    payload = build_todo_view(self.server.board_config, store=store,
+                                              actor=actor if scoped else None)
                 except Exception as exc:  # projection; degrade honestly
                     self._send_json(503, {"error": "todo view unavailable: {0}".format(type(exc).__name__)})
                     return
@@ -1436,9 +1504,14 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
             # by ADR-001 and must keep streaming.
             from .events_view import build_events_view
 
+            scoped, actor = self._read_scope()
+            if scoped and actor is None:
+                self._send_json(403, {"error": "session_required"})
+                return
             with self.server.board_lock:
                 try:
-                    payload = build_events_view(self.server.board_config, store=store)
+                    payload = build_events_view(self.server.board_config, store=store,
+                                                actor=actor if scoped else None)
                 except Exception as exc:  # projection; degrade honestly
                     self._send_json(503, {"error": "events view unavailable: {0}".format(type(exc).__name__)})
                     return
@@ -1461,7 +1534,19 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
             task_id = parsed.path[len("/api/v1/tasks/"):]
             from .task_detail import task_detail
 
+            scoped, actor = self._read_scope()
+            if scoped and actor is None:
+                self._send_json(403, {"error": "session_required"})
+                return
+            if scoped:
+                from .personal_evidence import task_visible_to
             with self.server.board_lock:
+                # A personal task outside the caller's scope is answered with
+                # the SAME unknown-id shape as a missing task: no summary,
+                # report version, original documents or even existence leaks.
+                if scoped and not task_visible_to(store, task_id, actor):
+                    self._send_json(404, {"error": "unknown task_id"})
+                    return
                 try:
                     detail = task_detail(store, task_id, config=self.server.board_config)
                 except TaskRuntimeError:
@@ -1486,7 +1571,11 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                 session = self._resolve_session()
                 session_actor = str(getattr(session, "actor", "") or "")
             with self.server.board_lock:
-                state = _board_state(store, self.server.board_config)
+                # First paint is scoped exactly like the list/refresh: a
+                # logged-out session-mode page renders the login panel with
+                # NO rows; the legacy rollback (no store) keeps the old page.
+                state = (_board_state(store, self.server.board_config, actor=session_actor)
+                         if session_mode else _board_state(store, self.server.board_config))
             self._send(200, _render_html(state, str(self.server.csrf_token),
                                          session_mode=session_mode,
                                          session_actor=session_actor).encode("utf-8"),
@@ -1506,6 +1595,31 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
         import time as _time
 
         store: TaskStore = self.server.task_store
+        # Realtime list scoping: with sessions attached, a stream carries only
+        # events for tasks this principal may read (shared + its own personal
+        # research); a live push must never describe another owner's task id.
+        # Without a session store the legacy unscoped stream stays available.
+        scoped, actor = self._read_scope()
+        if scoped and actor is None:
+            self._send_json(403, {"error": "session_required"})
+            return
+        from .personal_evidence import PERSONAL_ORIGIN_VIA
+
+        binding_cache: Dict[str, str] = {}
+
+        def _visible(task_id: str) -> bool:
+            if not scoped:
+                return True
+            key = str(task_id or "")
+            if key not in binding_cache:
+                with self.server.board_lock:
+                    binding = store.input_owner_binding(key) or {}
+                binding_cache[key] = (
+                    str(binding.get("owner") or "").strip()
+                    if str(binding.get("via") or "") == PERSONAL_ORIGIN_VIA else "")
+            owner = binding_cache[key]
+            return not owner or owner == actor
+
         try:
             last_id = int(self.headers.get("Last-Event-ID") or 0)
         except ValueError:
@@ -1527,7 +1641,11 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     # The store was closed (server shutdown); end the stream.
                     return
                 for event in events:
+                    # Advance the cursor for EVERY event, visible or not: a
+                    # filtered-out row must never be replayed forever.
                     last_id = int(event["sequence"])
+                    if not _visible(str(event.get("task_id") or "")):
+                        continue
                     message = {
                         "sequence": event["sequence"],
                         "event_id": event["event_id"],

@@ -820,6 +820,35 @@ class TaskStore:
         return {"owner": str(row["owner"]), "via": str(row["via"]),
                 "bound_at": str(row["bound_at"])}
 
+    def input_owner_bindings(self, task_ids: Optional[List[str]] = None) -> Dict[str, Dict[str, str]]:
+        """Batch form of :meth:`input_owner_binding` (read-only).
+
+        One query per 500 ids (SQLite host-parameter bound) so the board and
+        its realtime stream can scope a page of tasks without N+1 reads.
+        ``task_ids`` omitted = every binding row."""
+        if task_ids is None:
+            rows = self._conn.execute(
+                "SELECT task_id, owner, via, bound_at FROM task_input_bindings"
+            ).fetchall()
+        else:
+            ids = [str(item) for item in task_ids]
+            if not ids:
+                return {}
+            rows = []
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(self._conn.execute(
+                    "SELECT task_id, owner, via, bound_at FROM task_input_bindings "
+                    "WHERE task_id IN ({0})".format(placeholders), chunk).fetchall())
+        return {
+            str(row["task_id"]): {
+                "owner": str(row["owner"]), "via": str(row["via"]),
+                "bound_at": str(row["bound_at"]),
+            }
+            for row in rows
+        }
+
     def input_snapshots(self, task_id: str) -> List[Dict[str, Any]]:
         """Immutable per-version input history (payload decoded, sha preserved)."""
 
@@ -1416,10 +1445,32 @@ class TaskStore:
         if int(row["fencing_token"]) != int(fencing_token):
             raise TaskFencingError("stale fencing token {0} (current {1}); the task was reclaimed".format(fencing_token, row["fencing_token"]))
 
-    def summary(self) -> Dict[str, Any]:
-        rows = self._conn.execute("SELECT status, COUNT(*) AS n FROM research_tasks GROUP BY status").fetchall()
+    def summary(self, task_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Workbench counts; ``task_ids`` narrows them to a caller's scope.
+
+        The scoped form powers the session board: a personal session must
+        never see counts (or outbox totals) for tasks outside its own
+        shared + personal visibility. Omitted = whole-store projection, the
+        legacy/CLI behavior."""
+        if task_ids is None:
+            rows = self._conn.execute("SELECT status, COUNT(*) AS n FROM research_tasks GROUP BY status").fetchall()
+            outbox_count = int(self._conn.execute("SELECT COUNT(*) FROM task_outbox").fetchone()[0])
+        else:
+            ids = [str(item) for item in task_ids]
+            counts_acc: Dict[str, int] = {}
+            outbox_count = 0
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in self._conn.execute(
+                        "SELECT status, COUNT(*) AS n FROM research_tasks "
+                        "WHERE task_id IN ({0}) GROUP BY status".format(placeholders), chunk):
+                    counts_acc[str(row["status"])] = counts_acc.get(str(row["status"]), 0) + int(row["n"])
+                outbox_count += int(self._conn.execute(
+                    "SELECT COUNT(*) FROM task_outbox WHERE task_id IN ({0})".format(placeholders),
+                    chunk).fetchone()[0])
+            rows = [{"status": status, "n": count} for status, count in counts_acc.items()]
         counts = {row["status"]: int(row["n"]) for row in rows}
-        outbox_count = int(self._conn.execute("SELECT COUNT(*) FROM task_outbox").fetchone()[0])
         return {"schema_version": TASK_SCHEMA_VERSION, "task_counts": counts, "outbox_events": outbox_count}
 
     # -------- event consumption ledger --------
