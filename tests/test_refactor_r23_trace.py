@@ -14,6 +14,7 @@ import json
 import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from stock_agent.config import project_path_override
@@ -31,6 +32,8 @@ from stock_agent.observability import (
     observability_settings,
     project_log_fields,
     read_query_ledgers,
+    correlation,
+    project_value,
     safe_label,
 )
 from stock_agent.ops_view import build_ops_view
@@ -348,7 +351,8 @@ class FullLedgerTests(unittest.TestCase):
         invocation = report["reconciliation"]["invocations"]
         self.assertEqual(physical, 1)
         self.assertEqual(sum(invocation["states"].values()), 1)
-        self.assertEqual(invocation["by_provider"], {"synthetic": 1})
+        # "synthetic" is a bare word no registry verifies -> correlation value
+        self.assertEqual(invocation["by_provider"], {correlation("synthetic"): 1})
         self.assertEqual(len(report["trace"]["attempts"]), 1)
         self.assertEqual(sum(status["technical"]["invocation_attempts"].values()), 1)
         self.assertEqual(ledger["scope"], {"complete": True, "source": "sqlite_full_ledger"})
@@ -757,6 +761,274 @@ class BoundaryTests(unittest.TestCase):
             self.assertEqual(safe_label(value), value, value)
         self.assertEqual(safe_label(""), "")
         self.assertNotEqual(safe_label("has space"), "has space")
+
+
+class ProjectionRuleTests(unittest.TestCase):
+    """Where a value comes from decides how it may be published."""
+
+    def test_unprefixed_opaque_token_in_a_run_id_is_not_echoed(self):
+        token = "SolFixtureOpaqueValue20261125"
+        self.assertEqual(project_value("run_id", token), correlation(token))
+        for lower in (token.lower(), token.replace("Sol", "sol", 1)):
+            self.assertEqual(project_value("run_id", lower), correlation(lower), lower)
+
+    def test_structured_platform_ids_stay_readable_and_joinable(self):
+        for value in ("sol-r23-first-run", "dify-run-synthetic-001",
+                      "3f2a1c9e-5b7d-4e6f-8a9b-0c1d2e3f4a5b", "20261125001", "run_42"):
+            self.assertEqual(project_value("run_id", value), value, value)
+        self.assertEqual(project_value("run_id", correlation("x")), correlation("x"),
+                         "projection is idempotent")
+
+    def test_bare_word_external_values_need_a_known_set(self):
+        self.assertEqual(project_value("platform", "dify"), "dify")
+        self.assertNotEqual(project_value("platform", "difyy"), "difyy")
+        self.assertEqual(project_value("provider", "openai", frozenset({"openai"})), "openai")
+        self.assertEqual(project_value("provider", "openai"), correlation("openai"))
+        self.assertEqual(project_value("worker_id", "worker-4242"), "worker-4242")
+        self.assertNotEqual(project_value("worker_id", "SolFixtureOpaqueValue20261125"),
+                            "SolFixtureOpaqueValue20261125")
+
+    def test_business_identity_kept_under_the_entry_constraint(self):
+        self.assertEqual(project_value("case_id", "case-alpha"), "case-alpha")
+        self.assertEqual(project_value("business_intent_id", "sol-r23-business-intent"),
+                         "sol-r23-business-intent")
+        sentence = "Synthetic restricted prose fixture for R23"
+        self.assertEqual(project_value("case_id", sentence), correlation(sentence))
+        self.assertEqual(project_value("business_intent_id", "sk-R23SyntheticProviderFixture0001"),
+                         correlation("sk-R23SyntheticProviderFixture0001"))
+
+    def test_system_references_and_row_ids(self):
+        self.assertEqual(project_value("request_id", "kq_" + "a" * 32), "kq_" + "a" * 32)
+        self.assertEqual(project_value("intent_id", "qi_" + "b" * 16), "qi_" + "b" * 16)
+        self.assertEqual(project_value("request_id", "req-legacy-1"), "req-legacy-1")
+        self.assertEqual(project_value("request_id", "SolFixtureOpaqueValue20261125"),
+                         correlation("SolFixtureOpaqueValue20261125"))
+        self.assertEqual(project_value("attempt_id", "att_" + "c" * 16), "att_" + "c" * 16)
+        self.assertNotEqual(project_value("task_id", "task-not-a-row-id"), "task-not-a-row-id")
+        self.assertEqual(project_value("started_at", "2026-11-24T00:00:00+00:00"),
+                         "2026-11-24T00:00:00+00:00")
+
+    def test_registered_provider_is_published_by_name(self):
+        import stock_agent.observability as obs
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = TaskStore(Path(directory) / "tasks.sqlite3")
+            try:
+                task, _ = store.create_task(
+                    title="合成", input_payload={"research_question": "合成",
+                                                "data_classification": "public"},
+                    execution_mode="replay")
+                task_id = task["task_id"]
+                claim = store.claim_task(task_id, "w-p", ttl_seconds=120)
+                store.mark_running(task_id, worker_id="w-p", fencing_token=claim["fencing_token"],
+                                   expected_version=claim["version"])
+                store.prepare_invocation_attempt(
+                    task_id, worker_id="w-p", fencing_token=claim["fencing_token"], round_index=1,
+                    provider="openai", request_model="m", prompt_sha256="b" * 64)
+                unverified = build_observability_report(store, task_id=task_id)
+                with unittest.mock.patch.object(obs, "registered_providers",
+                                                return_value=frozenset({"openai"})):
+                    verified = build_observability_report(store, task_id=task_id)
+            finally:
+                store.close()
+        self.assertEqual(unverified["reconciliation"]["invocations"]["by_provider"],
+                         {correlation("openai"): 1})
+        self.assertEqual(verified["reconciliation"]["invocations"]["by_provider"], {"openai": 1})
+        self.assertEqual(verified["trace"]["attempts"][0]["provider"], "openai",
+                         "detail and aggregate use the same verified label")
+        self.assertEqual(sum(verified["reconciliation"]["invocations"]["states"].values()), 1)
+
+
+class RuntimeEdgeTests(unittest.TestCase):
+    """sol round 4: symlinked live WAL, one intake snapshot, non-record JSON,
+    the original error through a nested snapshot, opaque token via Dify."""
+    OPAQUE = "SolFixtureOpaqueValue20261125"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.enterContext(project_path_override(lambda value: self.root / value))
+        self.store = TaskStore(self.root / "tasks.sqlite3")
+        self.addCleanup(self.store.close)
+        task, _ = self.store.create_task(
+            title="合成", input_payload={"research_question": "合成", "data_classification": "public"},
+            execution_mode="replay")
+        self.task_id = task["task_id"]
+        self.intake = self.root / "connector.sqlite3"
+        self.audit = self.root / "ledger.jsonl"
+
+    def config(self, path=None):
+        return {"kimi_sources": {"ledger_path": str(self.audit),
+                                 "query_store_path": str(path or self.intake)}}
+
+    def _bind(self, writer):
+        from stock_agent.connector_runtime.queries import ConnectorQueryStore  # noqa: F401
+
+        reserved = writer.reserve_query(
+            "r23-fixture-query", source_id="file_price", upstream="file", purpose="synthetic",
+            per_source_rpm=0, per_source_rpd=0, group_daily_limit=0, request_id="req-r23-fixture")
+        intent_id = reserved["intent"]["intent_id"]
+        writer.mark_dispatched(intent_id)
+        writer.complete_query(intent_id, outcome="ok")
+        writer.record_query_consumption(intent_id, self.task_id, supply_status="data_delivered")
+        return intent_id
+
+    def test_symlink_to_a_live_intake_sees_the_committed_binding(self):
+        from stock_agent.connector_runtime.queries import ConnectorQueryStore
+
+        with ConnectorQueryStore(self.intake):
+            pass
+        alias = self.root / "connector-alias.sqlite3"
+        alias.symlink_to(self.intake)
+        with ConnectorQueryStore(self.intake) as writer:
+            self._bind(writer)
+            self.assertGreater(Path(str(self.intake) + "-wal").stat().st_size, 0)
+            direct = read_query_ledgers(self.config())
+            via_alias = read_query_ledgers(self.config(alias))
+        self.assertEqual((direct["intake_state"], len(direct["consumptions"])), ("readable", 1))
+        self.assertEqual((via_alias["intake_state"], len(via_alias["consumptions"])),
+                         ("readable", 1))
+        self.assertFalse(via_alias["intake_wal_pending"])
+        # Reading through the alias judges sidecars on the REAL file, so it
+        # never creates a sidecar named after the alias.
+        self.assertEqual([p.name for p in self.root.iterdir()
+                          if p.name.startswith("connector-alias.sqlite3-")], [])
+
+    def test_intents_and_consumptions_come_from_one_snapshot(self):
+        import sqlite3
+        from unittest.mock import patch
+
+        from stock_agent.connector_runtime.queries import ConnectorQueryStore
+
+        real_connect = sqlite3.connect
+        test = self
+
+        class Cursor:
+            def __init__(self, cursor):
+                self.cursor = cursor
+
+            def fetchall(self):
+                rows = self.cursor.fetchall()
+                test._bind(writer)  # a REAL connection commits after the intent read
+                return rows
+
+        class Reader:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+            @property
+            def row_factory(self):
+                return self.connection.row_factory
+
+            @row_factory.setter
+            def row_factory(self, value):
+                self.connection.row_factory = value
+
+            def execute(self, sql, *args):
+                cursor = self.connection.execute(sql, *args)
+                return Cursor(cursor) if sql == "SELECT * FROM query_intents" else cursor
+
+        def connect(database, *args, **kwargs):
+            return Reader(real_connect(database, *args, **kwargs))
+
+        with ConnectorQueryStore(self.intake) as writer:
+            writer._conn.execute("CREATE TABLE r23_wal_anchor (id INTEGER)")  # frames land in the WAL
+            with patch.object(sqlite3, "connect", side_effect=connect):
+                read = read_query_ledgers(self.config())
+        self.assertEqual((len(read["intents"]), len(read["consumptions"])), (0, 0),
+                         "the binding committed after the intent read belongs to a later snapshot")
+        for binding in read["consumptions"]:
+            self.assertIn(binding["intent_id"], read["intents"])
+        trace = build_trace(self.store, self.task_id, query_read=read)
+        self.assertEqual(trace["queries"], [])
+
+    def test_object_that_is_not_a_ledger_record_is_not_evidence(self):
+        for text, state in (("{}", "unreadable"), ("[]", "unreadable"),
+                            ('{"record_type":"future_type","x":1}', "unreadable"),
+                            ('{"record_type":"query_result"}', "unreadable"),
+                            ('{"record_type":"query_result","request_id":""}', "unreadable")):
+            self.audit.write_text(text + "\n", encoding="utf-8")
+            report = build_observability_report(self.store, config=self.config(),
+                                                task_id=self.task_id)
+            queries = report["reconciliation"]["queries"]
+            alert = next(c for c in report["alert_candidates"]["candidates"]
+                         if c["rule"] == "query_outcome_unknown")
+            self.assertEqual((queries["ledger_state"], queries["ledger_available"],
+                              alert["observed"], alert["evidence"]),
+                             (state, False, "unknown", "unknown"), text)
+            self.assertIn("data_query_ledger", report["reconciliation"]["unknown_items"], text)
+
+    def test_supported_records_keep_their_meaning(self):
+        self.audit.write_text("", encoding="utf-8")
+        report = build_observability_report(self.store, config=self.config())
+        self.assertEqual(report["reconciliation"]["queries"]["ledger_state"], "readable_empty")
+        self.audit.write_text("\n".join(json.dumps(r) for r in (
+            {"record_type": "query_intent", "request_id": "req-1"},
+            {"record_type": "query_result", "request_id": "req-1", "outcome": "outcome_unknown"},
+            {"record_type": "consumed", "artifact_id": "art-1"})) + "\n", encoding="utf-8")
+        report = build_observability_report(self.store, config=self.config())
+        queries = report["reconciliation"]["queries"]
+        self.assertEqual((queries["ledger_state"], queries["outcome_counts"]),
+                         ("readable", {"outcome_unknown": 1}))
+
+    def test_missing_task_keeps_the_original_error_through_the_nested_snapshot(self):
+        from stock_agent.task_runtime.store import TaskRuntimeError
+
+        with self.assertRaises(TaskRuntimeError):
+            build_observability_report(self.store, task_id="missing-task")
+        self.assertFalse(self.store._conn.in_transaction)
+        reader = TaskStore(self.store.db_path, read_only=True)
+        self.addCleanup(reader.close)
+        with self.assertRaises(TaskRuntimeError):
+            build_observability_report(reader, task_id="missing-task")
+        self.assertFalse(reader._conn.in_transaction)
+        # and a later report on the same connections still works
+        self.assertEqual(build_observability_report(self.store)["status"]["technical"]["queue_depth"], 1)
+
+    def test_snapshot_open_failure_is_not_confused_with_a_body_error(self):
+        class _Conn:
+            in_transaction = False
+
+            def execute(self, sql):
+                raise RuntimeError("cannot begin a read transaction")
+
+        class _Store:
+            _conn = _Conn()
+
+            db_path = Path("none.sqlite3")
+            read_only = True
+
+            def list_tasks(self):
+                raise KeyError("body failed")
+
+        from stock_agent.observability import _consistent_read
+
+        with self.assertRaises(KeyError):
+            with _consistent_read(_Store):
+                raise KeyError("body failed")
+
+    def test_opaque_token_as_run_id_through_the_dify_http_entry(self):
+        from test_dify_api_v1 import ApiServerTests
+
+        http = ApiServerTests("test_create_and_status_round_trip")
+        self.addCleanup(http.doCleanups)
+        http.setUp()
+        status, response = http._request("POST", "/api/dify/v1/create-research", {
+            "title": "Synthetic R23 edge", "case_id": "case-alpha", "input_version": 1,
+            "research_question": "Synthetic research?", "dify_run_id": self.OPAQUE,
+            "workflow_version": "wf-demo-1", "business_intent_id": "r23-runtime-edges",
+            "execution_mode": "replay"})
+        self.assertEqual(status, 200, response)
+        report = build_observability_report(http.store, task_id=response["data"]["task_id"])
+        self.assertNotIn(self.OPAQUE, json.dumps(report, ensure_ascii=False))
+        run = report["trace"]["platform_runs"][0]
+        self.assertEqual(run["run_id"], correlation(self.OPAQUE))
+        self.assertEqual(report["trace"]["business_identity"]["business_intent_id"],
+                         "r23-runtime-edges")
 
 
 class ZeroSideEffectsTests(FrozenCaseTestCase):

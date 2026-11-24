@@ -246,13 +246,70 @@ def error_code(text: Any) -> str:
 # accepted a sentence as a run id, and a provider label can look like a key.
 # Such a value is published only as a validated identifier or as a stable
 # irreversible digest — never as itself.
-LABEL_NOTE = ("外部关联值只以校验通过的标识或 sha256 稳定摘要呈现；明细与聚合同一标签，计数可对账")
+LABEL_NOTE = ("外部来源的关联值一律以 sha256 稳定关联值呈现；系统标识与受控词保留原样；"
+              "明细与聚合同一标签，计数可对账")
 _LABEL = re.compile(r"^[A-Za-z0-9_.:+\-/]{1,80}$")
 _LABEL_DIGEST_PREFIX = "sha256:"
 # Fields whose value is this module's own prose (Chinese notes / details),
-# not a value read from a ledger; they are exempt from labelling.
+# not a value read from a ledger; they are exempt from projection.
 PROSE_KEYS = frozenset({"note", "reason", "scope_note", "projection_note", "detail",
                         "ledger_detail", "intake_detail", "label_note"})
+# Values that came from OUTSIDE the system: typed or configured by a person
+# or another platform (a Dify run id, a provider or model name, a worker or
+# actor name). The entry points accept any string for most of them, so a view
+# publishes one only when it has the shape of a STRUCTURED identifier — a
+# UUID, a plain number, or lowercase segments joined by ``. _ : -`` — and
+# carries no credential marker. A bare alphanumeric blob (the shape of an
+# opaque token, with or without a recognised prefix) does not qualify and is
+# published as a correlation value instead.
+EXTERNAL_FIELDS = frozenset({
+    "run_id", "workflow_version", "actor", "platform", "provider", "request_model",
+    "worker_id", "source_id", "api_id", "data_kind", "role_id", "parent_task_id",
+    "upstream", "quota_group", "title", "purpose",
+})
+# Business identity: the case id and the business intent id are what people
+# join a trace on, so they stay readable — but only under the identifier
+# constraint the role entry already enforces for case ids. Anything outside
+# it (a sentence, a credential-shaped string) becomes a correlation value.
+_BUSINESS_IDENTITY_FIELDS = frozenset({"case_id", "business_intent_id"})
+_BUSINESS_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_STRUCTURED_ID = re.compile(r"^(?:[0-9]+|[a-z0-9]+(?:[._:-][a-z0-9]+)+)$")
+
+
+_BARE_WORD = re.compile(r"^[a-z0-9]+$")
+# The orchestration platforms the task store keys runs by (Dify, n8n).
+KNOWN_PLATFORMS = frozenset({"dify", "n8n"})
+
+
+def _is_structured_id(value: str, field: Any = None, known: frozenset = frozenset()) -> bool:
+    """Structured = UUID / number / separated lowercase segments. A BARE word
+    (``openai``, ``dify`` — but also a lowercase token) has no structure to
+    check, so it counts only when a known set for its field verifies it."""
+    if contains_secret_marker(value):
+        return False
+    if _UUID.match(value) or _STRUCTURED_ID.match(value):
+        return True
+    if not _BARE_WORD.match(value):
+        return False
+    name = str(field or "")
+    if name == "provider":
+        return value in known
+    return name == "platform" and value in KNOWN_PLATFORMS
+
+
+# References the system generates itself: ``qi_<16 hex>`` intake intents,
+# ``kq_<32 hex>`` Kimi requests. Ledger records written before those shapes
+# were fixed may carry another identifier-shaped reference; it is kept when it
+# looks like a reference (prefix + separator) and carries no credential marker.
+_REFERENCE_FIELDS = frozenset({"request_id", "intent_id", "idempotency_key"})
+_REFERENCE_SYSTEM = re.compile(r"^(qi_[0-9a-f]{16}|kq_[0-9a-f]{32})$")
+_REFERENCE = re.compile(r"^[A-Za-z]+[-_][A-Za-z0-9_-]{1,64}$")
+# Row ids of the task store: a fixed, verifiable shape.
+_ROW_ID = re.compile(r"^(task|att|evt)_[0-9a-f]{16}$")
+# Controlled vocabulary written by this code base: states, outcomes, event
+# types, gates, rules, evidence classes (lowercase snake_case).
+_CONTROLLED = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 
 
 def safe_label(value: Any) -> str:
@@ -265,17 +322,87 @@ def safe_label(value: Any) -> str:
     return _LABEL_DIGEST_PREFIX + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def _safe_tree(value: Any) -> Any:
-    """Label every string value in a view; leaves non-string data alone."""
+def correlation(value: Any) -> str:
+    """The stable, irreversible stand-in for a value that is never published
+    as itself. Equal values always map to the same stand-in, so two views of
+    the same run still join on it."""
+    text = str(value or "")
+    if text == "":
+        return ""
+    return _LABEL_DIGEST_PREFIX + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def registered_providers(config: Any) -> frozenset:
+    """Provider ids the provider registry has ACTIVATED (integrity OK).
+
+    Only those may be published as provider labels: membership in the
+    registry is the verifiable constraint that separates a configured
+    provider name from an arbitrary string stored in the attempt row.
+    """
+    try:
+        from .provider_registry import load_active_provider_ids
+
+        return frozenset(str(item) for item in load_active_provider_ids(config or {}))
+    except Exception:  # noqa: BLE001 — no readable registry: nothing is verified
+        return frozenset()
+
+
+def project_value(field: Any, value: Any, known: frozenset = frozenset()) -> Any:
+    """Publish ``value`` of ``field`` according to where the value came from.
+
+    external        -> kept only as a structured identifier without a
+                       credential marker (a bare word only when a known set
+                       verifies it: an activated provider, a known platform),
+                       otherwise a correlation value
+    business identity -> kept under the entry's identifier constraint,
+                       otherwise a correlation value
+    system reference -> kept when it has the shape of one, else correlation
+    task-store row id -> kept only in the fixed row-id shape, else correlation
+    anything else   -> kept when it is an identifier-shaped or controlled
+                       token without a credential marker, else a safe label
+    Non-strings are returned untouched.
+    """
+    if not isinstance(value, str):
+        return value
+    if value == "" or value.startswith(_LABEL_DIGEST_PREFIX):
+        return value
+    name = str(field or "")
+    if name in EXTERNAL_FIELDS:
+        if name == "provider" and value in known:
+            return value  # verified against the activated-provider registry
+        return value if _is_structured_id(value, name, known) else correlation(value)
+    if name in _BUSINESS_IDENTITY_FIELDS:
+        return value if _BUSINESS_IDENTITY.match(value) \
+            and not contains_secret_marker(value) else correlation(value)
+    if name in ("task_id", "attempt_id", "event_id"):
+        return value if _ROW_ID.match(value) else correlation(value)
+    if name in _REFERENCE_FIELDS:
+        if _REFERENCE_SYSTEM.match(value):
+            return value
+        return value if _REFERENCE.match(value) and not contains_secret_marker(value) \
+            else correlation(value)
+    return safe_label(value)
+
+
+def project_key(key: Any) -> str:
+    """A dictionary key that names data (a status, an event type, a
+    provider). Keys that name FIELDS or already are correlation values are
+    returned as they are, so projection stays idempotent."""
+    text = str(key)
+    if text.startswith(_LABEL_DIGEST_PREFIX) or _CONTROLLED.match(text):
+        return text
+    return safe_label(text)
+
+
+def _safe_tree(value: Any, field: Any = None, known: frozenset = frozenset()) -> Any:
+    """Project every string in a view, by the name of the field it sits in."""
     if isinstance(value, dict):
         return {str(key): (str(item) if key in PROSE_KEYS and isinstance(item, str)
-                           else _safe_tree(item))
-                for key, item in value.items()}
+                           else _safe_tree(item, key, known))
+                for key, item in ((project_key(k), v) for k, v in value.items())}
     if isinstance(value, list):
-        return [_safe_tree(item) for item in value]
-    if isinstance(value, str):
-        return safe_label(value)
-    return value
+        return [_safe_tree(item, field, known) for item in value]
+    return project_value(field, value, known)
 
 
 @contextlib.contextmanager
@@ -283,31 +410,32 @@ def _consistent_read(store: Any):
     """One SQLite read snapshot for a whole view.
 
     A read-only connection can still ``BEGIN``: every SELECT inside the block
-    then sees the same committed state, so an attempt committed by a writer
-    midway through a report cannot appear in one section and not another.
-    Nothing is written and the transaction is rolled back. Stores without a
-    usable connection, or a caller already inside a transaction, are passed
-    through unchanged.
+    then sees the same committed state, so a write committed midway through a
+    report cannot appear in one section and not another. Nothing is written
+    and the transaction is rolled back. A store without a usable connection,
+    or a caller already inside a transaction, is passed through unchanged.
+
+    The body runs from ONE ``yield``. An exception raised by the body leaves
+    this context as the exception it is — it is never caught here (a second
+    ``yield`` from an ``except`` would turn it into "generator didn't stop
+    after throw()"), and only a transaction THIS call began is rolled back.
     """
     conn = getattr(store, "_conn", None)
-    if conn is None:
-        yield
-        return
+    began = False
     try:
-        if conn.in_transaction:
-            yield
-            return
-        conn.execute("BEGIN")
+        if conn is not None and not conn.in_transaction:
+            conn.execute("BEGIN")
+            began = True
     except Exception:  # noqa: BLE001 — consistency is best effort, never a failure
-        yield
-        return
+        began = False
     try:
         yield
     finally:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:  # noqa: BLE001
-            pass
+        if began:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def redact(value: Any, limit: int = 200) -> str:
@@ -400,7 +528,7 @@ def aggregate_attempts(store: Any) -> Dict[str, Any]:
     states = {"succeeded": 0, "failed_known": 0, "outcome_unknown": 0,
               "reconciled": 0, "outstanding": 0}
     result = {"states": states, "reconciliations_waiting": 0, "providers": {},
-              "with_error": 0, "unrecognized": 0,
+              "providers_raw": {}, "with_error": 0, "unrecognized": 0,
               "scope": {"complete": False, "source": "per_task_fallback"}}
     conn = getattr(store, "_conn", None)
     rows = None
@@ -436,11 +564,27 @@ def aggregate_attempts(store: Any) -> Dict[str, Any]:
         if state == ATTEMPT_OUTCOME_UNKNOWN and not reconciled:
             result["reconciliations_waiting"] += count
         if provider:
-            label = safe_label(provider)
+            # A provider name is external text: correlated, never published
+            # as it is, unless the reconciliation can verify it (see
+            # ``provider_counts``). ``providers_raw`` never leaves a view.
+            label = correlation(provider)
             result["providers"][label] = result["providers"].get(label, 0) + count
+            result["providers_raw"][provider] = result["providers_raw"].get(provider, 0) + count
         result["with_error"] += int(with_error or 0)
     result["providers"] = dict(sorted(result["providers"].items()))
+    result["providers_raw"] = dict(sorted(result["providers_raw"].items()))
     return result
+
+
+def provider_counts(ledger: Dict[str, Any], known: frozenset = frozenset()) -> Dict[str, int]:
+    """``by_provider`` from ONE aggregate: an activated provider id is
+    published by name, every other stored label as its correlation value, so
+    the total always equals the five-state total."""
+    counts: Dict[str, int] = {}
+    for provider, count in (ledger.get("providers_raw") or {}).items():
+        label = project_value("provider", provider, known)
+        counts[label] = counts.get(label, 0) + count
+    return dict(sorted(counts.items()))
 
 
 def event_type_counts(store: Any) -> Dict[str, Any]:
@@ -450,14 +594,14 @@ def event_type_counts(store: Any) -> Dict[str, Any]:
         try:
             rows = conn.execute(
                 "SELECT event_type, COUNT(*) AS n FROM task_outbox GROUP BY event_type").fetchall()
-            return {"counts": {safe_label(r[0]): int(r[1]) for r in rows},
+            return {"counts": {project_key(r[0]): int(r[1]) for r in rows},
                     "scanned": sum(int(r[1]) for r in rows), "complete": True}
         except Exception:  # noqa: BLE001
             pass
     events = store.events(limit=MAX_EVENTS)
     counts: Dict[str, int] = {}
     for event in events:
-        name = safe_label(event.get("event_type") or "")
+        name = project_key(event.get("event_type") or "")
         counts[name] = counts.get(name, 0) + 1
     summary = getattr(store, "summary", None)
     total = int((summary() or {}).get("outbox_events") or 0) if callable(summary) else None
@@ -516,7 +660,7 @@ def read_query_ledgers(config: Any = None) -> Dict[str, Any]:
                         record = json.loads(line)
                     except json.JSONDecodeError:
                         record = None
-                    if not isinstance(record, dict):
+                    if not _is_ledger_record(record):
                         read["unreadable_lines"] += 1
                         continue
                     read["records"].append(record)
@@ -559,19 +703,51 @@ def read_query_ledgers(config: Any = None) -> Dict[str, Any]:
     return read
 
 
+# The audit ledger's record types and the fields each one cannot do without
+# (the same names the Kimi adapter writes: query_intent / query_result /
+# consumed). A syntactically valid object that is not one of these — `{}`,
+# an envelope, a future unknown type — is not evidence of anything.
+LEDGER_RECORD_FIELDS = {
+    "query_intent": ("request_id",),
+    "query_result": ("request_id",),
+    "consumed": ("artifact_id",),
+}
+
+
+def _is_ledger_record(record: Any) -> bool:
+    if not isinstance(record, dict):
+        return False
+    required = LEDGER_RECORD_FIELDS.get(str(record.get("record_type") or ""))
+    if required is None:
+        return False
+    return all(isinstance(record.get(name), str) and str(record[name]).strip()
+               for name in required)
+
+
 def _read_intake(intake_path: Path, read: Dict[str, Any]):
-    """(table names, intent rows, consumption rows) without creating files."""
+    """(table names, intent rows, consumption rows) without creating files.
+
+    The sidecar check and the open use the SAME resolved path: an intake
+    reached through a symlink must not be judged by the symlink's sidecars.
+    Schema, intents and consumptions are read inside ONE transaction on the
+    reader connection, so a binding always resolves to an intent of the same
+    snapshot.
+    """
     import sqlite3
 
-    wal = Path(str(intake_path) + "-wal")
-    wal_pending = wal.exists() and wal.stat().st_size > 0
-    base = intake_path.resolve().as_uri()
+    real = intake_path.resolve()
+    wal = Path(str(real) + "-wal")
+    base = real.as_uri()
+
+    def wal_pending() -> bool:
+        return wal.exists() and wal.stat().st_size > 0
 
     def load(uri: str) -> tuple:
         conn = sqlite3.connect(uri, uri=True, timeout=30, isolation_level=None,
                                check_same_thread=False)
         try:
             conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN")
             names = {str(r[0]) for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'")}
             if not {"query_intents", "query_consumptions"} <= names:
@@ -581,10 +757,18 @@ def _read_intake(intake_path: Path, read: Dict[str, Any]):
                 "SELECT * FROM query_consumptions ORDER BY consumed_at, intent_id").fetchall()
             return names, intents, consumptions
         finally:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
             conn.close()
 
-    if not wal_pending:
-        return load(base + "?mode=ro&immutable=1")
+    if not wal_pending():
+        rows = load(base + "?mode=ro&immutable=1")
+        if not wal_pending():
+            return rows
+        # A writer showed up while the immutable read ran: that read may have
+        # missed frames it cannot see. Do not keep it — read again properly.
     try:
         return load(base + "?mode=ro")
     except sqlite3.Error:
@@ -703,10 +887,12 @@ def build_trace(store: Any, task_id: str, *, config: Any = None,
     reconciliation so both report the same availability.
     """
     with _consistent_read(store):
-        return _build_trace(store, task_id, config, ledger, query_read)
+        return _build_trace(store, task_id, config, ledger, query_read,
+                            registered_providers(config))
 
 
-def _build_trace(store: Any, task_id: str, config: Any, ledger, query_read) -> Dict[str, Any]:
+def _build_trace(store: Any, task_id: str, config: Any, ledger, query_read,
+                 known: frozenset = frozenset()) -> Dict[str, Any]:
     task = store.get_task(str(task_id))
     read = dict(query_read) if query_read is not None else (
         {"state": LEDGER_READABLE if ledger else LEDGER_READABLE_EMPTY, "records": list(ledger or []),
@@ -804,7 +990,7 @@ def _build_trace(store: Any, task_id: str, config: Any, ledger, query_read) -> D
         "side_effects": "none",
         "projection_note": "仅标识/状态/时间/稳定错误码；不含输入输出正文、提示词或错误原文",
         "label_note": LABEL_NOTE,
-    })
+    }, known=known)
 
 
 # -------- reconciliation (view vs authoritative ledgers) -------- #
@@ -828,6 +1014,7 @@ def _build_reconciliation(store: Any, config: Any, now, ledger, query_read) -> D
     moment = now or utc_now()
     # ONE aggregate read, shared by the status and every section below.
     attempt_ledger = aggregate_attempts(store)
+    known = registered_providers(config)
     status = build_observability_status(store, now=moment, attempt_ledger=attempt_ledger)
     technical, business = status["technical"], status["business"]
     tasks = list(store.list_tasks())
@@ -888,7 +1075,7 @@ def _build_reconciliation(store: Any, config: Any, now, ledger, query_read) -> D
         "technical": technical,
         "business": business,
         "authoritative": {
-            "task_status_counts": {safe_label(k): int(v)
+            "task_status_counts": {project_value("status", k, known): int(v)
                                     for k, v in dict(summary.get("task_counts") or {}).items()},
             "outbox_events": outbox_total,
             "consumption": store.consumption_summary(),
@@ -905,7 +1092,7 @@ def _build_reconciliation(store: Any, config: Any, now, ledger, query_read) -> D
         },
         "invocations": {
             "states": attempt_states,
-            "by_provider": attempt_ledger["providers"],
+            "by_provider": provider_counts(attempt_ledger, known),
             "reconciliations_waiting": technical["reconciliations_waiting"],
             "known_failures": attempt_states["failed_known"],
             "unknown_open": attempt_states["outcome_unknown"],
@@ -967,7 +1154,7 @@ def _build_reconciliation(store: Any, config: Any, now, ledger, query_read) -> D
         "unknown_items": sorted(unknown_items),
         "side_effects": "none",
         "label_note": LABEL_NOTE,
-    })
+    }, known=known)
 
 
 def _db_bytes(store: Any) -> Optional[int]:
@@ -1147,4 +1334,4 @@ def build_observability_report(store: Any, *, config: Any = None,
         "side_effects": "none",
         "label_note": LABEL_NOTE,
     }
-    return _safe_tree(report)
+    return _safe_tree(report, known=registered_providers(config))

@@ -760,7 +760,7 @@ def business_with_sampling_off(store, root: Path, config_off: dict) -> dict:
 
 def scale_check(root: Path) -> dict:
     """An attempt on the 5,001st task must be counted (no sampling cap)."""
-    from stock_agent.observability import build_observability_report
+    from stock_agent.observability import build_observability_report, correlation as obs_correlation
     from stock_agent.task_runtime import TaskStore
 
     path = root / SCALE_DB_REL
@@ -796,7 +796,7 @@ def scale_check(root: Path) -> dict:
     view = sum(invocation["states"].values())
     path.unlink()
     return {"ok": physical == view == len(report["trace"]["attempts"]) == 1
-                   and invocation["by_provider"] == {"synthetic": 1},
+                   and invocation["by_provider"] == {obs_correlation("synthetic"): 1},
             "tasks": 5001, "sqlite_attempts": physical, "reconciliation_states_total": view,
             "provider_counts": invocation["by_provider"],
             "trace_attempts": len(report["trace"]["attempts"]),
@@ -972,6 +972,68 @@ def boundary_checks(root: Path) -> dict:
           (read["intake_state"], len(read["intents"]), len(read["consumptions"]),
            read["intake_wal_pending"]))
     check("boundary.intake.live_wal_really_pending", True, wal_size > 0)
+
+    # 8. (sol round 4) An intake reached through a SYMLINK while its WAL is live.
+    directory = base / "symlink"
+    directory.mkdir()
+    real_intake = directory / "connector.sqlite3"
+    alias = directory / "connector-alias.sqlite3"
+    link = ConnectorQueryStore(real_intake)
+    try:
+        link.reserve_query("k-r23-link", source_id="file_price", upstream="ifind", purpose="r23",
+                           per_source_rpm=60, per_source_rpd=10, group_daily_limit=10,
+                           request_id="req-r23-link")
+        intent_id = link._conn.execute("SELECT intent_id FROM query_intents").fetchone()[0]
+        link.record_query_consumption(intent_id, "task-r23-link")
+        alias.symlink_to(real_intake)
+        direct = obs.read_query_ledgers({"kimi_sources": {"query_store_path": str(real_intake)}})
+        via_alias = obs.read_query_ledgers({"kimi_sources": {"query_store_path": str(alias)}})
+    finally:
+        link.close()
+    check("boundary.intake.symlink_live_wal", ("readable", 1, False),
+          (via_alias["intake_state"], len(via_alias["consumptions"]),
+           via_alias["intake_wal_pending"]))
+    check("boundary.intake.direct_and_alias_agree",
+          (direct["intake_state"], len(direct["consumptions"])),
+          (via_alias["intake_state"], len(via_alias["consumptions"])))
+
+    # 9. An object that is not a ledger record is not evidence of zero.
+    #    (state, report available, trace available, alert observed, unknown item)
+    for name, text in (("object", "{}"), ("array", "[]"),
+                       ("unknown_type", json.dumps({"record_type": "future_type", "x": 1})),
+                       ("missing_field", json.dumps({"record_type": "query_result"}))):
+        outcome = corrupt("non_record_" + name, text + "\n")
+        check("boundary.ledger.non_record." + name,
+              ("unreadable", False, False, "unknown", True),
+              (outcome[0], outcome[1], outcome[2], outcome[3], outcome[6]))
+
+    # 10. The original error survives the nested read snapshot.
+    store, task_id = new_store("missing")
+    from stock_agent.task_runtime.store import TaskRuntimeError
+    raised = None
+    try:
+        obs.build_observability_report(store, task_id="missing-task")
+    except TaskRuntimeError as exc:
+        raised = exc
+    check("boundary.snapshot.original_error", "TaskRuntimeError", type(raised).__name__)
+    check("boundary.snapshot.no_transaction_leak", False, store._conn.in_transaction)
+    later = obs.build_observability_report(store)
+    check("boundary.snapshot.store_still_usable", 1,
+          later["status"]["technical"]["queue_depth"])
+    store.close()
+
+    # 11. An opaque token (no recognised prefix) typed into the run-id field.
+    store, task_id = new_store("opaque")
+    opaque = "ZcodeFixtureOpaqueValue20261125"
+    store.attach_platform_run(task_id, run={"platform": "dify", "run_id": opaque,
+                                            "workflow_version": "wf-demo-1", "actor": "a"})
+    report = obs.build_observability_report(store, task_id=task_id)
+    check("boundary.label.opaque_token_not_echoed", False, opaque in json.dumps(report))
+    check("boundary.label.opaque_token_stable", obs.correlation(opaque),
+          report["trace"]["platform_runs"][-1]["run_id"])
+    check("boundary.label.structured_run_id_kept", "sol-r23-first-run",
+          obs.project_value("run_id", "sol-r23-first-run"))
+    store.close()
 
     # 7. A read-only DIRECTORY (not root): the read still works and writes nothing.
     directory = base / "readonly"
