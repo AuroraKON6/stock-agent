@@ -1384,6 +1384,61 @@ class SignoffAndDeliveryTests(R22IntegrationCase):
                         "the worker records the persistent cancellation marker")
         self.assertEqual(store.get_task(child_id)["output"], {})
 
+    def test_cancel_committed_at_the_prompt_check_never_reserves_a_call(self):
+        from stock_agent import research_worker as worker_module
+        from test_refactor_r02 import _spec
+
+        fixture = self.attempt_fixture("test_successful_call_records_succeeded_attempt")
+        store = fixture.store
+        root, _ = store.create_task(
+            title="Synthetic root", case_id="synthetic",
+            idempotency_key="synthetic-prompt-check-root",
+            input_payload=_spec(), execution_mode="live")
+        child = propose_subtasks(
+            store, parent_task_id=root["task_id"],
+            proposals=[{"role_id": "event_analyst", "question": "synthetic child research"}])
+        child_id = child["created"][0]["task_id"]
+        store.claim_task(child_id, "w-r02")
+        gate = worker_module.assert_payload_external_safe
+        committed = {}
+
+        def cancel_at_prompt_check(prompt):
+            # The LAST checkpoint before this round's budget reservation and
+            # dispatch: exactly the window the counterexample uses.
+            gate(prompt)
+            if committed:
+                return
+            parent = workflow_cancel_task(
+                str(store.db_path), root["task_id"], actor="operator",
+                reason="取消", expected_version=root["version"])
+            committed.update({
+                "root": parent["status"],
+                "child_cancel_requested": bool(
+                    store.get_task(child_id)["cancel_requested"]),
+                "invocations": len(store.invocation_attempts(child_id)),
+            })
+
+        with patch.object(worker_module, "assert_payload_external_safe",
+                          cancel_at_prompt_check), \
+                patch("stock_agent.pi_runtime.call_pi_agent",
+                      return_value=fixture.response(
+                          fixture.final_output(child_id))) as stub:
+            result = run_research_task(store, child_id, worker_id="w-r02",
+                                       config=fixture.config)
+        self.assertEqual(committed["root"], "cancelled")
+        self.assertTrue(committed["child_cancel_requested"])
+        self.assertEqual(committed["invocations"], 0)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(stub.call_count, 0,
+                         "a cancellation committed before reservation forbids the call")
+        self.assertEqual(store.invocation_attempts(child_id), [],
+                         "no invocation row follows a committed cancellation")
+        self.assertEqual(
+            sum(event["event_type"] == "research_attempt_started"
+                for event in store.events(child_id)), 0,
+            "no budget reservation is written after the cancellation committed")
+        self.assertEqual(store.get_task(child_id)["status"], "cancelled")
+
     def test_workspace_cancel_refuses_a_foreign_owner(self):
         created = create_personal_research(
             self.store, actor=OWNER, question="个人工作台归属校验 600519",
@@ -1436,6 +1491,52 @@ class SignoffAndDeliveryTests(R22IntegrationCase):
         self.assertEqual(delivered["state"], "sent")
         self.assertTrue(delivered["authoritative"])
         self.assertEqual(delivered["rounds"][0]["attempt_id"], "att-old-lease")
+
+    def test_legacy_earlier_round_record_never_vouches_for_the_latest_context(self):
+        fixture = self.attempt_fixture(
+            "test_a07_timeout_after_send_is_unknown_and_never_auto_requeued")
+        store = fixture.store
+        task = fixture.create_live_task()
+        task_id = task["task_id"]
+        token = int(store.get_task(task_id)["fencing_token"])
+        rows = []
+        for round_index, sha, state, sent in (
+                (1, "a" * 64, "succeeded", "yes"),
+                (2, "b" * 64, "outcome_unknown", "unknown")):
+            attempt = store.prepare_invocation_attempt(
+                task_id, worker_id="w-r02", fencing_token=token,
+                round_index=round_index, provider="stub", request_model="stub",
+                prompt_sha256=sha)
+            store.mark_invocation_dispatched(attempt["attempt_id"],
+                                             worker_id="w-r02", fencing_token=token)
+            store.complete_invocation_attempt(
+                attempt["attempt_id"], worker_id="w-r02", fencing_token=token,
+                state=state, sent=sent)
+            rows.append(attempt)
+        # A legacy writer's record: rounds holds only the FIRST successful
+        # round, while the latest context's send went unknown.
+        legacy = {
+            "mode": "live", "called": True,
+            "rounds": [{"round": 1, "attempt_id": rows[0]["attempt_id"],
+                        "prompt_sha256": "a" * 64}],
+            "context_delivery": {"delivered_evidence": ["doc-1"]},
+            "outbound_context": {"evidence_summaries": {
+                "doc-1": {"summary": "synthetic", "sha256": "0" * 64}}},
+            "error": "ModelOutcomeUnknown: synthetic timeout after dispatch",
+        }
+        store.mark_blocked(task_id, worker_id="w-r02", fencing_token=token,
+                           error=legacy["error"], model_call=legacy)
+        row = project_review(store, identity=self.identity(),
+                             task_ids=[task_id])["tasks"][0]
+        sources = row["sources"]
+        self.assertEqual(sources["delivery_state"], "send_unknown",
+                         "an earlier round's record cannot vouch for the last context")
+        self.assertFalse(sources["delivery_authoritative"])
+        self.assertEqual(sources["delivered_evidence"], {})
+        self.assertEqual(sources["delivery_rounds"], [])
+        self.assertEqual(row["metering"]["invocation_attempts"], 2,
+                         "the historical invocation ledger stays visible")
+        self.assertEqual(row["metering"]["invocation_sent"], ["unknown", "yes"])
 
     def test_review_uses_worker_delivery_ledger_not_input_payload(self):
         undelivered = "synthetic-not-in-vault"

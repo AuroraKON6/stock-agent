@@ -42,7 +42,7 @@ Python 3.12.15，仓库锁定 `pyyaml==6.0.3`。全部在仓库根目录执行�
 | 命令 | 结果 |
 | --- | --- |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22.py` | 9 OK / exit 0 |
-| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 52 OK / exit 0（本单专项，第六轮后） |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 54 OK / exit 0（本单专项，第七轮后） |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17.py` | 12 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17_role_api.py` | 19 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r18.py` | 34 OK / exit 0 |
@@ -257,3 +257,25 @@ sol 在候选 `3e44c04` 上用 `invariant_checks.py` 复现 3 个反例（exit 1
 | C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run10 --port 18197`（共享锁内串行） | PASS 53/53，`down --volumes` exit 0，残留容器/网络/卷 0，端口可重绑 |
 
 边界说明：worker 侧的祖先取消是**本地检查点**——它保证本 worker 在取消的恢复窗口内零出站、零计量，并顺手把子任务标记为 `cancelled`；跨进程的图互斥与后代清点仍由 `cancel_subtree` 负责，二者不互相替代。工作台归属校验只针对**有服务端绑定**的任务：没有绑定的（非个人来源）任务保持原有入口语义，由 store 的原子授权与版本检查把关。旧格式复盘宁可 `prepared_only` 也不以 `called` 兜底——未绑定的发送不可证明即视为未送达。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 未改动，与 KONM-80 无共享文件冲突。
+
+
+## 13. 第七轮复验返工（sol 的 2 个补充反例）
+
+sol 在候选 `d0f2468` 上用 `dispatch_checks.py` 复现 2 个反例（exit 1）。逐项修复：
+
+| # | 失败项 | 修复 | 回归 / 证据 |
+| --- | --- | --- | --- |
+| 1 | 取消在 prompt 准备的检查点提交（根 `cancelled`、子 `cancel_requested=true`，预留与 invocation 均未开始），worker 随后仍新增 1 条 `research_attempt_started`、1 条 invocation 并调用了 1 次 provider stub | 新增 `subtask_graph.dispatch_boundary`（与 `creation_boundary` 同一把进程内 RLock + `<db>.subtask.lock` 的 flock）：worker 在**同一互斥临界区**内重读持久取消状态（自身/祖先链），命中即 `_DispatchCancelled`，否则才做预算预留、写 invocation、标记 dispatched。取消与「预留 + 派发」因此有唯一的已提交顺序：取消先提交 → 零预留零出站；本轮先提交 → 该调用属于在途，下一检查点停机 | `test_cancel_committed_at_the_prompt_check_never_reserves_a_call`（根 `cancelled`、子已带取消标记、stub 0 调用、invocation 0、`research_attempt_started` 0）；dispatch `cancel_completed_before_model_reservation_blocks_dispatch`（`provider_stub_calls=0`、`invocations=0`、`reservation_events=0`） |
+| 2 | 旧格式多轮：`rounds` 只有首轮成功记录（`called=true`），invocation 台账为 `[yes, unknown]`；复盘把首轮记录绑到**最后**的上下文，报 `sent` 且 `delivery_authoritative=true` | 旧格式只接受「任务**最新轮次**且该轮唯一一条 attempt 记录」的 `attempt_id`（并要求 `sent=yes`、`called` 为真、prompt sha 一致）；用轮次而非台账行序判最新（attempt 时间只有秒级，同秒行不可排序）。无绑定时按最新轮的发送状态定级：该轮存在 `unknown` → `send_unknown`，否则 `prepared_only`；历史 invocation 仍完整列出 | `test_legacy_earlier_round_record_never_vouches_for_the_latest_context`（`send_unknown`、非 authoritative、`delivered_evidence={}`、`delivery_rounds=[]`、`metering.invocation_attempts=2`）；dispatch `legacy_latest_unknown_round_not_reported_as_sent`（`projected_delivery_state=send_unknown`、非 authoritative；连跑 10 次结果一致） |
+
+复验命令与结果：
+
+| 命令 | 结果 |
+| --- | --- |
+| sol `dispatch_checks.py`（`PYTHONPATH=.:tests:scripts python3.12 -B <解压目录>/dispatch_checks.py`，仓库根为 cwd） | 2/2 PASS，exit 0（连跑 10 次均一致；脚本为 sol 附件，未提交进仓库） |
+| sol `invariant_checks.py` / `acceptance_edges.py` / `focused_checks.py` / `followup_checks.py` / `process_check.py` | 3/3、6/6、10/10、8/8、2/2 PASS，均 exit 0 |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 54 OK / exit 0 |
+| R22 / R02 / R03 / R17 / R17 role API / R18 / R15 citation / R10 | 9 / 18 / 14 / 12 / 19 / 34 / 5 / 11 OK，均 exit 0 |
+| 相邻 R01 / R14 / R20 / R20 scope / R15 personal / research rounds / fault matrix | 21 / 11 / 8 / 40 / 10 / 10 / 6 OK，均 exit 0 |
+
+边界说明：派发互斥只在**没有 `fcntl` 模块**的平台上退化为进程内锁（与取消一致）；`flock` 存在但失败时 worker 失败关闭、不发新调用。停止判定仍是 worker 本地检查点：跨进程的图互斥与后代清点仍由 `cancel_subtree` 负责。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 未改动，与 KONM-80 无共享文件冲突。

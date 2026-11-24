@@ -106,6 +106,19 @@ class _BudgetExhausted(ResearchWorkerError):
         self.decision = decision
 
 
+class _DispatchCancelled(ResearchWorkerError):
+    """A cancellation was committed before this round's budget reservation.
+
+    Raised from inside the dispatch boundary, after the persistent
+    cancellation state was re-read under the same cross-process lock that
+    cancellation itself takes: the committed order is "cancelled first", so
+    no reservation, invocation row or outbound request may follow."""
+
+    def __init__(self, cancelled_id: str):
+        super().__init__("cancelled before dispatch: {0}".format(cancelled_id))
+        self.cancelled_id = str(cancelled_id)
+
+
 def assert_payload_external_safe(text: str) -> None:
     """Belt-and-braces minimization gate behind the real governance screen."""
 
@@ -720,34 +733,50 @@ def run_research_task(
         # this attempt recorded in ONE transaction, so concurrent workers can
         # never both spend the last slot. The recorded event is the audit
         # trail even when the outcome stays unknown.
+        #
+        # Cancellation takes the SAME cross-process graph lock, so the pair
+        # (persistent cancellation state, reservation + dispatch decision) has
+        # one committed order: either the cancellation committed first and is
+        # re-read here (refused, nothing reserved), or this round's
+        # reservation/dispatch precedes it and the call was legitimately in
+        # flight (the next checkpoint stops the task). A prompt checkpoint that
+        # commits a cancellation between the between-rounds check and this
+        # point therefore cannot let a payer start.
         from .budget_guard import reserve_model_attempt
+        from .subtask_graph import cancelled_ancestor, dispatch_boundary
 
-        reservation = reserve_model_attempt(
-            store, config, task_id, worker_id=worker_id,
-            fencing_token=task["fencing_token"], attempt=attempt)
-        if not reservation.get("reserved"):
-            raise _BudgetExhausted(reservation)
-        from .task_runtime.store import ATTEMPT_FAILED_KNOWN, ATTEMPT_OUTCOME_UNKNOWN, ATTEMPT_SUCCEEDED
+        with dispatch_boundary(store):
+            fresh = store.get_task(task_id)
+            cancelled_in = cancelled_ancestor(store, fresh)
+            if cancelled_in is not None:
+                raise _DispatchCancelled(cancelled_in)
+            reservation = reserve_model_attempt(
+                store, config, task_id, worker_id=worker_id,
+                fencing_token=task["fencing_token"], attempt=attempt)
+            if not reservation.get("reserved"):
+                raise _BudgetExhausted(reservation)
+            from .task_runtime.store import ATTEMPT_FAILED_KNOWN, ATTEMPT_OUTCOME_UNKNOWN, ATTEMPT_SUCCEEDED
 
-        provider_timeout = int(provider.get("timeout") or llm_cfg.get("timeout") or 60)
-        deadline = call_deadline_seconds(
-            provider_timeout=provider_timeout, case_time_limit=case_time_limit,
-            elapsed_seconds=time.perf_counter() - started)
-        if deadline <= 0:
-            # The case budget is exhausted before dispatch: provably not sent,
-            # so this is a safe retryable failure, not an unknown outcome.
-            raise ModelCallNotSent(
-                RuntimeError("case deadline exhausted before model dispatch"),
-                "sent=no stage=preflight")
-        invocation = store.prepare_invocation_attempt(
-            task_id, worker_id=worker_id, fencing_token=task["fencing_token"],
-            round_index=round_index, provider=provider_name,
-            request_model=request_model, prompt_sha256=attempt["prompt_sha256"],
-            budget_event_id=str(reservation.get("event_id") or ""),
-            deadline_seconds=deadline)
-        attempt_id = str(invocation["attempt_id"])
-        store.mark_invocation_dispatched(attempt_id, worker_id=worker_id,
-                                         fencing_token=task["fencing_token"])
+            provider_timeout = int(provider.get("timeout") or llm_cfg.get("timeout") or 60)
+            deadline = call_deadline_seconds(
+                provider_timeout=provider_timeout, case_time_limit=case_time_limit,
+                elapsed_seconds=time.perf_counter() - started)
+            if deadline <= 0:
+                # The case budget is exhausted before dispatch: provably not
+                # sent, so this is a safe retryable failure, not an unknown
+                # outcome.
+                raise ModelCallNotSent(
+                    RuntimeError("case deadline exhausted before model dispatch"),
+                    "sent=no stage=preflight")
+            invocation = store.prepare_invocation_attempt(
+                task_id, worker_id=worker_id, fencing_token=task["fencing_token"],
+                round_index=round_index, provider=provider_name,
+                request_model=request_model, prompt_sha256=attempt["prompt_sha256"],
+                budget_event_id=str(reservation.get("event_id") or ""),
+                deadline_seconds=deadline)
+            attempt_id = str(invocation["attempt_id"])
+            store.mark_invocation_dispatched(attempt_id, worker_id=worker_id,
+                                             fencing_token=task["fencing_token"])
         round_started = time.perf_counter()
         runner = None
         try:
@@ -949,6 +978,18 @@ def run_research_task(
                         model_call["usage"][key] = current + value
                     elif key not in model_call["usage"]:
                         model_call["usage"][key] = value
+            except _DispatchCancelled as exc:
+                # The cancellation was committed before this round reserved or
+                # dispatched anything. Land this worker's own terminal state and
+                # report it as cancelled — never as a retryable failure.
+                stop = _stop_for_cancelled_ancestor(store, store.get_task(task_id),
+                                                    worker_id, model_call)
+                if stop is not None:
+                    return stop
+                model_call["cancelled_by_ancestor"] = str(exc.cancelled_id)
+                model_call["error"] = "task cancelled before dispatch; no outbound permitted"
+                return {"status": "cancelled", "model_call": model_call,
+                        "cancelled_by_ancestor": str(exc.cancelled_id)}
             except _BudgetExhausted as exc:
                 model_call["budget"] = dict(exc.decision)
                 return _blocked(exc.decision.get("reason") or "budget exhausted",

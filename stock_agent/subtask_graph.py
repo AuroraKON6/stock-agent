@@ -494,6 +494,26 @@ def creation_boundary(store: TaskStore,
     return _CreationBoundary(store, require_file_lock=require_file_lock)
 
 
+def dispatch_boundary(store: TaskStore,
+                      *, require_file_lock: bool = False) -> "_CreationBoundary":
+    """Order a model-call's reservation + dispatch against cancellation.
+
+    Cancellation records its request inside ``creation_boundary``, so a worker
+    that re-reads the persistent cancellation state and then writes its budget
+    reservation / invocation row INSIDE the same boundary gets one committed
+    order for the two acts: a cancellation that already committed is seen and
+    the call is refused (nothing reserved, nothing sent), while a round that
+    reserved and marked its attempt dispatched first was legitimately in
+    flight and is stopped at the worker's next checkpoint. Without the shared
+    boundary the worker could pass its last cancellation check, prepare a
+    prompt, and still reserve budget after the cancellation had committed.
+
+    The file lock is optional in the same narrow sense as cancellation: it
+    degrades only where the ``fcntl`` module does not exist, and a lock that
+    exists but errors still fails closed (``graph_lock_unavailable``)."""
+    return _CreationBoundary(store, require_file_lock=require_file_lock)
+
+
 class _CreationBoundary:
     def __init__(self, store: TaskStore, *, require_file_lock: bool = True) -> None:
         self._memory = str(store.db_path) == ":memory:"

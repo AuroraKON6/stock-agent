@@ -178,6 +178,14 @@ def _children(store: TaskStore, parent_id: str) -> List[Dict[str, Any]]:
             if str(item.get("parent_task_id") or "") == str(parent_id)]
 
 
+def _round_index(item: Dict[str, Any]) -> int:
+    """The round an invocation row belongs to (``0`` when absent/unusable)."""
+    try:
+        return int((item or {}).get("round_index") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _delivery_rounds(model_call: Dict[str, Any],
                      attempts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Per-round delivery credentials: context round ↔ invocation attempt.
@@ -224,21 +232,33 @@ def _delivery_rounds(model_call: Dict[str, Any],
         return rounds
     # Legacy/other writers: no per-round context records. Their only
     # self-recorded binding is the attempt id on the round they delivered.
-    # Accept the LAST round's attempt, and only when the worker recorded a
-    # returned call — a requeued task whose new context never left must not
-    # borrow an older lease's ``sent``. Without that evidence the ledger is
-    # still listed (``attempts``) but nothing is bound to this context.
+    # Accept it ONLY when that attempt is the task's LATEST round and the sole
+    # attempt of that round with a recorded send — an earlier round's success
+    # says nothing about the context the worker prepared LAST (a later round
+    # may have gone unknown with no response record at all), and a requeued
+    # task whose new context never left must not borrow an older lease's
+    # ``sent``. Round index is used, not the ledger's row order: attempt times
+    # have second resolution, so same-second rows are not orderable. Without
+    # that evidence the ledger is still listed (``attempts``) but nothing is
+    # bound to this context.
     if attempts:
         records = model_call.get("rounds")
         last_record = (records[-1] if isinstance(records, list) and records
                        and isinstance(records[-1], dict) else {})
         attempt_id = str(last_record.get("attempt_id") or "")
-        if bool(model_call.get("called")) and attempt_id:
-            match = next((item for item in reversed(attempts)
-                          if str(item.get("attempt_id") or "") == attempt_id), None)
-            if match is not None:
-                rounds.append({"round": int(match.get("round_index") or 0),
-                               "context": None, "attempt": match})
+        match = next((item for item in attempts
+                      if str(item.get("attempt_id") or "") == attempt_id), None)
+        latest_round = max(_round_index(item) for item in attempts)
+        at_latest = [item for item in attempts if _round_index(item) == latest_round]
+        recorded_sha = str(last_record.get("prompt_sha256") or "")
+        if (bool(model_call.get("called")) and match is not None
+                and _round_index(match) == latest_round
+                and len(at_latest) == 1
+                and str(at_latest[0].get("sent") or "") == "yes"
+                and (not recorded_sha
+                     or recorded_sha == str(match.get("prompt_sha256") or ""))):
+            rounds.append({"round": latest_round, "context": None,
+                           "attempt": at_latest[0]})
     return rounds
 
 
@@ -293,10 +313,19 @@ def _delivery(payload: Dict[str, Any],
         state, authoritative = "prepared_only", False
     elif attempts:
         # A ledger exists but nothing binds it to the current context (a
-        # legacy record after a requeue, or a run that stopped before any
-        # round). Do not fall back to ``called``: that flag may describe a
-        # previous lease. Unverified = not delivered.
-        state, authoritative = "prepared_only", False
+        # legacy record after a requeue, an earlier round's record, or a run
+        # that stopped before any round). Do not fall back to ``called``. The
+        # LATEST round still says what happened to the latest prepared
+        # context: an ``unknown`` send there stays send_unknown (it may have
+        # reached the provider), anything else is unverified and counts as not
+        # delivered. Round index, not row order — attempt times have second
+        # resolution and same-second rows are not orderable.
+        latest_round = max(_round_index(item) for item in attempts)
+        at_latest = [item for item in attempts if _round_index(item) == latest_round]
+        if any(str(item.get("sent") or "") == "unknown" for item in at_latest):
+            state, authoritative = "send_unknown", False
+        else:
+            state, authoritative = "prepared_only", False
     elif str(model_call.get("replay_source") or ""):
         state, authoritative = "replayed", True
     elif bool(model_call.get("called")):
