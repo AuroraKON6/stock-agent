@@ -230,35 +230,16 @@ def _delivery_rounds(model_call: Dict[str, Any],
                     attempt = candidates[-1] if candidates else None
             rounds.append({"round": index, "context": record, "attempt": attempt})
         return rounds
-    # Legacy/other writers: no per-round context records. Their only
-    # self-recorded binding is the attempt id on the round they delivered.
-    # Accept it ONLY when that attempt is the task's LATEST round and the sole
-    # attempt of that round with a recorded send — an earlier round's success
-    # says nothing about the context the worker prepared LAST (a later round
-    # may have gone unknown with no response record at all), and a requeued
-    # task whose new context never left must not borrow an older lease's
-    # ``sent``. Round index is used, not the ledger's row order: attempt times
-    # have second resolution, so same-second rows are not orderable. Without
-    # that evidence the ledger is still listed (``attempts``) but nothing is
-    # bound to this context.
-    if attempts:
-        records = model_call.get("rounds")
-        last_record = (records[-1] if isinstance(records, list) and records
-                       and isinstance(records[-1], dict) else {})
-        attempt_id = str(last_record.get("attempt_id") or "")
-        match = next((item for item in attempts
-                      if str(item.get("attempt_id") or "") == attempt_id), None)
-        latest_round = max(_round_index(item) for item in attempts)
-        at_latest = [item for item in attempts if _round_index(item) == latest_round]
-        recorded_sha = str(last_record.get("prompt_sha256") or "")
-        if (bool(model_call.get("called")) and match is not None
-                and _round_index(match) == latest_round
-                and len(at_latest) == 1
-                and str(at_latest[0].get("sent") or "") == "yes"
-                and (not recorded_sha
-                     or recorded_sha == str(match.get("prompt_sha256") or ""))):
-            rounds.append({"round": latest_round, "context": None,
-                           "attempt": at_latest[0]})
+    # Legacy/other writers: no per-round context records — and therefore NO
+    # verifiable binding between the context bytes the record carries and any
+    # invocation row. Their round records only name the attempt that returned;
+    # the top-level ``context_delivery``/``outbound_context`` is overwritten on
+    # every round, including a round whose budget was refused before an
+    # attempt row existed. Bounding "the latest round's send" to that record
+    # would therefore attribute a later, never-sent reference set to an earlier
+    # successful send. Nothing is bound here: the ledger stays visible through
+    # ``attempts`` and the caller classifies the context from it, never as
+    # delivered.
     return rounds
 
 

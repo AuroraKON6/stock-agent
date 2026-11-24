@@ -42,7 +42,7 @@ Python 3.12.15，仓库锁定 `pyyaml==6.0.3`。全部在仓库根目录执行�
 | 命令 | 结果 |
 | --- | --- |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22.py` | 9 OK / exit 0 |
-| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 54 OK / exit 0（本单专项，第七轮后） |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 55 OK / exit 0（本单专项，第八轮后） |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17.py` | 12 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17_role_api.py` | 19 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r18.py` | 34 OK / exit 0 |
@@ -279,3 +279,26 @@ sol 在候选 `d0f2468` 上用 `dispatch_checks.py` 复现 2 个反例（exit 1�
 | 相邻 R01 / R14 / R20 / R20 scope / R15 personal / research rounds / fault matrix | 21 / 11 / 8 / 40 / 10 / 10 / 6 OK，均 exit 0 |
 
 边界说明：派发互斥只在**没有 `fcntl` 模块**的平台上退化为进程内锁（与取消一致）；`flock` 存在但失败时 worker 失败关闭、不发新调用。停止判定仍是 worker 本地检查点：跨进程的图互斥与后代清点仍由 `cancel_subtree` 负责。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 未改动，与 KONM-80 无共享文件冲突。
+
+
+## 14. 第八轮复验返工（旧格式上下文与发送记录不可绑定）
+
+sol 在候选 `001d05a` 上用 `legacy_context_check.py` 复现 1 个反例（exit 1）：`872312b` 旧 worker 首轮只投递证据 A 并返回中间结果；第二轮已准备 A、B，但在建立 invocation 前因共享调用预算用尽而停。台账只有首轮一条 invocation，复盘却报 `sent`、`delivery_authoritative=true`，B 进入已投递引用。
+
+| 失败项 | 修复 | 回归 / 证据 |
+| --- | --- | --- |
+| 旧格式没有逐轮上下文记录，`model_call["rounds"]` 只记「返回的那一轮」，而顶层 `context_delivery`/`outbound_context` 每轮都被覆盖（包括预算被拒、没有 attempt 行的那一轮）。把「最新轮的发送」与顶层上下文拼在一起，会把从未发送的引用记成已投递 | 旧格式**一律不做上下文绑定**：`_delivery_rounds` 对无 `context_rounds` 的记录返回空，`_delivery` 只按最新轮的状态定级（该轮有 `unknown` → `send_unknown`，否则 `prepared_only`），已投递引用为空、`authoritative=false`；历史 invocation 仍由 `metering.invocation_attempts`/`invocation_sent` 完整列出。当前格式（逐轮记录 + 显式 `attempt_id`/租约绑定）不受影响 | `test_legacy_budget_denied_round_never_marks_prepared_refs_delivered`（`prepared_only`、`delivered_evidence={}`、`allowed_references=[]`、`metering.invocation_attempts=1`、`invocation_sent=["yes"]`）；sol `legacy_context_check.py`：`prepared_context_ref_counts=[1,2]`、`invocation_rounds=[1]`、`second_reference_projected_delivered=false`、`projected_state=prepared_only`、非 authoritative |
+
+语义变化（已在测试中固定）：旧格式任务不再出现 `sent`+权威引用集；其送达结论只保留在调用台账里。`test_legacy_model_call_never_borrows_a_prior_lease_send` 的正例同步改为 `prepared_only`。
+
+复验命令与结果：
+
+| 命令 | 结果 |
+| --- | --- |
+| sol `legacy_context_check.py`（`PYTHONPATH=.:tests:scripts python3.12 -B <解压目录>/legacy_context_check.py`，仓库根为 cwd） | 1/1 PASS，exit 0（脚本为 sol 附件，未提交进仓库） |
+| sol `recovery_edges.py` / `dispatch_checks.py` / `invariant_checks.py` / `acceptance_edges.py` / `focused_checks.py` / `followup_checks.py` / `process_check.py` | 4/4、2/2、3/3、6/6、10/10、8/8、2/2 PASS，均 exit 0 |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 55 OK / exit 0 |
+| R22 / R02 / R03 / R17 / R17 role API / R18 / R15 citation / R10 | 9 / 18 / 14 / 12 / 19 / 34 / 5 / 11 OK，均 exit 0 |
+| 相邻 R01 / R14 / R20 / R20 scope / R15 personal / research rounds / fault matrix | 21 / 11 / 8 / 40 / 10 / 10 / 6 OK，均 exit 0（R20 scope 另连跑 8 次均 OK） |
+
+边界说明：这是有意的取舍——旧格式没有任何能把「上下文字节」绑到 invocation 行的证据（顶层上下文每轮覆盖、无逐轮哈希），因此宁可把上下文标为仅准备/未核实，也不借一次历史发送把引用记成已投递。新格式的逐轮 `outbound_context_sha256` + 显式 `attempt_id`/租约绑定继续支持 `sent`。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 未改动，与 KONM-80 无共享文件冲突。

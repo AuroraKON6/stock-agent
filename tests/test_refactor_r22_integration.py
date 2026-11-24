@@ -1483,14 +1483,17 @@ class SignoffAndDeliveryTests(R22IntegrationCase):
         self.assertEqual(delivery["delivered"], {})
         self.assertFalse(delivery["authoritative"])
         self.assertEqual(delivery["rounds"], [])
-        # The historical invocation stays visible in the ledger, but a legacy
-        # record that DID return is still bound by its own round attempt id.
+        # The historical invocation stays visible in the ledger, but even a
+        # legacy record that DID return cannot bind its refs: the top-level
+        # context is overwritten every round, so a later budget-denied round's
+        # reference set could be attributed to this send.
         legacy_delivered = dict(legacy_blocked, called=True,
                                 rounds=[{"round": 1, "attempt_id": "att-old-lease"}])
         delivered = _delivery(payload, legacy_delivered, attempts)
-        self.assertEqual(delivered["state"], "sent")
-        self.assertTrue(delivered["authoritative"])
-        self.assertEqual(delivered["rounds"][0]["attempt_id"], "att-old-lease")
+        self.assertEqual(delivered["state"], "prepared_only")
+        self.assertFalse(delivered["authoritative"])
+        self.assertEqual(delivered["delivered"], {})
+        self.assertEqual(delivered["rounds"], [])
 
     def test_legacy_earlier_round_record_never_vouches_for_the_latest_context(self):
         fixture = self.attempt_fixture(
@@ -1537,6 +1540,52 @@ class SignoffAndDeliveryTests(R22IntegrationCase):
         self.assertEqual(row["metering"]["invocation_attempts"], 2,
                          "the historical invocation ledger stays visible")
         self.assertEqual(row["metering"]["invocation_sent"], ["unknown", "yes"])
+
+    def test_legacy_budget_denied_round_never_marks_prepared_refs_delivered(self):
+        fixture = self.attempt_fixture(
+            "test_a07_timeout_after_send_is_unknown_and_never_auto_requeued")
+        store = fixture.store
+        task = fixture.create_live_task()
+        task_id = task["task_id"]
+        token = int(store.get_task(task_id)["fencing_token"])
+        first = store.prepare_invocation_attempt(
+            task_id, worker_id="w-r02", fencing_token=token, round_index=1,
+            provider="stub", request_model="stub", prompt_sha256="a" * 64)
+        store.mark_invocation_dispatched(first["attempt_id"], worker_id="w-r02",
+                                         fencing_token=token)
+        store.complete_invocation_attempt(first["attempt_id"], worker_id="w-r02",
+                                          fencing_token=token, state="succeeded",
+                                          sent="yes")
+        # Round two prepared doc-1 AND doc-2, then hit the shared budget before
+        # an invocation row existed: the ledger holds only round one, but the
+        # legacy record's top-level context is the round-two set.
+        legacy = {
+            "mode": "live", "called": True,
+            "rounds": [{"round": 1, "attempt_id": first["attempt_id"],
+                        "prompt_sha256": "a" * 64}],
+            "context_delivery": {"delivered_evidence": ["doc-1", "doc-2"]},
+            "outbound_context": {"evidence_summaries": {
+                "doc-1": {"summary": "synthetic A", "sha256": "0" * 64},
+                "doc-2": {"summary": "synthetic B", "sha256": "1" * 64}}},
+            "governance": {"gate": "budget", "decision": "denied"},
+            "error": "daily model-call budget exhausted: 1/1 attempts today",
+        }
+        store.mark_blocked(task_id, worker_id="w-r02", fencing_token=token,
+                           error=legacy["error"], model_call=legacy)
+        row = project_review(store, identity=self.identity(),
+                             task_ids=[task_id])["tasks"][0]
+        sources = row["sources"]
+        self.assertEqual(sources["delivery_state"], "prepared_only",
+                         "a context prepared for a refused round was never sent")
+        self.assertFalse(sources["delivery_authoritative"])
+        self.assertEqual(sources["delivered_evidence"], {})
+        self.assertEqual(sources["delivery_rounds"], [])
+        self.assertNotIn("doc-2", sources["allowed_references"],
+                         "the never-sent reference is not a delivered reference")
+        self.assertNotIn("doc-1", sources["allowed_references"])
+        self.assertEqual(row["metering"]["invocation_attempts"], 1,
+                         "the first round's send stays in the call ledger")
+        self.assertEqual(row["metering"]["invocation_sent"], ["yes"])
 
     def test_review_uses_worker_delivery_ledger_not_input_payload(self):
         undelivered = "synthetic-not-in-vault"
