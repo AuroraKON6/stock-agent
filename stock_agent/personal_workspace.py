@@ -34,6 +34,7 @@ from .task_intake import ensure_question_task
 from .task_runtime import TaskStore
 from .task_runtime.store import (
     STATUS_AWAITING_HUMAN,
+    STATUS_CANCELLED,
     STATUS_SUCCEEDED,
     TERMINAL_STATUSES,
     TaskRuntimeError,
@@ -188,12 +189,14 @@ def cancel_personal_task(store: TaskStore, *, actor: str, task_id: str,
     The workspace entry keeps its guards (owner via the session, optimistic
     version, terminal refusal) and delegates the propagation to the graph's
     governed cancellation, so one click cannot leave a child queued after
-    its parent is cancelled. A partially propagated call is resumable with
-    the root's current version."""
+    its parent is cancelled. An ALREADY-cancelled root is not a terminal
+    refusal: the entry accepts it with the row's current version and lets
+    the governed entry finish the interrupted descendant pass (idempotent,
+    one event per descendant). Every other terminal state is still refused."""
     from .subtask_graph import cancel_task_tree  # no module cycle
 
     task = store.get_task(str(task_id or ""))
-    if task["status"] in TERMINAL_STATUSES:
+    if task["status"] in TERMINAL_STATUSES and task["status"] != STATUS_CANCELLED:
         raise WorkspaceError("cancel_terminal: task already finished ({0})".format(task["status"]))
     return cancel_task_tree(
         store, str(task_id), actor=actor,

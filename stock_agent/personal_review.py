@@ -208,14 +208,18 @@ def _delivery_rounds(model_call: Dict[str, Any],
                 index = 0
             attempt = by_id.get(str(record.get("attempt_id") or ""))
             if attempt is None:
-                # No explicit link: accept only an attempt of the SAME round
-                # STARTED after this context was prepared. A previous run's
-                # attempt (even with the same round index) never qualifies.
-                prepared_at = str(record.get("prepared_at") or "")
-                candidates = [item for item in by_round.get(index, [])
-                              if not prepared_at
-                              or str(item.get("started_at") or "") >= prepared_at]
-                attempt = candidates[-1] if candidates else None
+                # No explicit link: require the SAME LEASE. Round index and
+                # second-level time are not identity — a requeued task can
+                # start the same round in the same second under a new fencing
+                # token. A record without lease binding matches nothing.
+                worker_id = str(record.get("worker_id") or "")
+                token = record.get("fencing_token")
+                if worker_id and token is not None:
+                    candidates = [
+                        item for item in by_round.get(index, [])
+                        if str(item.get("worker_id") or "") == worker_id
+                        and int(item.get("fencing_token") or 0) == int(token)]
+                    attempt = candidates[-1] if candidates else None
             rounds.append({"round": index, "context": record, "attempt": attempt})
         return rounds
     # Legacy/other writers: no per-round context records. The ledger alone is

@@ -42,7 +42,7 @@ Python 3.12.15，仓库锁定 `pyyaml==6.0.3`。全部在仓库根目录执行�
 | 命令 | 结果 |
 | --- | --- |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22.py` | 9 OK / exit 0 |
-| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 44 OK / exit 0（本单专项，第四轮后） |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 49 OK / exit 0（本单专项，第五轮后） |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17.py` | 12 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17_role_api.py` | 19 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r18.py` | 34 OK / exit 0 |
@@ -208,3 +208,28 @@ sol 在候选 `872312b` 上用 `acceptance_edges.py` 复现 6 个反例（exit 1
 环境说明：`test_refactor_r15_w10_skeleton.py` 与 `test_summary_review.py` 在本机默认 `TMPDIR`（`/var/folders/...`，`/var` 为符号链接）下因 `evidence_excerpts` 的 reparse-point 守卫报错；`TMPDIR=/private/tmp` 下分别 1 OK / 23 OK（skipped=1）。`test_acceptance_fixes_20260921*.py` 需要未入库的 `config/watchlist.local.json`，导入即失败。以上均与本单改动无关。
 
 边界说明：取消入口统一为 `cancel_task_tree`（workflow service、个人工作台、CLI），根取消仍是 store 的原子授权与版本检查，后代传播在其后、同一持久化边界内完成；根已取消时重复调用只在调用方持有当前版本时继续传播，且每个后代仍只有 1 条取消事件。取消不再要求可用的 `fcntl`（创建仍要求）。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 未改动，与 KONM-80 无共享文件冲突。
+
+
+## 11. 第五轮复验返工（sol 的 4 个补充反例）
+
+sol 在候选 `0d6b485` 上用 `recovery_edges.py` 复现 4 个反例（exit 1）。逐项修复：
+
+| # | 失败项 | 修复 | 回归 / 证据 |
+| --- | --- | --- | --- |
+| 1 | 创建进程持真实 POSIX 锁并暂停在校验与写入之间，仅对取消进程注入 `flock` 错误：取消返回成功、根 `cancelled`，随后持锁进程创建 1 个 `queued` 子任务 | `creation_boundary(require_file_lock=False)` 的退化范围收窄为**仅 `fcntl` 模块不存在**（Windows）：创建在该平台同样被拒，故无跨进程创建者可竞争。`fcntl` 存在而 `flock` 报错时一律 `graph_lock_unavailable` 失败关闭，取消绝不单独越过互斥 | `test_cancel_fails_closed_when_the_file_lock_errors`（取消零事件、根仍 `queued`；创建同样拒绝）；recovery `cancel_lock_failure_does_not_race_a_locked_creator`（`cancel_result=graph_lock_unavailable`、parent=queued）；既有 `single_task_cancel_without_fcntl` 仍 PASS |
+| 2 | 个人工作台部分取消后，以根最新版本从同一入口续跑被 `cancel_terminal` 拒绝，子仍 `leased` | `cancel_personal_task` 只对 `succeeded/failed/blocked/expired` 保持 `cancel_terminal`；根已 `cancelled` 时接受当前版本并交给 `cancel_task_tree` 完成幂等传播 | `test_workspace_entry_resumes_an_interrupted_cancellation`；`test_workspace_cancel_still_refuses_finished_roots`（已完成仍拒绝）；recovery `workspace_entry_resumes_partial_cancellation` |
+| 3 | 受保护恢复成功传播并标记子任务，但恢复凭证的 `used_at` 为空（终态异常把本次核销一并回滚，传播随后独立提交） | 恢复路径在触碰任何后代前，用 `store.claim_principal_verification` 在**独立事务**中核销恢复凭证（失败即 `PrincipalVerificationError`）；同一凭证的 `already_claimed_same_command` 视为首次已提交授权的延续。单命令凭证约束不变 | `test_protected_resume_consumes_its_own_receipt`（两张凭证 `used_at` 均非空）；recovery `protected_recovery_consumes_its_receipt`（`initial/recovery_receipt_consumed=true`） |
+| 4 | 同秒重试：首轮已发送后返回无效 JSON 重排队，重领后预算拦截；唯一 invocation 属旧租约，但复盘仍凭同轮次 + 同秒报 `sent` | `context_rounds` 记录本轮**租约身份**（`worker_id` + `fencing_token`）；复盘仅接受显式 `attempt_id` 或同一 worker + fencing token 的 invocation，删除秒级时间回退；无租约绑定的记录不匹配任何 invocation | `test_same_second_requeue_never_borrows_the_prior_lease_send`（`prepared_only`、`delivered_evidence={}`）；recovery `same_second_retry_never_borrows_prior_send`；上轮 `test_context_round_never_pairs_with_an_earlier_runs_attempt` 仍 PASS |
+
+复验命令与结果：
+
+| 命令 | 结果 |
+| --- | --- |
+| sol `recovery_edges.py`（`PYTHONPATH=.:tests:scripts python3.12 -B <解压目录>/recovery_edges.py`，仓库根为 cwd） | 4/4 PASS，exit 0（脚本为 sol 附件，未提交进仓库） |
+| sol `acceptance_edges.py` / `focused_checks.py` / `followup_checks.py` / `process_check.py` | 6/6、10/10、8/8、2/2 PASS，均 exit 0 |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 49 OK / exit 0 |
+| R22 / R02 / R03 / R17 / R17 role API / R18 / R15 citation / R10 | 9 / 18 / 14 / 12 / 19 / 34 / 5 / 11 OK，均 exit 0 |
+| 相邻 R01 / R14 / R20 / R20 scope / R15 personal / research rounds / fault matrix | 21 / 11 / 8 / 40 / 10 / 10 / 6 OK，均 exit 0 |
+| C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run9 --port 18195`（共享锁内串行） | PASS 53/53，cleanup 残留 0，端口可重绑 |
+
+边界说明：取消只在**没有 `fcntl` 模块**的平台上退化为进程内互斥；`flock` 存在但失败时取消与创建一样失败关闭。受保护恢复要求并提交一条新凭证（或复用首次已提交的同命令凭证），核销与后代传播仍是两次提交：若传播再次失败，需要再签发一张凭证——这是「单命令一凭证」的代价，已在注释中写明。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 未改动。

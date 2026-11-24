@@ -867,6 +867,12 @@ def run_research_task(
             model_call["context_rounds"].append({
                 "round": round_index,
                 "prepared_at": now_iso(),
+                # Lease identity of THIS attempt: the review pairs the context
+                # with an invocation row only when worker + fencing token
+                # match, so a retry after requeue (same round, same second)
+                # can never borrow the previous lease's sending credential.
+                "worker_id": str(worker_id),
+                "fencing_token": int(task.get("fencing_token") or 0),
                 "delivery": delivery,
                 "outbound_context_sha256": hashlib.sha256(
                     json.dumps(safe_context, ensure_ascii=False, sort_keys=True,

@@ -49,6 +49,7 @@ except ImportError:  # pragma: no cover - Windows hosts fall back to the RLock
 from .task_runtime.store import (
     STATUS_CANCELLED,
     TERMINAL_STATUSES,
+    PrincipalVerificationError,
     TaskRuntimeError,
     TaskStore,
     TaskTransitionError,
@@ -478,13 +479,14 @@ def creation_boundary(store: TaskStore,
     processes. If the file lock is unavailable, creation is REFUSED rather
     than run without cross-process mutual exclusion.
 
-    ``require_file_lock=False`` is for CANCELLATION on hosts without a
-    working ``fcntl`` (or when the lock file cannot be opened): the caller
-    still takes the in-process RLock and, on a working platform, the same
-    advisory file lock. Refusing there would make cancellation — the one
-    operation that must always stay available — depend on a lock that no
-    competing creator can obtain either (creation keeps requiring it), so
-    there is no cross-process creator to serialize against.
+    ``require_file_lock=False`` is for CANCELLATION on hosts where the
+    ``fcntl`` MODULE does not exist (Windows). There the in-process RLock is
+    the only lock available to anyone, and creation itself is refused, so no
+    cross-process creator can exist to race. It is deliberately NOT a licence
+    to skip a lock that exists but failed: if ``fcntl`` is importable and
+    ``flock`` errors, another process may hold the lock right now — the
+    caller must fail closed (``graph_lock_unavailable``) rather than proceed
+    alone, or a paused creator could commit a child after the cancellation.
 
     An in-memory store has no file and no cross-process peers, so it uses
     the in-process lock only and never writes a lock sidecar.
@@ -535,11 +537,13 @@ class _CreationBoundary:
                     except OSError as exc:
                         if handle is not None:
                             handle.close()
-                        if not self._require_file_lock:
-                            return None
+                        # NEVER degrade here: the lock module exists, so a
+                        # failure means a real interlock problem (held by a
+                        # creator, or the lock file is unusable). Proceeding
+                        # would let a paused creator commit after us.
                         raise SubtaskGraphError(
                             "graph_lock_unavailable: cannot take the cross-process "
-                            "subtask lock ({0}); refusing to create".format(exc))
+                            "subtask lock ({0}); refusing the graph mutation".format(exc))
                     entry["handle"] = handle
                 entry["depth"] += 1
                 self._file_entry = entry
@@ -647,6 +651,16 @@ def cancel_task_tree(store: TaskStore, task_id: str, *, actor: str, reason: str,
     optimistic token, and only the idempotent descendant pass runs (the
     root is not written or re-emitted). ``_cancel_node`` skips terminal and
     already-requested nodes, so a resumed pass emits no duplicate events.
+
+    On the resume path a protected call must still present a one-command
+    receipt, and that receipt is CONSUMED AND COMMITTED by this call
+    (``claim_principal_verification``) before any descendant is touched.
+    The store's own claim cannot be used here: it lives inside the root
+    transaction that raises on a terminal row, so its claim would roll back
+    — exactly the "recovery mutated children but recorded no consumption"
+    gap. Reusing the already-used FIRST receipt is also accepted: it was
+    committed with the original authorized root cancellation, so the resume
+    is the continuation of that command rather than a new one.
     """
     task_id = str(task_id)
     with creation_boundary(store, require_file_lock=False):
@@ -666,11 +680,39 @@ def cancel_task_tree(store: TaskStore, task_id: str, *, actor: str, reason: str,
                     "expected_version {0} does not match current {1}".format(
                         expected_version, root["version"]))
             # Already cancelled, caller proves it holds the current row: resume.
+            if principal_verification is not None:
+                _authorize_resume(store, principal_verification, task_id=task_id,
+                                  actor=actor)
         # ``cancel_subtree`` re-enters the (reentrant, refcounted) boundary, so
         # the descent itself stays inside the same exclusion.
         cancel_subtree(store, task_id, actor=actor, reason=reason,
                        skip_root=True, require_file_lock=False)
     return store.get_task(task_id)
+
+
+def _authorize_resume(store: TaskStore, principal_verification: Dict[str, Any],
+                      *, task_id: str, actor: str) -> None:
+    """Consume (or accept the committed first use of) the resume receipt.
+
+    A fresh receipt is claimed in its OWN transaction, so the consumption is
+    durable even though the task row is already terminal. A receipt already
+    consumed for THIS task's cancel command is accepted as the original
+    authorization being continued; anything else stays fail-closed."""
+    if not isinstance(principal_verification, dict):
+        raise TaskRuntimeError("principal_verification must be an object")
+    verdict = store.claim_principal_verification(
+        str(principal_verification.get("verification_id") or ""),
+        actor=str(principal_verification.get("actor") or actor),
+        command_id=str(principal_verification.get("command_id") or "cancel:{0}".format(task_id)),
+        task_id=task_id, action="cancel",
+        issued_fallback=principal_verification.get("issued_fallback"))
+    if verdict.get("claimed"):
+        # ``ok`` = fresh receipt consumed in its own committed transaction;
+        # ``already_claimed_same_command`` = the original cancellation's
+        # receipt, already committed — accepted as the same command.
+        return
+    raise PrincipalVerificationError(
+        str(verdict.get("reason") or "principal_verification_required"))
 
 
 def _cancel_subtree_locked(store: TaskStore, root_task_id: str, *, actor: str,

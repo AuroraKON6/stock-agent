@@ -986,11 +986,134 @@ class CancelAndPartialFailureTests(R22IntegrationCase):
         self.assertEqual(
             sum(event["event_type"] == "task_cancelled"
                 for event in self.store.events(child_id)), 1)
+        # A repeated call with the current version is the idempotent resume of
+        # an already-cancelled root: success, and no duplicate child event.
+        again = cancel_personal_task(
+            self.store, actor=OWNER, task_id=root["task_id"],
+            expected_version=cancelled["version"], reason="再次取消")
+        self.assertEqual(again["status"], "cancelled")
+        self.assertEqual(
+            sum(event["event_type"] == "task_cancelled"
+                for event in self.store.events(child_id)), 1,
+            "the resume never duplicates a descendant cancellation")
+        with self.assertRaises(TaskVersionConflictError):
+            cancel_personal_task(self.store, actor=OWNER, task_id=root["task_id"],
+                                 expected_version=0, reason="过期版本")
+
+    def test_workspace_cancel_still_refuses_finished_roots(self):
+        created = create_personal_research(
+            self.store, actor=OWNER, question="个人工作台拒绝已完成任务 600519",
+            symbols=["600519"], execution_mode="replay", config=self.config)
+        root = created["task"]
+        claim = self.store.claim_task(root["task_id"], "finished-worker")
+        self.store.mark_running(root["task_id"], worker_id="finished-worker",
+                                fencing_token=claim["fencing_token"],
+                                expected_version=claim["version"])
+        self.store.complete(root["task_id"], worker_id="finished-worker",
+                            fencing_token=claim["fencing_token"],
+                            output={"summary": "synthetic finished result"})
+        finished = self.store.get_task(root["task_id"])
         with self.assertRaises(WorkspaceError) as caught:
             cancel_personal_task(self.store, actor=OWNER, task_id=root["task_id"],
-                                 expected_version=cancelled["version"], reason="再次取消")
+                                 expected_version=finished["version"])
         self.assertIn("cancel_terminal", str(caught.exception),
-                      "the entry's terminal guard stays in front")
+                      "only a cancelled root is resumable; finished work is not")
+
+    def test_workspace_entry_resumes_an_interrupted_cancellation(self):
+        created = create_personal_research(
+            self.store, actor=OWNER, question="个人工作台恢复取消 600519",
+            symbols=["600519"], execution_mode="replay", config=self.config)
+        root = created["task"]
+        child = propose_subtasks(
+            self.store, parent_task_id=root["task_id"],
+            proposals=[{"role_id": "event_analyst", "question": "个人续跑子任务"}])
+        child_id = child["created"][0]["task_id"]
+        claim = self.store.claim_task(child_id, "resume-worker")
+        original = TaskStore.request_cancel
+        renewals = [0]
+
+        def renew_before_cancel(connection, task_id, **values):
+            if task_id == child_id:
+                renewals[0] += 1
+                self.store.renew_lease(child_id, worker_id="resume-worker",
+                                       fencing_token=claim["fencing_token"])
+            return original(connection, task_id, **values)
+
+        with patch.object(TaskStore, "request_cancel", renew_before_cancel):
+            with self.assertRaises(SubtaskGraphError) as caught:
+                cancel_personal_task(
+                    self.store, actor=OWNER, task_id=root["task_id"],
+                    expected_version=root["version"], reason="用户取消")
+        self.assertIn("cancel_conflict", str(caught.exception))
+        self.assertGreaterEqual(renewals[0], 8)
+        partial_root = self.store.get_task(root["task_id"])
+        self.assertEqual(partial_root["status"], "cancelled")
+        self.assertFalse(self.store.get_task(child_id)["cancel_requested"])
+        resumed = cancel_personal_task(
+            self.store, actor=OWNER, task_id=root["task_id"],
+            expected_version=partial_root["version"], reason="用户取消")
+        self.assertEqual(resumed["status"], "cancelled")
+        child_after = self.store.get_task(child_id)
+        self.assertTrue(child_after["cancel_requested"],
+                        "the workspace entry finishes the interrupted descent")
+        self.assertEqual(
+            sum(event["event_type"] in {"task_cancelled", "task_cancel_requested"}
+                for event in self.store.events(child_id)), 1)
+
+    def test_protected_resume_consumes_its_own_receipt(self):
+        import sqlite3
+        from datetime import datetime, timedelta
+
+        def receipt(label):
+            key = "resume-{0}".format(label)
+            self.store.register_principal_verification(
+                key, actor="operator", task_id=root["task_id"], action="cancel",
+                expires_at=(datetime.now().astimezone()
+                            + timedelta(minutes=5)).isoformat())
+            return {"verification_id": key, "actor": "operator", "action": "cancel",
+                    "command_id": "cancel:{0}".format(root["task_id"])}
+
+        root = self.create_root()
+        child = propose_subtasks(
+            self.store, parent_task_id=root["task_id"],
+            proposals=[{"role_id": "event_analyst", "question": "protected child"}])
+        child_id = child["created"][0]["task_id"]
+        claim = self.store.claim_task(child_id, "protected-worker")
+        original = TaskStore.request_cancel
+        renew = {"on": True}
+
+        def renew_before_cancel(connection, task_id, **values):
+            if task_id == child_id and renew["on"]:
+                self.store.renew_lease(child_id, worker_id="protected-worker",
+                                       fencing_token=claim["fencing_token"])
+            return original(connection, task_id, **values)
+
+        initial, recovery = receipt("initial"), receipt("recovery")
+        with patch.object(TaskStore, "request_cancel", renew_before_cancel):
+            with self.assertRaises(SubtaskGraphError):
+                workflow_cancel_task(
+                    str(self.db_path), root["task_id"], actor="operator",
+                    reason="取消", expected_version=root["version"],
+                    principal_verification=initial)
+        partial_root = self.store.get_task(root["task_id"])
+        self.assertEqual(partial_root["status"], "cancelled")
+        renew["on"] = False
+        resumed = workflow_cancel_task(
+            str(self.db_path), root["task_id"], actor="operator",
+            reason="取消", expected_version=partial_root["version"],
+            principal_verification=recovery)
+        self.assertEqual(resumed["status"], "cancelled")
+        self.assertTrue(self.store.get_task(child_id)["cancel_requested"])
+        with sqlite3.connect(Path(self.db_path).resolve().as_uri() + "?mode=ro",
+                             uri=True) as reader:
+            used = dict(reader.execute(
+                "SELECT verification_id, used_at FROM principal_verifications "
+                "WHERE verification_id IN (?,?)",
+                [initial["verification_id"], recovery["verification_id"]]).fetchall())
+        self.assertTrue(used.get(initial["verification_id"]),
+                        "the first receipt authorized the committed root cancel")
+        self.assertTrue(used.get(recovery["verification_id"]),
+                        "the resume's receipt is consumed and COMMITTED")
 
     def test_single_task_cancel_survives_missing_fcntl(self):
         root = self.create_root()
@@ -1010,6 +1133,32 @@ class CancelAndPartialFailureTests(R22IntegrationCase):
         self.assertEqual(
             sum(event["event_type"] == "task_cancelled"
                 for event in self.store.events(root["task_id"])), 1)
+
+    def test_cancel_fails_closed_when_the_file_lock_errors(self):
+        if subtask_graph.fcntl is None:
+            self.skipTest("this host has no POSIX advisory locking module")
+        root = self.create_root()
+        other = self.create_root()
+        with patch.object(subtask_graph.fcntl, "flock",
+                          side_effect=OSError("synthetic advisory lock failure")):
+            with self.assertRaises(SubtaskGraphError) as cancel_failure:
+                workflow_cancel_task(
+                    str(self.db_path), root["task_id"], actor="operator",
+                    reason="锁错误取消", expected_version=root["version"])
+        self.assertIn("graph_lock_unavailable", str(cancel_failure.exception))
+        self.assertEqual(self.store.get_task(root["task_id"])["status"], "queued",
+                         "cancellation never proceeds without the interlock")
+        self.assertEqual(
+            sum(event["event_type"] in {"task_cancelled", "task_cancel_requested"}
+                for event in self.store.events(root["task_id"])), 0)
+        # Creation keeps its fail-closed behaviour; the module still exists.
+        with patch.object(subtask_graph.fcntl, "flock",
+                          side_effect=OSError("synthetic advisory lock failure")):
+            with self.assertRaises(SubtaskGraphError) as create_failure:
+                propose_subtasks(
+                    self.store, parent_task_id=other["task_id"],
+                    proposals=[{"role_id": "event_analyst", "question": "locked"}])
+        self.assertIn("graph_lock_unavailable", str(create_failure.exception))
 
     def test_partial_step_failure_keeps_sibling_parent_and_audit(self):
         root, flow = self.bound_root()
@@ -1151,6 +1300,44 @@ class SignoffAndDeliveryTests(R22IntegrationCase):
                          "an older run's attempt cannot vouch for a new context")
         self.assertEqual(delivery["delivered"], {})
         self.assertFalse(delivery["authoritative"])
+
+    def test_same_second_requeue_never_borrows_the_prior_lease_send(self):
+        from datetime import datetime
+
+        from stock_agent.model_operations import LLMResponse
+
+        fixture = self.attempt_fixture(
+            "test_a06_not_sent_failure_requeues_within_attempt_budget")
+        fixture.config.setdefault("task_runtime", {})["budget"] = {
+            "daily_model_call_limit": 1}
+        task = fixture.create_live_task()
+        fixed_second = datetime.now().astimezone().isoformat(timespec="seconds")
+        with patch("stock_agent.task_runtime.store._now", return_value=fixed_second), \
+                patch("stock_agent.research_worker.now_iso", return_value=fixed_second), \
+                patch("stock_agent.pi_runtime.call_pi_agent",
+                      return_value=LLMResponse("synthetic invalid JSON",
+                                               {"model": "offline-stub"})) as stub:
+            first = fixture.run_worker(task)
+            again = fixture.store.claim_task(task["task_id"], "w-r02")
+            self.assertTrue(again, "the invalid answer requeues within budget")
+            second = fixture.run_worker(task)
+        attempts = fixture.store.invocation_attempts(task["task_id"])
+        self.assertEqual(len(attempts), 1)
+        self.assertLess(attempts[0]["fencing_token"], again["fencing_token"],
+                        "the only invocation belongs to the PREVIOUS lease")
+        latest = second["model_call"]["context_rounds"][-1]
+        self.assertFalse(latest.get("attempt_id"))
+        self.assertEqual(latest["prepared_at"], attempts[0]["started_at"],
+                         "same round, same second — time is not identity")
+        review = project_review(fixture.store, identity=self.identity(),
+                                task_ids=[task["task_id"]])
+        sources = review["tasks"][0]["sources"]
+        self.assertEqual(sources["delivery_state"], "prepared_only",
+                         "a prior lease's send never vouches for the new context")
+        self.assertEqual(sources["delivered_evidence"], {})
+        self.assertFalse(sources["delivery_authoritative"])
+        self.assertEqual(stub.call_count, 1,
+                         "the budget blocked the second dispatch before any send")
 
     def test_review_uses_worker_delivery_ledger_not_input_payload(self):
         undelivered = "synthetic-not-in-vault"
