@@ -108,10 +108,60 @@ def seed_attempt(store, config: dict, state: str) -> dict:
     return row
 
 
+def seed_personal_evidence(config: dict) -> None:
+    from stock_agent.evidence_excerpts import _document_text, create_excerpt, excerpt_selector
+    from stock_agent.evidence_vault import link_evidence_to_signal
+    from stock_agent.models import AnalyzedSignal, now_iso
+    from stock_agent.personal_evidence import import_personal_document, personal_vault_view
+    from stock_agent.personal_workspace import create_personal_research
+    from stock_agent.research_worker import run_research_task
+    from stock_agent.storage import SignalStore
+
+    owner = r25.EVIDENCE_OWNER
+    url = "https://www.cninfo.com.cn/x?r24-synthetic-fixture"
+    signal_id = "r24-synthetic-filing"
+    with closing(SignalStore(DATA / "stock_agent.sqlite3")) as signals:
+        signals.upsert_many([AnalyzedSignal(
+            signal_id=signal_id, source="manual", source_type="filing", title="R24 合成公告信号",
+            summary="Synthetic filing fixture", url=url, published_at=now_iso(), collected_at=now_iso(),
+            symbols=["600519"], payload={"data_classification": "public"})])
+    incoming = DATA / "incoming" / "r24_synthetic_filing.html"
+    incoming.parent.mkdir()
+    incoming.write_text("<html><body><p>合成公告（非真实披露）：营业收入为 1,234.56 万元。</p></body></html>",
+                        encoding="utf-8")
+    document = import_personal_document(
+        config, owner, str(incoming), source_url=url, title="R24 合成公告（非真实披露）",
+        published_at=now_iso())["document"]
+    view = personal_vault_view(config, owner)
+    link_evidence_to_signal(view, document_id=document["document_id"], signal_id=signal_id,
+                            actor=owner, actor_role="information_analyst", notes="R24 synthetic association")
+    body, _ = _document_text(view, document)
+    start = body.index("营业收入为")
+    selector = excerpt_selector(create_excerpt(
+        view, document["document_id"], start, body.index("。", start) + 1))
+    with closing(r25.open_store()) as store:
+        result = create_personal_research(
+            store, actor=owner, question="核对 R24 合成公告", symbols=["600519"],
+            config=config, fact_selectors=[selector])
+        task_id = result["task"]["task_id"]
+        store.bump_input_version(
+            task_id, actor=owner, reason="Use synthetic replay response",
+            payload_overrides={"replay_response": {
+                "schema_version": "1.0", "task_id": task_id, "summary": "结论",
+                "key_findings": [], "unknowns": [], "evidence_refs": [], "human_questions": [],
+                "model_self_assessed_confidence": 0.3}})
+        require(bool(store.claim_task(task_id, ACTOR)), "Unable to claim personal evidence task")
+        outcome = run_research_task(store, task_id, worker_id=ACTOR, config=config)
+        require(outcome["status"] == "succeeded", f"Personal evidence replay failed: {outcome}")
+    evidence = r25._evidence_checks(str(DATA / DB), DATA, connect=sealed_connection)
+    require(evidence.get("ok"), f"Personal evidence reference check failed: {evidence}")
+    r25.emit({"phase": "seed_personal_evidence", **evidence})
+
+
 def seed() -> int:
     require(not r25.TASKS_DB.exists(), "R24 requires a fresh source volume")
-    require(r25.cmd_seed(0) == 0 and r25.cmd_seed_evidence() == 0,
-            "R25 synthetic source / personal evidence seed failed")
+    require(r25.cmd_seed(0) == 0, "R25 synthetic source seed failed")
+    seed_personal_evidence(r25.load_drill_config())
 
     original = Path("/fixtures") / FLOW_MANIFEST
     version = validate_replay_workflow(original)
@@ -153,11 +203,15 @@ def seed() -> int:
     return 0
 
 
-def snapshot(data: Path) -> dict:
-    db = data / DB
+def sealed_connection(db_path: str | Path) -> sqlite3.Connection:
+    db = Path(db_path)
     wal = db.with_name(db.name + "-wal")
     require(not wal.exists() or not wal.stat().st_size, f"Uncheckpointed database: {db}")
-    with closing(_open_payload_sqlite(db)) as connection:
+    return _open_payload_sqlite(db)
+
+
+def snapshot(data: Path) -> dict:
+    with closing(sealed_connection(data / DB)) as connection:
         connection.row_factory = sqlite3.Row
         return {
             table: [dict(row) for row in connection.execute(
@@ -330,7 +384,7 @@ def compare(bundle: Path, restored: Path, *, raw: bool = False) -> int:
     workflow_restore, workflow_restore_errors = workflow_projection(
         restored / "data", recovered, manifest, restored_config)
     errors = source_errors + restore_errors + workflow_source_errors + workflow_restore_errors
-    r25_exit = r25.cmd_compare(str(DATA / DB), str(restored))
+    r25_exit = r25.cmd_compare(str(DATA / DB), str(restored), connect=sealed_connection)
     ok = (r25_exit == 0 and not differences and not errors and budget_source == budget_restore
           and workflow_source == workflow_restore)
     report = {

@@ -723,7 +723,7 @@ def _ro_connection(db_path: str) -> sqlite3.Connection:
         "file:{0}?mode=ro".format(Path(db_path).resolve()), uri=True)
 
 
-def _evidence_checks(db_path: str, data_root: Path) -> dict:
+def _evidence_checks(db_path: str, data_root: Path, *, connect=_ro_connection) -> dict:
     """Verify the evidence reference chain inside ONE root.
 
     Requires at least one task whose approved_facts carry an excerpt
@@ -733,7 +733,7 @@ def _evidence_checks(db_path: str, data_root: Path) -> dict:
     import hashlib as _hashlib
 
     result: dict = {"present": False}
-    connection = _ro_connection(db_path)
+    connection = connect(db_path)
     try:
         rows = connection.execute(
             "SELECT task_id, input_payload, model_call FROM research_tasks"
@@ -823,13 +823,13 @@ def _evidence_checks(db_path: str, data_root: Path) -> dict:
     return result
 
 
-def cmd_compare(live_db: str, restored_root: str) -> int:
+def cmd_compare(live_db: str, restored_root: str, *, connect=_ro_connection) -> int:
     restored_root_path = Path(restored_root)
     restored_db = str(restored_root_path / "data/task_runtime/tasks.sqlite3")
     live_root = Path(live_db).resolve().parents[1]
 
     def snapshot(db_path: str) -> dict:
-        connection = _ro_connection(db_path)
+        connection = connect(db_path)
         try:
             counts = {}
             for table, _ in TABLES:
@@ -861,8 +861,8 @@ def cmd_compare(live_db: str, restored_root: str) -> int:
                               "differing_columns": sum(differing)})
                 if len(drift) >= 3:
                     break
-    live_evidence = _evidence_checks(live_db, live_root)
-    restored_evidence = _evidence_checks(restored_db, restored_root_path)
+    live_evidence = _evidence_checks(live_db, live_root, connect=connect)
+    restored_evidence = _evidence_checks(restored_db, restored_root_path, connect=connect)
     evidence_ok = bool(live_evidence.get("ok")) and bool(restored_evidence.get("ok"))
     ok = counts_equal and tasks_equal and outbox_equal and evidence_ok
     emit({"phase": "compare", "ok": ok,
