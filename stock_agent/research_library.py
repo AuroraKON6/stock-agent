@@ -247,10 +247,6 @@ def _day_start(day):
     return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
 
 
-def _day_end(day):
-    return _day_start(day + timedelta(days=1)) - timedelta(seconds=1)
-
-
 def _inverted(since, until) -> bool:
     """Whether the window is empty. Two timestamps: plain instant order. A
     calendar date is read in the completion's own offset, so against a
@@ -263,10 +259,13 @@ def _inverted(since, until) -> bool:
         return False
     if isinstance(since, datetime) and isinstance(until, datetime):
         return since > until
+    # A day D in offset X starts at D 00:00 - X and ends just before
+    # D+1 00:00 - X. Over X in [-14h, +14h]: earliest start = D 00:00 - 14h,
+    # latest end = D+1 00:00 + 14h.
     if isinstance(since, datetime):           # until is a date
-        return since > _day_end(until) + timedelta(hours=12)
+        return since >= _day_start(until) + timedelta(days=1, hours=14)
     if isinstance(until, datetime):           # since is a date
-        return _day_start(since) - timedelta(hours=10) > until
+        return _day_start(since) - timedelta(hours=14) > until
     return since > until
 
 
@@ -308,13 +307,14 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
     Historical records that do not name a source (``unrecorded``) recover
     it from what the ledgers can prove. Exactly one namespace ever held the
     bytes: that one authorized them. Held nowhere: judged in the task's own
-    namespace, which fails. Both the shared vault and the owner's namespace
-    hold them: the title the worker recorded as delivered names the copy
-    the report used when exactly one of the two ledgers ever recorded that
-    title. When both did (same title), or no delivered title is on record,
-    and the copies disagree on whether they are still verified, the entry is
-    ``source_unverified`` —
-    excluded by default, kept for the audit view with ``unverified_sources``.
+    namespace, which fails. Both apply: the title the worker recorded as
+    delivered names the copy the report used when exactly one of the two
+    COMPLETE ledgers ever recorded that title. Anywhere the record and the
+    ledgers cannot prove the source — both ledgers recorded that title or
+    neither did, or one ledger cannot be read and verified — the entry is
+    ``source_unverified``: excluded from default retrieval and the timeline
+    as a whole even when a copy still verifies, and kept for the audit view
+    with ``unverified_sources``.
 
     An entry whose evidence fully left its authorizing projection is
     ``evidence_revoked``; one that lost part of it is
@@ -325,27 +325,36 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
     state_cache: Dict[str, tuple] = {}
 
     def namespace_state(owner: str):
-        """(SHAs the namespace HOLDS in any status, SHAs it verifies now, every
-        title its ledger EVER recorded per SHA). ``owner`` empty names the
-        shared vault."""
+        """(ledger provable?, SHAs the namespace HOLDS in any status, SHAs
+        it verifies now, every title its ledger EVER recorded per SHA).
+        ``owner`` empty names the shared vault. ``provable`` is False when
+        the ledger cannot be read and verified: such a namespace proves
+        nothing — neither that it holds a document nor that it never did."""
         if owner not in state_cache:
+            provable, held, live, titles = False, set(), set(), {}
             try:
                 view = config if not owner else personal_vault_view(config, owner)
-                vault = load_evidence_vault(view or {})
-                documents = [document for document in (vault.get("documents") or {}).values()
-                             if isinstance(document, dict) and document.get("sha256")]
-                held = {str(document["sha256"]) for document in documents}
-                titles: Dict[str, set] = {str(document["sha256"]): set() for document in documents}
-                for record in load_hash_chained_jsonl(
-                        project_path(evidence_vault_config(view or {})["events_path"]))["records"]:
-                    if record.get("event_type") in ("evidence_captured", "evidence_quarantined"):
-                        titles.setdefault(str((record.get("payload") or {}).get("sha256")), set()).add(
-                            str((record.get("payload") or {}).get("title") or ""))
-                live = set(verified_evidence_documents(view or {}).keys())
-            except Exception:  # an unresolvable namespace holds and verifies nothing
-                held, live, titles = set(), set(), {}  # type: ignore[assignment]
-            state_cache[owner] = (held, live, titles)
+                ledger = load_hash_chained_jsonl(
+                    project_path(evidence_vault_config(view or {})["events_path"]))
+                if ledger.get("integrity_status") == "OK":
+                    provable = True
+                    for record in ledger.get("records") or []:
+                        if record.get("event_type") in ("evidence_captured", "evidence_quarantined"):
+                            payload = record.get("payload") or {}
+                            titles.setdefault(str(payload.get("sha256")), set()).add(
+                                str(payload.get("title") or ""))
+                    documents = [document for document in
+                                 (load_evidence_vault(view or {}).get("documents") or {}).values()
+                                 if isinstance(document, dict) and document.get("sha256")]
+                    held = {str(document["sha256"]) for document in documents}
+                    live = set(verified_evidence_documents(view or {}).keys())
+            except Exception:  # unreadable: the namespace proves nothing
+                provable, held, live, titles = False, set(), set(), {}
+            state_cache[owner] = (provable, held, live, titles)
         return state_cache[owner]
+
+    def verifies(source, owner):
+        return namespace_state(owner if source == "personal" else "")[2]
 
     checked = []
     for entry in index.get("entries", []):
@@ -353,41 +362,40 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
         personal = entry.get("namespace") == NAMESPACE_PERSONAL
         owner = str(entry.get("owner") or "")
         sources = entry.get("evidence_sources") or {}
-
         titles = entry.get("delivered_titles") or {}
 
-        def judge(sha, _owner=owner, _sources=sources, _personal=personal,
-                  _titles=titles):
+        def judge(sha, _owner=owner, _sources=sources, _personal=personal, _titles=titles):
             source = _sources.get(sha)
             if source not in ("shared", "personal"):
-                # Historical record: recover the source from what the record
-                # and the ledgers can prove. Exactly one namespace ever held
-                # these bytes -> that one authorized them. Held nowhere ->
-                # judged (and failing) in the task's own namespace.
-                namespaces = [("shared", *namespace_state(""))] if not _personal else [
-                    ("shared", *namespace_state("")), ("personal", *namespace_state(_owner))]
-                holders = [state for state in namespaces if sha in state[1]]
-                if len(holders) == 1:
-                    source = holders[0][0]
-                elif not holders:
+                # Historical record without a source marker. Recover the
+                # source only from what the record and COMPLETE ledgers can
+                # prove; anything less needs review and is excluded.
+                namespaces = [("shared", ""), ("personal", _owner)] if _personal else [("shared", "")]
+                states = [{"name": name, "owner": owner_, "provable": state[0], "held": state[1],
+                           "live": state[2], "titles": state[3]}
+                          for name, owner_ in namespaces for state in [namespace_state(owner_)]]
+                provable = [state for state in states if state["provable"]]
+                unprovable = [state for state in states if not state["provable"]]
+                holders = [state for state in provable if sha in state["held"]]
+                if len(provable) == 1 and not unprovable:
+                    source = provable[0]["name"]     # the only namespace that applies
+                elif not unprovable and len(holders) == 1:
+                    source = holders[0]["name"]      # exactly one ledger ever held it
+                elif not unprovable and not holders:
                     source = NAMESPACE_PERSONAL if _personal else NAMESPACE_SHARED
                 else:
-                    # Both hold them: the title the worker delivered is the
-                    # record's own statement of which copy it used. It names
-                    # the copy when exactly one ledger ever recorded it.
+                    # Both apply, or a ledger cannot be consulted. The title
+                    # the worker delivered names the copy only when exactly
+                    # one COMPLETE ledger ever recorded it.
                     delivered = str(_titles.get(sha) or "")
-                    named = [state[0] for state in holders if delivered and delivered in state[3].get(sha, ())]
-                    if len(named) == 1:
-                        source = named[0]
-                    elif all(sha in state[2] for state in holders):
-                        return True, False   # either copy still backs the report
-                    elif not any(sha in state[2] for state in holders):
-                        return False, False  # withdrawn everywhere
-                    else:
-                        # The copies disagree and nothing on record tells
-                        # them apart: needs review, excluded by default.
-                        return False, True
-            return sha in namespace_state(_owner if source == "personal" else "")[1], False
+                    named = [state for state in holders if delivered and delivered in state["titles"].get(sha, ())]
+                    if not unprovable and len(named) == 1:
+                        return sha in named[0]["live"], False
+                    if not unprovable and len(holders) == len(provable) and not any(
+                            sha in state["live"] for state in holders):
+                        return False, False          # withdrawn in every ledger that holds it
+                    return False, True               # cannot be proven: needs review
+            return sha in verifies(source, _owner), False
 
         live, unverified = [], []
         for sha in shas:
@@ -399,11 +407,14 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
         entry = dict(entry)
         entry["live_evidence_shas"] = live
         entry.pop("unverified_sources", None)
-        if shas and not live and not unverified:
-            entry["stale_reason"] = "evidence_revoked"
-        elif unverified:
+        if unverified:
+            # Per the acceptance ruling: a report whose citation source
+            # cannot be proven leaves default retrieval and the timeline as
+            # a whole, whatever else still verifies.
             entry["stale_reason"] = "source_unverified"
             entry["unverified_sources"] = unverified
+        elif shas and not live:
+            entry["stale_reason"] = "evidence_revoked"
         elif len(live) < len(shas):
             entry["stale_reason"] = "evidence_partially_revoked"
         else:

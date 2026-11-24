@@ -588,13 +588,15 @@ class ReportTimeSourceTests(ScopeTestCase):
     def test_personal_original_withdrawal_not_masked_by_later_shared_copy(self):
         document_id, sha, content = self._personal_document(ALICE, self.CONTENT, "个人来源原件")
         self._personal(ALICE, "个人来源研究", document_ids=[document_id])
-        shared_copy = import_document(self.config, self.root, content=content, title="后来的共享副本")
-        self.assertEqual(shared_copy[1], sha)
         cached = build_library_index(self.store)
         entry = cached["entries"][0]
         self.assertEqual(entry["evidence_sources"], {sha: "unrecorded"},
-                         "no delivery record names the source: resolved from the task's namespace")
-        self.assertEqual(self._count(cached, ALICE, "个人来源"), 1)
+                         "no delivery record names the source: recovered from the ledgers")
+        self.assertEqual(self._count(cached, ALICE, "个人来源"), 1, "only the personal ledger ever held it")
+        shared_copy = import_document(self.config, self.root, content=content, title="后来的共享副本")
+        self.assertEqual(shared_copy[1], sha)
+        self.assertEqual(self._count(cached, ALICE, "个人来源"), 0,
+                         "two ledgers now hold the same bytes: the source can no longer be proven")
         self._withdraw(content, personal_vault_view(self.config, ALICE))
         self.assertNotIn(sha, verified_evidence_documents(personal_vault_view(self.config, ALICE)),
                          "the personal original left the owner's deliverable projection")
@@ -647,15 +649,24 @@ class ReportTimeSourceTests(ScopeTestCase):
         document_id, sha, content = self._personal_document(ALICE, "跨版本同字节原件。", "跨版本原件")
         import_document(self.config, self.root, content=content, title="跨版本原件",
                         signal_ids=[], seed_signals=False)
-        self._personal(ALICE, "跨版本研究", document_ids=[document_id])
+        task = self._personal(ALICE, "跨版本研究", document_ids=[document_id])
         cached = build_library_index(self.store)
         entry = [e for e in cached["entries"] if e["question"] == "跨版本研究"][0]
         self.assertEqual((entry["evidence_sources"], entry["delivered_titles"]), ({sha: "unrecorded"}, {}))
-        self.assertEqual(query_library(cached, self.config, ALICE, query="跨版本")["result_count"], 1,
-                         "both copies verified: the report is backed either way")
-        self._withdraw(content)   # the shared original; the personal copy stays
-        result = query_library(cached, self.config, ALICE, query="跨版本")
-        self.assertEqual(result["result_count"], 0, "the source cannot be proven: excluded by default")
+        self._roster([{"actor_id": ALICE, "principal_type": "human", "active": True,
+                       "roles": ["quality_reviewer"], "information_side": "public"}])
+        for step in ("both verify", "shared withdrawn"):
+            if step == "shared withdrawn":
+                self._withdraw(content)   # the shared original; the personal copy stays
+            result = query_library(cached, self.config, ALICE, query="跨版本")
+            audit = query_library(cached, self.config, ALICE, query="跨版本", include_stale=True)
+            self.assertEqual((result["result_count"], audit["result_count"]), (0, 1), step)
+            self.assertEqual([(r["stale_reason"], r["unverified_sources"]) for r in audit["results"]],
+                             [("source_unverified", [sha])], step)
+        # Timeline of that case is excluded too; the case detail stays readable.
+        self.assertEqual(query_library(cached, self.config, ALICE, timeline_of=task["task_id"])["result_count"], 0)
+        self.assertEqual(query_library(cached, self.config, ALICE, timeline_of=task["task_id"],
+                                       include_stale=True)["result_count"], 1)
         self._roster([{"actor_id": ALICE, "principal_type": "human", "active": True,
                        "roles": ["quality_reviewer"], "information_side": "public"}])
         audit = query_library(cached, self.config, ALICE, query="跨版本", include_stale=True)
@@ -668,10 +679,10 @@ class ReportTimeSourceTests(ScopeTestCase):
         self.assertEqual(query_library(build_library_index(self.store), self.config, BOB,
                                        query="仅个人")["result_count"], 1)
 
-    def test_old_record_source_recovered_from_the_delivered_title(self):
+    def _proven_shared_record(self):
         """Both vaults hold the same bytes under different titles; the worker
-        delivered the shared copy. Read as a record WITHOUT the namespace
-        field (previous worker), the delivered title still names the copy."""
+        delivers the shared copy. Read as a record WITHOUT the namespace
+        field (previous worker): the delivered title still names the copy."""
         from stock_agent.evidence_vault import link_evidence_to_signal
         from stock_agent.models import AnalyzedSignal, now_iso
         from stock_agent.storage import SignalStore
@@ -693,6 +704,7 @@ class ReportTimeSourceTests(ScopeTestCase):
                                 signal_id=signal_id, actor="test-evidence-collector",
                                 actor_role="information_analyst")
         task = self._personal(ALICE, "旧记录来源研究", document_ids=[document_id])
+        self.SHARED_SHA = sha
         model_call = dict(task["model_call"])
         self.assertEqual(model_call["context_delivery"]["evidence_namespaces"],
                          {"document:sha256:{0}".format(sha): "shared"})
@@ -701,6 +713,11 @@ class ReportTimeSourceTests(ScopeTestCase):
         self.store._conn.execute("UPDATE research_tasks SET model_call = ? WHERE task_id = ?",
                                  (json.dumps(model_call, ensure_ascii=False), task["task_id"]))
         self.store._conn.commit()
+        return task["task_id"]
+
+    def test_old_record_source_recovered_from_the_delivered_title(self):
+        self._proven_shared_record()
+        sha = self.SHARED_SHA
         cached = build_library_index(self.store)
         entry = cached["entries"][0]
         self.assertEqual(entry["evidence_sources"], {sha: "unrecorded"})
@@ -714,6 +731,28 @@ class ReportTimeSourceTests(ScopeTestCase):
                          "the delivered title names the shared copy: its withdrawal decides")
         self.assertEqual(query_library(cached, self.config, ALICE, query="旧记录来源")["result_count"], 0)
 
+    def test_unreadable_ledger_cannot_be_vouched_for_by_another_copy(self):
+        """The delivered title proves the shared copy. The shared ledger then
+        fails integrity while the personal copy still verifies: the source is
+        no longer provable and the personal copy cannot vouch for it."""
+        task_id = self._proven_shared_record()
+        cached = build_library_index(self.store)
+        self._withdraw(self.CONTENT)
+        self.assertEqual(query_library(cached, self.config, ALICE, query="旧记录来源")["result_count"], 0)
+        self._roster([{"actor_id": ALICE, "principal_type": "human", "active": True,
+                       "roles": ["quality_reviewer"], "information_side": "public"}])
+        self.assertEqual([r["stale_reason"] for r in query_library(
+            cached, self.config, ALICE, query="旧记录来源", include_stale=True)["results"]],
+            ["evidence_revoked"])
+        ledger = Path(self.config["official_evidence_vault"]["events_path"])
+        ledger.write_text(ledger.read_text(encoding="utf-8")
+                          + '{"schema_version":"1.0","event_type":"evidence_captured"}\n', encoding="utf-8")
+        for index in (cached, build_library_index(self.store)):
+            self.assertEqual(query_library(index, self.config, ALICE, query="旧记录来源")["result_count"], 0)
+            audit = query_library(index, self.config, ALICE, query="旧记录来源", include_stale=True)
+            self.assertEqual([(r["stale_reason"], r.get("unverified_sources")) for r in audit["results"]],
+                             [("source_unverified", [self.SHARED_SHA])])
+
     def test_historical_record_without_source_fails_closed(self):
         sha = "c" * 64
         index = {"schema_version": LIBRARY_SCHEMA, "entry_count": 1, "entries": [
@@ -726,6 +765,39 @@ class ReportTimeSourceTests(ScopeTestCase):
         self.assertEqual(stale["audit_granted"], False)
         annotated = annotate_revocation(index, self.config)
         self.assertEqual(annotated["entries"][0]["stale_reason"], "evidence_revoked")
+
+
+class MixedWindowBoundaryTests(unittest.TestCase):
+    """The mixed-granularity rule uses one offset range, UTC-14..+14, on
+    both sides: a legal window at either edge is accepted."""
+
+    @staticmethod
+    def _query(completed_at, since, until):
+        class Store:
+            input_owner_binding = staticmethod(lambda task_id: None)
+
+            @staticmethod
+            def list_tasks():
+                return [{"task_id": "task-x", "status": "succeeded", "updated_at": completed_at,
+                         "input_payload": {"research_question": "边界研究", "symbols": []}, "output": {}}]
+
+        config = {"official_evidence_vault": {"enabled": False}}
+        with project_path_override(lambda value: Path(value)):
+            return query_library(build_library_index(Store()), config, "anyone",
+                                 since=since, until=until)
+
+    def test_legal_windows_at_both_offset_edges(self):
+        early = self._query("2026-10-01T00:30:00+14:00", "2026-10-01", "2026-09-30T11:00:00Z")
+        self.assertEqual(early["result_count"], 1)
+        self.assertEqual((early["filters"]["since"], early["filters"]["until"]),
+                         ("2026-10-01", "2026-09-30T11:00:00Z"))
+        late = self._query("2026-10-01T23:30:00-14:00", "2026-10-02T13:00:00Z", "2026-10-01")
+        self.assertEqual(late["result_count"], 1)
+        # The same mixed windows stop matching one second short of the completion.
+        self.assertEqual(self._query("2026-10-01T00:30:00+14:00", "2026-10-01",
+                                     "2026-09-30T10:29:59Z")["result_count"], 0)
+        self.assertEqual(self._query("2026-10-01T23:30:00-14:00", "2026-10-02T13:30:01Z",
+                                     "2026-10-01")["result_count"], 0)
 
 
 class OrderingTests(unittest.TestCase):
