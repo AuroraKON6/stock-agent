@@ -490,7 +490,7 @@ class LibraryHttpTests(ScopeTestCase):
         # detail route, and its digest recomputes from the preserved report.
         identity_fields = ("report_version", "report_sha256", "report_schema_version")
         for row in body["results"]:
-            status, detail = self._request("/api/v1/tasks/" + row["task_id"])
+            status, detail = self._request("/api/v1/tasks/" + row["task_id"], cookie)
             self.assertEqual(status, 200)
             self.assertEqual({k: detail["report_version"][k] for k in identity_fields},
                              {k: row[k] for k in identity_fields})

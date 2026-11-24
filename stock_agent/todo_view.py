@@ -28,13 +28,21 @@ def _age_minutes(updated_at: str, now: Optional[datetime] = None) -> int:
 
 
 def build_todo_view(config: Dict[str, Any], *, store: Optional[Any] = None,
-                    now: Optional[datetime] = None) -> Dict[str, Any]:
+                    now: Optional[datetime] = None,
+                    actor: Optional[str] = None) -> Dict[str, Any]:
     from .models import now_iso
 
     awaiting: list = []
     blocked: list = []
+    visible_ids: Optional[set] = None
+    if store is not None and actor is not None:
+        from .personal_evidence import visible_task_ids
+
+        visible_ids = visible_task_ids(store, actor)
     if store is not None:
         for task in store.list_tasks(status="awaiting_human"):
+            if visible_ids is not None and str(task.get("task_id") or "") not in visible_ids:
+                continue
             request = task.get("human_request") if isinstance(task.get("human_request"), dict) else {}
             awaiting.append({
                 "task_id": str(task.get("task_id") or ""),
@@ -48,6 +56,8 @@ def build_todo_view(config: Dict[str, Any], *, store: Optional[Any] = None,
         awaiting.sort(key=lambda item: item["updated_at"])  # oldest first
 
         for task in store.list_tasks(status="blocked"):
+            if visible_ids is not None and str(task.get("task_id") or "") not in visible_ids:
+                continue
             blocked.append({
                 "task_id": str(task.get("task_id") or ""),
                 "title": str(task.get("title") or ""),

@@ -47,6 +47,15 @@ class WorkspaceError(ValueError):
     invalid_fact_selector, empty_note, already_acknowledged"""
 
 
+class WorkspaceForbidden(WorkspaceError):
+    """The session principal is not the owner of the targeted personal task.
+
+    Raised BEFORE any create/mutate work so a denied request leaves the task
+    store, input bindings, queue and model dispatch byte-for-byte unchanged.
+    Shared research (no trusted personal binding) stays available to every
+    signed-in principal — the documented legacy compatibility path."""
+
+
 # Same cap the R13 fact bundle enforces; the entry rejects instead of letting
 # the bundle silently truncate a user's selection.
 MAX_CREATE_FACT_SELECTORS = 50
@@ -173,6 +182,19 @@ def create_personal_research(store: TaskStore, *, actor: str, question: str,
         # business input can never write it, and a deduplicated retry keeps
         # the original task's binding.
         input_owner_binding={"owner": actor, "via": PERSONAL_ORIGIN_VIA})
+    if str(result.get("status") or "") == "DUPLICATE":
+        # Question identity is global (question + scope + mode), so a matching
+        # case may already belong to another personal owner. Never hand that
+        # task back: the duplicate submission is a read of someone else's case.
+        # The DUPLICATE branch writes no new task/binding/queue row, so the
+        # refusal leaves the store exactly as it was.
+        from .personal_evidence import task_personal_owner
+
+        existing = result.get("task") or {}
+        existing_owner = task_personal_owner(store, str(existing.get("task_id") or ""))
+        if existing_owner and existing_owner != str(actor or "").strip():
+            raise WorkspaceForbidden(
+                "not_owner: the matching case belongs to another principal")
     if str(result.get("status") or "") == "RECORDED":
         if attachments:
             result["documents_attached"] = len(attachments)
@@ -217,8 +239,20 @@ def rerun_completed_research(store: TaskStore, *, actor: str, task_id: str,
 
     The ORIGINAL task keeps its terminal state and output; the rerun is a NEW
     business intent (uuid minted by the intake) whose origin links
-    prior_task_id + as_of, so the case page can show both versions."""
+    prior_task_id + as_of, so the case page can show both versions.
+
+    Write ownership: only the session principal the original task's trusted
+    input binding names may re-research it. The check runs before the intake,
+    so a denied rerun creates no task, no binding, no queued row and triggers
+    no model dispatch. Shared research (no personal binding) remains
+    rerunnable — the compatibility path for generic/pipeline/historical
+    tasks, whose content is already visible to signed-in principals."""
     task = store.get_task(str(task_id or ""))
+    from .personal_evidence import task_personal_owner
+
+    owner = task_personal_owner(store, str(task["task_id"]))
+    if owner and owner != str(actor or "").strip():
+        raise WorkspaceForbidden("not_owner: the original case belongs to another principal")
     payload = task.get("input_payload") or {}
     question = str(payload.get("research_question") or "").strip()
     symbols = [str(s).strip() for s in (payload.get("symbols") or []) if str(s).strip()]
