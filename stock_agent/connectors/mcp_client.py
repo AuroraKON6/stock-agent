@@ -108,6 +108,12 @@ class MCPClient:
                                          destination=destination)
 
     def _rpc(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        policy = self.policy
+        # A81: a revoked connector sends ZERO JSON-RPC — this includes the
+        # constructor's initialize, so a pre-revoked client never handshakes.
+        if policy.revoked:
+            raise PolicyViolation(
+                "connector_revoked: {0}".format(policy.connector_id))
         self._request_id += 1
         request: Dict[str, Any] = {"jsonrpc": "2.0", "id": self._request_id,
                                    "method": method}
@@ -198,9 +204,33 @@ class MCPClient:
                 raise MCPToolError(
                     "result_malformed: content[{0}].type {1!r} not allowed".format(
                         index, ctype))
-            if ctype == "text" and not isinstance(item.get("text"), str):
-                raise MCPToolError(
-                    "result_malformed: content[{0}].text must be a string".format(index))
+            if ctype == "text":
+                if not isinstance(item.get("text"), str):
+                    raise MCPToolError(
+                        "result_malformed: content[{0}].text must be a string".format(
+                            index))
+            elif ctype == "image":
+                data = item.get("data")
+                mime = item.get("mimeType")
+                if not isinstance(data, str) or not data.strip():
+                    raise MCPToolError(
+                        "result_malformed: content[{0}].data must be a non-empty "
+                        "string".format(index))
+                if not isinstance(mime, str) or not mime.strip():
+                    raise MCPToolError(
+                        "result_malformed: content[{0}].mimeType must be a "
+                        "non-empty string".format(index))
+            elif ctype == "resource":
+                resource = item.get("resource")
+                if not isinstance(resource, dict):
+                    raise MCPToolError(
+                        "result_malformed: content[{0}].resource must be an "
+                        "object".format(index))
+                uri = resource.get("uri")
+                if not isinstance(uri, str) or not uri.strip():
+                    raise MCPToolError(
+                        "result_malformed: content[{0}].resource.uri must be a "
+                        "non-empty string".format(index))
         return {"tool": tool, "content": content, "is_error": bool(result.get("isError")),
                 # A85 note: text items are returned verbatim as DATA — nothing
                 # here interprets instructions inside tool output.

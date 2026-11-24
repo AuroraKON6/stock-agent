@@ -68,7 +68,8 @@ def http_manifest(**overrides):
 
 def http_credential(**overrides):
     entry = {"connector_id": "httpq", "audience": "https://api.example.com",
-             "token": "test-connector-token"}
+             "token": "test-connector-token",
+             "destination": "https://api.example.com"}
     entry.update(overrides)
     return ConnectorCredential(**entry)
 
@@ -161,6 +162,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(presentation["connector_id"], "httpq")
         self.assertEqual(presentation["audience"], "https://api.example.com")
         self.assertEqual(presentation["authorization"], "Bearer test-connector-token")
+        self.assertEqual(presentation["destination"], "https://api.example.com")
         with self.assertRaises(PolicyViolation) as missing:
             bind_connector_credential(policy, None)
         self.assertIn("credential_not_bound", str(missing.exception))
@@ -177,8 +179,14 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("credential_expired", str(expired.exception))
         with self.assertRaises(PolicyViolation) as destination:
             bind_connector_credential(
-                policy, good, destination="https://evil.example/x")
+                policy, http_credential(destination="https://attacker.example"),
+                destination="https://api.example.com")
         self.assertIn("credential_destination_mismatch", str(destination.exception))
+        with self.assertRaises(PolicyViolation) as unbound:
+            bind_connector_credential(
+                policy, http_credential(destination=""),
+                destination="https://api.example.com")
+        self.assertIn("credential_destination_mismatch", str(unbound.exception))
         self.assertNotIn("test-connector-token", repr(good))
         self.assertIn("<redacted>", repr(good))
 
@@ -289,6 +297,12 @@ class MCPClientTests(unittest.TestCase):
             {"content": [{"type": "text", "text": 7}]},
             {"content": [{"type": "unsupported"}]},
             {"content": [{"not_type": "x"}]},
+            {"content": [{"type": "image"}]},
+            {"content": [{"type": "image", "data": "AA=="}]},
+            {"content": [{"type": "image", "data": "", "mimeType": "image/png"}]},
+            {"content": [{"type": "resource"}]},
+            {"content": [{"type": "resource", "resource": {}}]},
+            {"content": [{"type": "resource", "resource": {"uri": ""}}]},
             "not-an-object",
         )
         for result in cases:
@@ -369,6 +383,16 @@ class MCPClientTests(unittest.TestCase):
         with self.assertRaises(MCPToolError) as caught:
             over_client.call_tool("get_quote", {})
         self.assertIn("result_too_large", str(caught.exception))
+
+    def test_a81_pre_revoked_client_sends_zero_rpc(self):
+        transport = MemoryMCPTransport({"get_quote": {}})
+        with self.assertRaises(PolicyViolation) as caught:
+            MCPClient(ConnectorPolicy.from_manifest(manifest(revoked=True)),
+                      transport, credential=connector_credential())
+        self.assertIn("connector_revoked", str(caught.exception))
+        self.assertEqual(transport.auth_presentations, [],
+                         "no initialize was sent for a pre-revoked connector")
+        self.assertEqual(transport.calls, [])
 
     def test_a80_protocol_version_mismatch_fails_handshake(self):
         class BadVersion:
@@ -509,6 +533,20 @@ class HTTPConnectorTests(unittest.TestCase):
         transport = RecordingTransport(body=json.dumps({"ok": True}).encode())
         connector = self._connector(transport=transport)
         self.assertEqual(connector.post({}), {"ok": True})
+
+    def test_f2_stale_credential_after_destination_change_zero_sends(self):
+        holder = {"policy": self._policy()}
+        transport = RecordingTransport()
+        connector = HTTPConnector(lambda: holder["policy"], transport,
+                                  public_resolver, lambda: http_credential())
+        # Trusted config moves the connector to a new public origin; the old
+        # credential is still bound to the old origin and must be refused.
+        holder["policy"] = ConnectorPolicy.from_manifest(http_manifest(
+            endpoint="https://other.example.com"))
+        with self.assertRaises(PolicyViolation) as caught:
+            connector.post({"q": 1})
+        self.assertIn("credential_destination_mismatch", str(caught.exception))
+        self.assertEqual(transport.calls, [], "nothing was sent to the new origin")
 
     def test_a81_live_revocation_http_same_instance(self):
         with tempfile.TemporaryDirectory() as tmp:

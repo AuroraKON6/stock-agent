@@ -64,18 +64,22 @@ def _parse_expiry(value: str) -> Optional[datetime]:
 @dataclass(frozen=True)
 class ConnectorCredential:
     """A82: the connector's OWN credential, bound by trusted config to one
-    connector id and one audience. Never caller-supplied. ``token`` is
-    redacted from repr so it cannot leak into logs."""
+    connector id, one audience and one approved destination origin. Never
+    caller-supplied. ``token`` is redacted from repr so it cannot leak into
+    logs. ``destination`` is an independent binding from the policy document:
+    swapping the policy endpoint cannot make an old credential usable."""
 
     connector_id: str
     audience: str
     token: str = field(repr=False)
+    destination: str = ""
     expires_at: str = ""
 
     def __repr__(self) -> str:
         return ("ConnectorCredential(connector_id={0!r}, audience={1!r}, "
-                "token=<redacted>, expires_at={2!r})").format(
-                    self.connector_id, self.audience, self.expires_at)
+                "token=<redacted>, destination={2!r}, expires_at={3!r})").format(
+                    self.connector_id, self.audience, self.destination,
+                    self.expires_at)
 
 
 def bind_connector_credential(policy: "ConnectorPolicy",
@@ -83,8 +87,8 @@ def bind_connector_credential(policy: "ConnectorPolicy",
                               destination: str = "") -> Dict[str, str]:
     """A82: adjudicate the connector identity BEFORE any bytes move. The
     credential must be the trusted-config credential for THIS connector and
-    THIS audience, unexpired, and (when given) for the approved destination.
-    Returns the presentation handed to the transport adapter."""
+    THIS audience, unexpired, and bound to the approved destination given for
+    this request. Returns the presentation handed to the transport adapter."""
     if not isinstance(credential, ConnectorCredential):
         raise PolicyViolation(
             "credential_not_bound: connector identity missing or not a "
@@ -105,13 +109,24 @@ def bind_connector_credential(policy: "ConnectorPolicy",
             "credential_expired: connector credential expired at {0}".format(
                 credential.expires_at))
     if destination:
+        approved = str(credential.destination or "").strip()
+        if not approved:
+            raise PolicyViolation(
+                "credential_destination_mismatch: credential has no approved "
+                "destination binding")
+        if _origin(approved) != _origin(destination):
+            raise PolicyViolation(
+                "credential_destination_mismatch: credential approved for {0}, "
+                "request goes to {1}".format(_origin(approved), _origin(destination)))
         if _origin(destination) != _origin(policy.endpoint):
             raise PolicyViolation(
-                "credential_destination_mismatch: credential for {0} cannot be "
-                "used at {1}".format(_origin(policy.endpoint), _origin(destination)))
+                "credential_destination_mismatch: request destination {0} is not "
+                "the policy endpoint {1}".format(
+                    _origin(destination), _origin(policy.endpoint)))
     return {
         "connector_id": policy.connector_id,
         "audience": str(policy.token_audience or ""),
+        "destination": _origin(destination) if destination else "",
         "authorization": "Bearer {0}".format(credential.token),
     }
 
