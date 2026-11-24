@@ -4,7 +4,7 @@
 （[REFACTOR_R23_20261023.md](REFACTOR_R23_20261023.md)），基线 `dc8a4cffd51663c0b4f1c67b1f5c03d7f3422071`。
 全部输入为合成案件；真实供应商、真实外发、R18 真传输、生产告警接收均为 `NOT_RUN`。
 
-本文件描述第 3 轮（sol 第二轮校验返工后）的行为。前两轮缺陷及对应改动见 §6。
+本文件描述第 4 轮（sol 第三轮校验返工后）的行为。前三轮缺陷及对应改动见 §6。
 
 ## 1. 结论一览
 
@@ -20,14 +20,14 @@
 - `stock_agent/observability.py`（追加；`build_observability_status` 的键不变，`technical.scope`、
   `label_note` 为新增键）：`build_trace`、`build_reconciliation`、`build_metrics`、
   `build_alert_candidates`、`emit_observability_log`、`project_log_fields`、`observability_settings`、
-  `read_query_ledgers`、`queries_for_task`、`aggregate_attempts`、`event_type_counts`、`error_code`、
-  `safe_label`、`build_observability_report`。
+  `read_query_ledgers`、`queries_for_task`、`aggregate_attempts`、`provider_counts`、`event_type_counts`、`error_code`、
+  `safe_label`、`correlation`、`project_value`、`build_observability_report`。
 - `stock_agent/research_worker.py`：`run_research_task` 成为薄封装，正常入口结束时上送一条结构化记录；
   原函数体改名 `_run_research_task`，逻辑未动。
 - `stock_agent/ops_view.py`：`recent_failures[].error` 由错误原文改为稳定错误码。
 - `stock_agent/cli.py`：只读子命令 `observability`（`read_only=True` 开库，库不存在时拒绝、不创建）。
 - `scripts/r23_observability_drill.py`、`deploy/testing/r23_observability.compose.yaml`：容器演练。
-- `tests/test_refactor_r23_trace.py`：44 项定向用例，与容器演练共用同一冻结合成案例。
+- `tests/test_refactor_r23_trace.py`：57 项定向用例，与容器演练共用同一冻结合成案例。
 - `tests/test_ops_view.py`：`recent_failures` 排序用例改为断言错误码（见 §6 第 2 项）。
 
 未改 TaskStore、预算、采纳或 worker 状态流。`aggregate_attempts` / `event_type_counts` 通过
@@ -56,17 +56,35 @@
 - **不抽样。** attempt 五态、供应商计数、待对账数和 outbox 事件类型计数都是全量聚合。
 - **一份报告一次账本读数。** 整份报告在一个 SQLite 只读快照里构建（`BEGIN` … `ROLLBACK`，不写任何东西），
   attempt 只聚合一次并由状态与各节共用。写入方在报告中途提交，不会让同一报告里的两节对不上。
-- **外部关联值只以安全标签出现。** 平台 run ID、provider / 模型名、来源 ID 这类值由外部输入，
-  Dify 入口接受一句话当 run ID，provider 名也可以长得像密钥。凡不是合规标识符或带凭据形态的值，
-  一律输出 `sha256:` 加 16 位十六进制的稳定摘要；明细（trace 的 attempt）与聚合（`by_provider`）
-  用同一个标签函数，计数可对账。
-- **查询账本解析失败不等于空账本。** JSONL 非空但没有一条能解析 → `unreadable`；部分行坏 →
-  `partially_unreadable`。两者都算不可用：告警观测值为 `unknown`、结果计数为空、
-  `data_query_ledger` 进 `unknown_items`。只有真正零行的文件才是 `readable_empty`。
+- **查询账本解析失败不等于空账本。** JSONL 非空但没有一条是受支持的账本记录 → `unreadable`；部分行不是 →
+  `partially_unreadable`。受支持的记录即 Kimi adapter 写的三种：`query_intent`、`query_result`（都要有
+  `request_id`）、`consumed`（要有 `artifact_id`）；语法有效但不是这三种的对象（`{}`、数组、未知类型）不算
+  证据。两者都算不可用：告警观测值为 `unknown`、结果计数为空、`data_query_ledger` 进 `unknown_items`。
+  只有真正零行的文件才是 `readable_empty`。
+- **按字段来源投影关联值。** 视图里每个字符串按所在字段决定能否原样输出：
+  - 系统生成的行标识（`task_` / `att_` / `evt_` + 16 位十六进制）和引用（`qi_` + 16 位、`kq_` + 32 位）
+    符合格式才原样保留，否则换成关联值；
+  - 业务身份（`case_id`、`business_intent_id`）在角色入口对 case id 使用的标识符约束内保留，超出约束
+    （句子、凭据形态）换成关联值；
+  - 外部来源的标签（平台 run ID、provider / 模型名、worker、来源等）只在具有结构化标识符形态时保留：
+    UUID、纯数字、或以 `. _ : -` 分隔的小写段。单个词没有结构可校验，只有已知集合能核实它时才保留
+    （provider 注册表已激活的 provider、任务库已知的平台名）；其余换成 `sha256:` 加 16 位十六进制的稳定关联值；
+  - 其余字段（状态、时间戳等）走标识符形态校验。
+
+  同一个值总是映射到同一个关联值，同一运行的两次读取仍能关联。明细与聚合同一标签，计数可对账。
+- **这份约束的边界。** 格式校验分辨不出本身就长得像合法标识符的令牌。带分隔符的小写令牌
+  （例如 `sol-opaque-value-20261125`）填进 run ID 仍会原样显示；`case_id` / `business_intent_id` 里任何符合
+  标识符约束的令牌也会显示，因为业务身份必须保持可读才能关联。要让这两类也彻底不外显，只能一律换成关联值，
+  代价是业务身份不可读。
+- **`by_provider` 的口径。** 它按 attempt 行记录的 provider 标签归类计数，只说明「配置的提供商标签」，
+  不是供应商被访问的证据。演练用内存桩调用，这一项照样有数。真实供应商用量在 `usage.real_supplier`，
+  保持 `unknown`。
+- **查询 intake 一次读取。** 结构、意图、消费在读连接的同一个读事务里读取，绑定总能解析到同一份快照里的
+  意图。sidecar 判定和实际打开用同一个解析后的真实路径，经符号链接访问时不会按别名的 sidecar 误判。
 - **读 intake 不创建文件。** 没有 pending WAL 的 intake 以 `immutable` 只读打开（只读挂载同样可用，
-  不会生成 `-wal` / `-shm`）。有 pending WAL 的 intake 需要普通只读打开才能看到已提交记录；若做不到
-  （例如只读挂载上没有共享内存文件），回退到主文件并置 `intake_wal_pending=true`、
-  `query_consumption_binding_wal_pending` 进 `unknown_items`。
+  不会生成 `-wal` / `-shm`）。读完若发现 WAL 出现了，这次读取作废，改用普通只读打开重读。有 pending WAL 的
+  intake 需要普通只读打开才能看到已提交记录；若做不到（例如只读挂载上没有共享内存文件），回退到主文件并置
+  `intake_wal_pending=true`、`query_consumption_binding_wal_pending` 进 `unknown_items`。
 - **阈值拒收非有限值。** `NaN` / `Infinity` 使告警能力关闭、配置标无效，报告可被严格 JSON 解析。
 - **用量三分列。** `ledger`（预算账本与五态 attempt）、`replay`（回放模式任务数）、`estimated` 与
   `real_supplier` 一律 `unknown`——仓库没有估算账本，也没有供应商回执，不编造数字。
@@ -137,3 +155,13 @@ $C down --volumes --remove-orphans
 | 2 | 写入方在报告中途提交，五态总计 0、供应商总计 1 | 整份报告一个只读快照；attempt 只聚合一次 | 演练 `boundary.commit.*`；`test_commit_during_a_report_does_not_mix_aggregate_reads` |
 | 3 | 坏 JSONL 被当成空账本；读已关闭的 WAL intake 留下 `-wal` / `-shm` | 解析失败与空账本分开，不完整计量为未知；无 pending WAL 用 `immutable` 打开，有则普通只读打开 | 演练 `boundary.ledger.*`、`boundary.intake.*`、容器 `rointake`；`BoundaryTests` |
 | 4 | `NaN` 阈值通过校验 | 拒收非有限值 | 演练 `boundary.config.nan` / `.inf`；`test_non_finite_thresholds_fail_closed_and_keep_strict_json` |
+
+### 第 3 轮（sol 第三轮校验，`2f91715`）
+
+| # | 缺陷 | 改动 | 新证据 |
+| --- | --- | --- | --- |
+| 5 | 经符号链接读活跃 WAL 漏掉已提交绑定 | sidecar 判定与打开用同一真实路径；读后复查 WAL | 演练 `boundary.intake.symlink_live_wal`；`test_symlink_to_a_live_intake_sees_the_committed_binding` |
+| 6 | 意图与消费可能来自不同快照 | 读连接上同一读事务 | 演练 `boundary.intake.*`；`test_intents_and_consumptions_come_from_one_snapshot` |
+| 7 | `{}` 这样的非账本记录被当成有效的零 | 校验记录类型和必要字段 | 演练 `boundary.ledger.non_record.*`；`test_object_that_is_not_a_ledger_record_is_not_evidence` |
+| 8 | 不带前缀的令牌经 run ID 出现在报告 | 按字段来源与可验证约束投影（见 §3） | 演练 `boundary.label.opaque_token_*`；`ProjectionRuleTests`、`test_opaque_token_as_run_id_through_the_dify_http_entry` |
+| 9 | 嵌套读快照吞掉真实错误 | 快照上下文只 `yield` 一次，只回滚自己开启的事务 | 演练 `boundary.snapshot.*`；`test_missing_task_keeps_the_original_error_through_the_nested_snapshot` |
