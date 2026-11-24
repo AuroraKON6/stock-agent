@@ -24,13 +24,16 @@ Acceptance rows covered:
 """
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
+from unittest.mock import patch
 
+from stock_agent import subtask_graph
 from stock_agent.config import project_path_override
 from stock_agent.personal_review import (
     ReviewAccessError,
@@ -336,6 +339,29 @@ class DualModeTests(R22IntegrationCase):
                          "the role API's credential suffix must not launder an orchestrator")
         self.assertEqual(actor_kind(OWNER), "human")
 
+    def test_prepared_context_without_execution_is_not_delivered(self):
+        spec = self.spec()
+        spec.pop("replay_response")
+        self.counter[0] += 1
+        task, _ = self.store.create_task(
+            title="Prepared context without an answer", input_payload=spec,
+            case_id="case-prepared", execution_mode="replay", actor="operator")
+        result, row = self.run_full_chain(task)
+        self.assertEqual(row["status"], "queued",
+                         "the missing replay answer requeues within the budget")
+        self.assertTrue(row["model_call"].get("error"))
+        self.assertFalse(row["model_call"].get("replay_source"))
+        self.assertFalse(row["model_call"].get("called"))
+        review = project_review(self.store, identity=self.identity(),
+                                task_ids=[task["task_id"]])
+        sources = review["tasks"][0]["sources"]
+        self.assertEqual(sources["delivered_evidence"], {},
+                         "a prepared outbound context is not a delivery")
+        self.assertEqual(sources["delivery_source"], "prepared_only")
+        self.assertFalse(sources["delivery_authoritative"])
+        self.assertEqual(len(sources["undelivered_references"]), 2)
+        self.assertEqual(review["attribution"]["independent_evidence_count"], 0)
+
     def test_role_step_budget_exhaustion_creates_nothing(self):
         root, flow = self.bound_root(budget_limit=2)
         self.run_step(root, flow, "event_analyst", "分析")
@@ -563,6 +589,123 @@ class FanoutReviewTests(R22IntegrationCase):
         self.assertEqual(len(self.store.list_tasks()), before,
                          "the invalid dependency vetoes the whole batch, dedupe or not")
 
+    def test_dependency_batch_retry_stays_a_pure_duplicate(self):
+        parent = self.parent()
+        proposals = [
+            {"role_id": "event_analyst", "question": "retry base"},
+            {"role_id": "counter_evidence", "question": "retry dependent",
+             "depends_on": ["event_analyst"]},
+        ]
+        first = propose_subtasks(self.store, parent_task_id=parent["task_id"],
+                                 proposals=proposals)
+        self.assertEqual(len(first["created"]), 2)
+        count = len(self.store.list_tasks())
+        again = propose_subtasks(self.store, parent_task_id=parent["task_id"],
+                                 proposals=proposals)
+        self.assertEqual(again["created"], [])
+        self.assertEqual([item["reason"] for item in again["duplicates"]],
+                         ["duplicate_child", "duplicate_child"])
+        self.assertEqual(len(self.store.list_tasks()), count,
+                         "an exact retry of a legal dependency batch meters nothing")
+
+    def test_duplicate_of_existing_child_cannot_add_dependencies(self):
+        parent = self.parent()
+        propose_subtasks(self.store, parent_task_id=parent["task_id"],
+                         proposals=[{"role_id": "event_analyst",
+                                     "question": "existing"}])
+        count = len(self.store.list_tasks())
+        with self.assertRaises(SubtaskGraphError) as caught:
+            propose_subtasks(self.store, parent_task_id=parent["task_id"],
+                             proposals=[{"role_id": "event_analyst",
+                                         "question": "existing",
+                                         "depends_on": ["counter_evidence"]}])
+        self.assertIn("dependency_invalid", str(caught.exception))
+        self.assertEqual(len(self.store.list_tasks()), count,
+                         "an existing child's recorded dependencies are immutable")
+
+    def test_duplicate_line_cannot_redeclare_a_conflicting_dependency(self):
+        parent = self.parent()
+        with self.assertRaises(SubtaskGraphError) as caught:
+            propose_subtasks(
+                self.store, parent_task_id=parent["task_id"],
+                proposals=[
+                    {"role_id": "event_analyst", "question": "analysis"},
+                    {"role_id": "counter_evidence", "question": "counter",
+                     "depends_on": ["event_analyst"]},
+                    # Same identity as line 1 but claiming the opposite edge:
+                    # an exact retry may repeat dependencies, but a conflicting
+                    # one would create a cycle if the edge were honoured.
+                    {"role_id": "event_analyst", "question": "analysis",
+                     "depends_on": ["counter_evidence"]},
+                ])
+        self.assertIn("dependency_invalid", str(caught.exception))
+        self.assertEqual(self.children(parent["task_id"]), [],
+                         "the conflicting duplicate vetoes the whole batch")
+
+    def test_task_key_uses_the_full_normalized_question(self):
+        parent = self.parent()
+        prefix = "common question prefix" * 4
+        result = propose_subtasks(
+            self.store, parent_task_id=parent["task_id"],
+            proposals=[{"role_id": "event_analyst", "question": prefix + " alpha"},
+                       {"role_id": "event_analyst", "question": prefix + " bravo"}])
+        self.assertEqual(len(result["created"]), 2,
+                         "questions sharing their first 40 characters stay distinct")
+        children = self.children(parent["task_id"])
+        self.assertEqual(len(children), 2)
+        self.assertEqual(
+            sum(event["event_type"] == "task_created"
+                for task in children for event in self.store.events(task["task_id"])),
+            2)
+
+    def test_read_only_store_refuses_creation(self):
+        parent = self.parent()
+        read_only = TaskStore(self.db_path, read_only=True)
+        self.addCleanup(read_only.close)
+        with self.assertRaises(SubtaskGraphError) as caught:
+            propose_subtasks(read_only, parent_task_id=parent["task_id"],
+                             proposals=[{"role_id": "event_analyst",
+                                         "question": "read-only write check"}])
+        self.assertIn("read_only_store", str(caught.exception))
+        self.assertEqual(self.children(parent["task_id"]), [])
+
+    def test_missing_cross_process_lock_refuses_creation(self):
+        parent = self.parent()
+        before = len(self.store.list_tasks())
+        with patch.object(subtask_graph.fcntl, "flock",
+                          side_effect=OSError("synthetic flock failure")):
+            with self.assertRaises(SubtaskGraphError) as caught:
+                propose_subtasks(self.store, parent_task_id=parent["task_id"],
+                                 proposals=[{"role_id": "event_analyst",
+                                             "question": "no lock"}])
+        self.assertIn("graph_lock_unavailable", str(caught.exception))
+        self.assertEqual(len(self.store.list_tasks()), before,
+                         "no cross-process exclusion means no creation")
+
+    def test_in_memory_store_keeps_caller_connection_and_writes_no_sidecar(self):
+        with tempfile.TemporaryDirectory() as path:
+            previous = Path.cwd()
+            os.chdir(path)
+            store = TaskStore(":memory:")
+            try:
+                root, _ = store.create_task(
+                    title="memory root", case_id="case-memory",
+                    input_payload={"data_classification": "public"},
+                    execution_mode="replay")
+                result = propose_subtasks(
+                    store, parent_task_id=root["task_id"],
+                    proposals=[{"role_id": "event_analyst",
+                                "question": "in-memory child"}])
+                self.assertEqual(len(result["created"]), 1)
+                self.assertEqual(store.get_task(root["task_id"])["task_id"],
+                                 root["task_id"],
+                                 "the caller's connection stays open")
+                self.assertEqual(list(Path(path).glob("*.subtask.lock")), [],
+                                 "an in-memory store writes no lock sidecar")
+            finally:
+                store.close()
+                os.chdir(previous)
+
 
 # ---------------------------------------------------------------------- #
 # 父取消与部分失败                                                        #
@@ -649,6 +792,72 @@ class CancelAndPartialFailureTests(R22IntegrationCase):
         self.assertEqual(self.store.get_task(child_id)["status"], "cancelled")
         self.assertEqual(
             sum(event["event_type"] == "task_cancelled"
+                for event in self.store.events(child_id)), 1)
+
+    def test_cancel_waits_for_an_in_flight_child_creation(self):
+        root = self.create_root()
+        entered, proceed = Event(), Event()
+        original = TaskStore.create_task
+
+        def pause_child_create(connection, **values):
+            if values.get("parent_task_id") == root["task_id"]:
+                entered.set()
+                if not proceed.wait(5):
+                    raise RuntimeError("test did not release the pending create")
+            return original(connection, **values)
+
+        with patch.object(TaskStore, "create_task", pause_child_create):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                making = pool.submit(
+                    propose_subtasks, self.store,
+                    parent_task_id=root["task_id"],
+                    proposals=[{"role_id": "event_analyst",
+                                "question": "pending child"}])
+                self.assertTrue(entered.wait(5))
+                cancelling = pool.submit(
+                    workflow_cancel_task, str(self.db_path), root["task_id"],
+                    actor="operator", reason="取消", expected_version=root["version"])
+                proceed.set()
+                making.result(timeout=8)
+                cancelled_root = cancelling.result(timeout=8)
+        children = self.children(root["task_id"])
+        self.assertEqual(len(children), 1)
+        self.assertEqual(cancelled_root["status"], "cancelled")
+        self.assertTrue(children[0]["cancel_requested"],
+                        "creation inside the boundary is visible to the cancel")
+        self.assertEqual(self.store.get_task(children[0]["task_id"])["status"],
+                         "cancelled")
+
+    def test_cancel_absorbs_a_worker_claim_version_race(self):
+        root = self.create_root()
+        child = propose_subtasks(
+            self.store, parent_task_id=root["task_id"],
+            proposals=[{"role_id": "event_analyst", "question": "leased child"}])
+        child_id = child["created"][0]["task_id"]
+        claimed = []
+        original = TaskStore.request_cancel
+
+        def claim_before_cancel(connection, task_id, **values):
+            if task_id == child_id and not claimed:
+                worker = TaskStore(self.db_path)
+                try:
+                    claimed.append(bool(worker.claim_task(child_id, "test-worker")))
+                finally:
+                    worker.close()
+            return original(connection, task_id, **values)
+
+        with patch.object(TaskStore, "request_cancel", claim_before_cancel):
+            cancelled_root = workflow_cancel_task(
+                str(self.db_path), root["task_id"], actor="operator",
+                reason="取消", expected_version=root["version"])
+        self.assertEqual(claimed, [True])
+        self.assertEqual(cancelled_root["status"], "cancelled")
+        child_after = self.store.get_task(child_id)
+        self.assertEqual(child_after["status"], "leased")
+        self.assertTrue(child_after["cancel_requested"],
+                        "the retry records the flag on the freshly leased version")
+        self.assertEqual(
+            sum(event["event_type"] in {"task_cancelled", "task_cancel_requested"}
                 for event in self.store.events(child_id)), 1)
 
     def test_partial_step_failure_keeps_sibling_parent_and_audit(self):
@@ -763,6 +972,30 @@ class SignoffAndDeliveryTests(R22IntegrationCase):
                 self.assertIn(decision, [item["decision"] for item
                                          in row["signoff"]["human_decisions"]],
                               "the decision stays visible without becoming sign-off")
+
+    def test_output_field_alone_is_not_a_signoff(self):
+        task = self.create_root(case_id="case-spoofed-signoff")
+        task_id = task["task_id"]
+        claimed = self.store.claim_task(task_id, "spoof-worker")
+        token = claimed["fencing_token"]
+        self.store.mark_running(task_id, worker_id="spoof-worker",
+                                fencing_token=token,
+                                expected_version=claimed["version"])
+        self.store.complete(
+            task_id, worker_id="spoof-worker", fencing_token=token,
+            output={"summary": "synthetic model output",
+                    "personal_acknowledgement": {"actor": OWNER}})
+        self.assertEqual(
+            sum(event["event_type"] == "personal_acknowledgement"
+                for event in self.store.events(task_id)), 0)
+        review = project_review(self.store, identity=self.identity(),
+                                task_ids=[task_id])
+        row = review["tasks"][0]
+        self.assertFalse(row["signoff"]["acknowledged_by_human"],
+                         "task data cannot mint human attribution")
+        self.assertEqual(row["signoff"]["human"], [])
+        self.assertEqual(review["attribution"]["human_signoffs"], [])
+        self.assertEqual(len(row["signoff"]["untrusted_output_claims"]), 1)
 
 
 # ---------------------------------------------------------------------- #

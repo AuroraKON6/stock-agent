@@ -81,14 +81,20 @@ def cancel_task(db_path, task_id: str, *, actor: str, reason: str, expected_vers
     transition rules. Descendants are then cancelled through the graph's
     own governed path, which descends past terminal intermediates so a
     queued grandchild cannot outlive a finished middle node. Verification
-    authorizes the subtree operation, not each descendant node."""
-    from .subtask_graph import cancel_subtree  # local import: no module cycle
+    authorizes the subtree operation, not each descendant node.
+
+    Cancellation enters the SAME persisted boundary as child creation: a
+    batch paused between validation and creation cannot slip a live child
+    past this call — it either sees the cancelled parent (and creates
+    nothing) or waits, and the child is then cancelled with its parent."""
+    from .subtask_graph import cancel_subtree, creation_boundary  # no module cycle
 
     with request_store(db_path) as store:
-        store.request_cancel(
-            task_id, actor=actor, reason=reason, expected_version=expected_version,
-            principal_verification=principal_verification)
-        cancel_subtree(store, task_id, actor=actor, reason=reason, skip_root=True)
+        with creation_boundary(store):
+            store.request_cancel(
+                task_id, actor=actor, reason=reason, expected_version=expected_version,
+                principal_verification=principal_verification)
+            cancel_subtree(store, task_id, actor=actor, reason=reason, skip_root=True)
         return store.get_task(str(task_id))
 
 

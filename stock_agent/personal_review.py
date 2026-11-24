@@ -185,8 +185,14 @@ def _delivery(payload: Dict[str, Any],
     The authoritative record is the worker's own outbox ledger
     (``model_call.context_delivery``): ``delivered_evidence`` lists the refs
     that entered the outbound context, ``dropped_evidence`` records the refs
-    refused before egress (``<ref>:<reason>``). A review that read the input
-    payload instead would present an undelivered document as usable source.
+    refused before egress (``<ref>:<reason>``). But a PREPARED context is not
+    a delivery: the ledger exists from the moment egress is built, including
+    on attempts that never produced an answer. The allowlist therefore counts
+    only when an execution credential backs it — a live call that returned
+    (``called``) or a consumed recorded replay (``replay_source``). A send
+    whose outcome is unknown, and an attempt that only prepared context, are
+    reported as such with NO delivered refs.
+
     When the task never executed there is no ledger; then nothing counts as
     delivered and the configured refs are listed as unverified."""
     context = payload.get("public_context") if isinstance(payload.get("public_context"), dict) else {}
@@ -195,7 +201,18 @@ def _delivery(payload: Dict[str, Any],
     delivery = model_call.get("context_delivery")
     delivery = delivery if isinstance(delivery, dict) else {}
     delivered_refs = delivery.get("delivered_evidence")
-    authoritative = isinstance(delivered_refs, list)
+    error = str(model_call.get("error") or "").lower()
+    if bool(model_call.get("called")):
+        state = "sent"
+    elif str(model_call.get("replay_source") or ""):
+        state = "replayed"
+    elif "outcome unknown" in error:
+        state = "send_unknown"
+    elif model_call:
+        state = "prepared_only"
+    else:
+        state = "no_execution_record"
+    authoritative = state in {"sent", "replayed"}
     outbound = model_call.get("outbound_context")
     outbound = outbound if isinstance(outbound, dict) else {}
     outbound_evidence = outbound.get("evidence_summaries")
@@ -207,7 +224,8 @@ def _delivery(payload: Dict[str, Any],
         ref, _, reason = str(raw).partition(":")
         dropped.setdefault(ref, reason or "dropped_before_egress")
     delivered: Dict[str, Dict[str, Any]] = {}
-    for raw_ref in delivered_refs or []:
+    admitted_refs = (delivered_refs or []) if authoritative else []
+    for raw_ref in admitted_refs:
         ref = str(raw_ref)
         info = outbound_evidence.get(ref)
         info = info if isinstance(info, dict) else {}
@@ -225,45 +243,39 @@ def _delivery(payload: Dict[str, Any],
         if ref in dropped:
             reason = dropped[ref]
         elif not authoritative:
-            reason = "no_execution_record"
+            reason = state
         else:
             reason = "not_delivered_by_execution"
         undelivered.append({"ref": ref, "reason": reason})
     return {"delivered": delivered, "configured": configured,
             "undelivered": undelivered, "authoritative": authoritative,
-            "source": ("worker_context_delivery" if authoritative
-                       else "no_execution_record")}
+            "state": state,
+            "source": "worker_context_delivery" if authoritative else state}
 
 
 def _signoffs(store: TaskStore, task: Dict[str, Any]) -> Tuple[
-        List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]],
+        List[Dict[str, Any]]]:
     """Human sign-off records vs automated claims refused as such.
 
-    ONLY a ``personal_acknowledgement`` record is a sign-off: that is what
-    the store writes for ``decision == acknowledge`` (on the awaiting-human
-    path) and for the terminal-result acknowledgement path. The other human
-    decisions — ``provide_input`` and ``reject`` — record a
-    ``human_response_recorded`` event but are NOT acknowledgements of the
-    result; they stay in ``human_decisions`` for the audit trail."""
+    ONLY a trusted ``personal_acknowledgement`` EVENT written by the store is
+    a sign-off. The output field of the same name is just task data — a
+    producer can write any JSON into it — so a field without the matching
+    event is reported as an unverified claim, never as human attribution.
+    ``human_response_recorded`` events for ``provide_input`` / ``reject`` are
+    not acknowledgements of the result; they stay in ``human_decisions``."""
     human: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
     decisions: List[Dict[str, Any]] = []
+    untrusted: List[Dict[str, Any]] = []
     output = task.get("output") if isinstance(task.get("output"), dict) else {}
-    acknowledgement = output.get("personal_acknowledgement")
-    has_output_ack = isinstance(acknowledgement, dict)
-    if has_output_ack:
-        actor = acknowledgement.get("actor")
-        record = {"actor": str(actor or ""), "at": str(acknowledgement.get("at") or ""),
-                  "source": "personal_acknowledgement",
-                  "scope": str(acknowledgement.get("scope") or "")}
-        (human if actor_kind(actor) == "human" else rejected).append(record)
+    claim = output.get("personal_acknowledgement")
+    claimed_actor = str((claim or {}).get("actor") or "") if isinstance(claim, dict) else ""
     for event in store.events(str(task["task_id"]), limit=500):
         event_type = str(event.get("event_type") or "")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         actor = event.get("actor")
         if event_type == "personal_acknowledgement":
-            if has_output_ack:
-                continue  # the output row above IS this event's record
             record = {"actor": str(actor or ""), "at": str(event.get("created_at") or ""),
                       "source": event_type,
                       "scope": str(payload.get("on") or "personal_acknowledgement")}
@@ -275,7 +287,18 @@ def _signoffs(store: TaskStore, task: Dict[str, Any]) -> Tuple[
                 "decision": str(payload.get("decision") or ""),
                 "signs_off_result": False,
             })
-    return human, rejected, decisions
+    if isinstance(claim, dict):
+        trusted = any(item["source"] == "personal_acknowledgement"
+                      and (not claimed_actor or item["actor"] == claimed_actor)
+                      for item in human + rejected)
+        if not trusted:
+            untrusted.append({
+                "field": "output.personal_acknowledgement",
+                "actor": claimed_actor,
+                "at": str(claim.get("at") or ""),
+                "reason": "no_trusted_signoff_event",
+            })
+    return human, rejected, decisions, untrusted
 
 
 def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -309,7 +332,7 @@ def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
                          "at": str(event.get("created_at") or ""),
                          "detail": str((event.get("payload") or {}).get("error")
                                        or (event.get("payload") or {}).get("reason") or "")[:300]})
-    human, rejected, decisions = _signoffs(store, task)
+    human, rejected, decisions, untrusted = _signoffs(store, task)
     kind = producer_kind(task)
     return {
         "schema_version": REVIEW_SCHEMA,
@@ -351,6 +374,7 @@ def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
             "configured_references": delivery["configured"],
             "undelivered_references": delivery["undelivered"],
             "delivery_source": delivery["source"],
+            "delivery_state": delivery["state"],
             "delivery_authoritative": delivery["authoritative"],
             "citations_outside_allowlist": sorted(set(citations) - set(allowed)),
         },
@@ -379,6 +403,7 @@ def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
         },
         "signoff": {"human": human, "rejected_automated_claims": rejected,
                     "human_decisions": decisions,
+                    "untrusted_output_claims": untrusted,
                     "acknowledged_by_human": bool(human)},
     }
 
@@ -495,6 +520,7 @@ def project_review(store: TaskStore, *, identity: Dict[str, Any],
                 "same_evidence_bytes_count_once": True,
                 "signoff_requires_human_actor": True,
                 "signoff_requires_acknowledgement": True,
+                "signoff_requires_trusted_event": True,
                 "delivery_ledger_is_authoritative": True,
                 "automated_actors": sorted(set(AUTOMATED_ACTOR_PREFIXES)
                                            | _EXTRA_AUTOMATED_ACTORS),

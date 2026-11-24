@@ -37,7 +37,6 @@ R17) is NOT_RUN by dependency and stays honestly marked.
 """
 from __future__ import annotations
 
-import hashlib
 import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -51,6 +50,7 @@ from .task_runtime.store import (
     TERMINAL_STATUSES,
     TaskRuntimeError,
     TaskStore,
+    TaskVersionConflictError,
 )
 
 SUBTASK_GRAPH_SCHEMA = "1.0"
@@ -59,6 +59,9 @@ DEFAULT_MAX_CHILDREN = 3
 
 _LOCKS_GUARD = threading.Lock()
 _LOCKS: Dict[str, "threading.RLock"] = {}
+# One advisory lock FILE per DB, shared (refcounted) by nested boundary entries
+# in the same process: RLock is reentrant for the thread, flock is not.
+_FILE_LOCKS: Dict[str, Dict[str, Any]] = {}
 
 _ROLES = {"event_analyst", "fundamental_analyst", "counter_evidence",
           "synthesis_drafter", "quality_check"}
@@ -153,19 +156,25 @@ def propose_subtasks(
     whole (fail closed) — partial fan-out is how scope creep starts.
 
     The parent re-read, duplicate resolution, cap/budget gates and the
-    creation loop run inside ONE per-parent exclusion boundary (thread lock
-    plus a POSIX advisory file lock keyed by DB path and parent id), so two
+    creation loop run inside ONE exclusion boundary per task DB (thread lock
+    plus a POSIX advisory file lock), shared with cancellation, so two
     orchestrators racing on the same parent cannot both pass the checks and
     overdraw the budget, exceed fan-out, or create the same child twice.
     The second submission converges on the first one's task as a duplicate.
 
     Duplicates are resolved BEFORE the fan-out and budget gates, but the
     dependency review runs over the WHOLE normalized batch — a duplicate
-    proposal that names an unknown dependency still refuses the batch
+    proposal that names an unknown dependency, or that claims dependencies
+    the existing child does not have, still refuses the batch
     (``dependency_invalid``) instead of slipping under the dedupe.
     """
     if not isinstance(proposals, list) or not proposals:
         raise SubtaskGraphError("malformed_proposal: proposals must be a non-empty list")
+    if getattr(store, "read_only", False):
+        # Fail before any read sidecar or write: a read-only caller cannot
+        # authorize task creation, and must not be silently upgraded.
+        raise SubtaskGraphError(
+            "read_only_store: subtask creation requires a writable connection")
     parent_task_id = str(parent_task_id)
 
     # Preliminary snapshot OUTSIDE the boundary. It can only REFUSE (an
@@ -185,7 +194,7 @@ def propose_subtasks(
             "fanout_exceeded: parent {0} already exceeds cap {1}".format(
                 parent_task_id, max_children))
 
-    with _creation_boundary(store, parent_task_id):
+    with creation_boundary(store):
         authoritative = _fresh_store(store)
         try:
             return _propose_locked(
@@ -193,14 +202,20 @@ def propose_subtasks(
                 budget_limit=budget_limit, max_depth=max_depth,
                 max_children=max_children)
         finally:
-            authoritative.close()
+            # Only close the connection THIS function opened (never the
+            # caller's store, and never an in-memory caller's connection).
+            if authoritative is not store:
+                authoritative.close()
 
 
 def _fresh_store(store: TaskStore) -> TaskStore:
     """A second connection on the same DB — the authoritative view used once
     the boundary is held. Tests may subclass the caller's store to slow or
     synchronize reads; those hooks must not sit inside the critical section,
-    and in production a fresh request-scoped connection is the R03 rule."""
+    and in production a fresh request-scoped connection is the R03 rule.
+
+    An in-memory store shares no file and has no cross-process peers, so the
+    caller's own connection is used (and must stay open for the caller)."""
     if str(store.db_path) == ":memory:":
         return store
     return TaskStore(store.db_path)
@@ -301,6 +316,42 @@ def _propose_locked(
             continue
         unique_items.append((index, item))
 
+    # A duplicate is an ANSWER about an existing identity, not a new place to
+    # record dependencies. If a repeated line claims dependencies that the
+    # first occurrence / existing child does not have (or omits ones it does),
+    # the batch is internally inconsistent — creating the other lines while
+    # silently dropping this one's edge is how a cycle slips through. Refuse
+    # the whole batch; an exact retry still matches and stays a duplicate.
+    role_by_id = {str(child["task_id"]): str(child.get("role_id") or "")
+                  for child in existing_children}
+    first_deps: Dict[Tuple[str, str], set] = {}
+    for index, item in normalized:
+        key = (item["role_id"], _question_key(item["question"]))
+        declared = set(item["depends_on"])
+        if key in first_deps:
+            if declared != first_deps[key]:
+                raise SubtaskGraphError(
+                    "dependency_invalid: duplicate {0} on #{1} declares conflicting "
+                    "dependencies".format(item["role_id"], index))
+            continue
+        if key in existing_keys:
+            existing = next(child for child in existing_children
+                            if str(child["task_id"]) == existing_keys[key])
+            origin = (existing.get("input_payload") or {}).get("origin") or {}
+            recorded = set()
+            intact = True
+            for dependency_id in origin.get("depends_on") or []:
+                role_name = role_by_id.get(str(dependency_id))
+                if not role_name:
+                    intact = False
+                    break
+                recorded.add(role_name)
+            if not intact or declared != recorded:
+                raise SubtaskGraphError(
+                    "dependency_invalid: duplicate {0} on #{1} declares dependencies "
+                    "the existing child does not have".format(item["role_id"], index))
+        first_deps[key] = declared
+
     # Fan-out counts DISTINCT new children: a batch that is entirely
     # duplicates widens nothing, so each new (role, question-identity) key
     # counts once against the cap.
@@ -377,7 +428,7 @@ def _propose_locked(
             parent_task_id=parent_task_id,
             execution_mode=str(parent.get("execution_mode") or "live"),
             idempotency_key="subtask::{0}::{1}::{2}".format(
-                parent_task_id, item["role_id"], key[1][:40]),
+                parent_task_id, item["role_id"], key[1]),
             actor="subtask_graph",
         )
         resolved[item["role_id"]] = str(task["task_id"])
@@ -395,24 +446,36 @@ def _propose_locked(
             "created": created, "duplicates": duplicates, "rejected": []}
 
 
-def _creation_boundary(store: TaskStore, parent_task_id: str) -> "_CreationBoundary":
-    """Serialize check-then-create for one parent, across threads AND processes.
+def creation_boundary(store: TaskStore) -> "_CreationBoundary":
+    """Serialize graph MUTATIONS on one task DB, across threads AND processes.
 
-    The in-process RLock is keyed by the resolved DB path; the advisory file
-    lock (``flock`` on ``<db>.<parent-hash>.subtask.lock``) extends the same
-    exclusion to other processes sharing the store. The order of validation,
-    dedupe, caps and creation is only meaningful if nothing can interleave
-    between them — this is that boundary.
+    Creation and cancellation both enter this boundary: a cancellation that
+    lands while a batch is between validation and creation either happens
+    first (the proposal then sees a terminal parent and creates nothing) or
+    waits and then cancels the freshly created children. The in-process
+    RLock is keyed by the resolved DB path; the advisory file lock
+    (``flock`` on ``<db>.subtask.lock``) extends the same exclusion to other
+    processes. If the file lock is unavailable, creation is REFUSED rather
+    than run without cross-process mutual exclusion.
+
+    An in-memory store has no file and no cross-process peers, so it uses
+    the in-process lock only and never writes a lock sidecar.
     """
-    return _CreationBoundary(store, parent_task_id)
+    return _CreationBoundary(store)
 
 
 class _CreationBoundary:
-    def __init__(self, store: TaskStore, parent_task_id: str) -> None:
-        db_key = str(Path(store.db_path).resolve())
-        parent_key = hashlib.sha256(str(parent_task_id).encode()).hexdigest()[:16]
-        self._lock_key = "{0}::{1}".format(db_key, parent_key)
-        self._lock_path = "{0}.{1}.subtask.lock".format(db_key, parent_key)
+    def __init__(self, store: TaskStore) -> None:
+        self._memory = str(store.db_path) == ":memory:"
+        if self._memory:
+            self._lock_key = "memory::{0}".format(id(store))
+            self._lock_path = None
+        else:
+            resolved = str(Path(store.db_path).resolve())
+            self._lock_key = resolved
+            self._lock_path = resolved + ".subtask.lock"
+        self._thread_lock: Optional[threading.RLock] = None
+        self._file_entry: Optional[Dict[str, Any]] = None
 
     def __enter__(self) -> None:
         with _LOCKS_GUARD:
@@ -421,28 +484,84 @@ class _CreationBoundary:
                 lock = _LOCKS[self._lock_key] = threading.RLock()
         lock.acquire()
         self._thread_lock = lock
-        self._handle = None
-        if fcntl is not None:
-            try:
-                self._handle = open(self._lock_path, "a+")
-                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
-            except OSError:
-                # A read-only state dir cannot host the advisory lock; the
-                # RLock still serializes this process, and the store's own
-                # BEGIN IMMEDIATE keeps individual writes atomic.
-                if self._handle is not None:
-                    self._handle.close()
-                self._handle = None
+        try:
+            if not self._memory:
+                if fcntl is None:
+                    raise SubtaskGraphError(
+                        "graph_lock_unavailable: this platform has no cross-process "
+                        "file locking; refusing unsafe creation")
+                with _LOCKS_GUARD:
+                    entry = _FILE_LOCKS.setdefault(
+                        self._lock_path, {"handle": None, "depth": 0})
+                # The per-key RLock is ours, so this entry is touched by this
+                # thread only. Take the flock OUTSIDE the global guard: a
+                # cross-process wait must not stall unrelated DBs here.
+                if entry["handle"] is None:
+                    handle = None
+                    try:
+                        handle = open(self._lock_path, "a+")
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    except OSError as exc:
+                        if handle is not None:
+                            handle.close()
+                        raise SubtaskGraphError(
+                            "graph_lock_unavailable: cannot take the cross-process "
+                            "subtask lock ({0}); refusing to create".format(exc))
+                    entry["handle"] = handle
+                entry["depth"] += 1
+                self._file_entry = entry
+        except BaseException:
+            lock.release()
+            self._thread_lock = None
+            raise
         return None
 
     def __exit__(self, exc_type, exc, tb) -> None:
         try:
-            if self._handle is not None:
-                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-                self._handle.close()
-                self._handle = None
+            if self._file_entry is not None:
+                with _LOCKS_GUARD:
+                    entry = self._file_entry
+                    entry["depth"] -= 1
+                    if entry["depth"] <= 0:
+                        handle = entry["handle"]
+                        entry["handle"] = None
+                        entry["depth"] = 0
+                        if handle is not None:
+                            try:
+                                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                            finally:
+                                handle.close()
         finally:
+            self._file_entry = None
             self._thread_lock.release()
+
+
+def _cancel_node(store: TaskStore, task_id: str, *, actor: str, reason: str,
+                 expected_version: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """Cancel one node, absorbing the version race with a live worker.
+
+    A worker may claim/lease the task between our read and the write (that
+    bump is exactly what the store's optimistic check reports). Re-read and
+    retry with the fresh version: the eventual write sets ``cancel_requested``
+    while the task is leased, so the worker's checkpoint lands the terminal
+    state. An already-requested task is not written twice (no duplicate
+    event), and a terminal one is left untouched."""
+    version = expected_version
+    for _ in range(8):
+        task = store.get_task(task_id)
+        if task["status"] in TERMINAL_STATUSES:
+            return None
+        if task.get("cancel_requested"):
+            return task
+        if version is None:
+            version = int(task["version"])
+        try:
+            return store.request_cancel(task_id, actor=actor, reason=reason,
+                                        expected_version=version)
+        except TaskVersionConflictError:
+            version = None
+    raise SubtaskGraphError(
+        "cancel_conflict: {0} kept changing during cancellation; retry".format(task_id))
 
 
 def cancel_subtree(store: TaskStore, root_task_id: str, *, actor: str,
@@ -454,10 +573,20 @@ def cancel_subtree(store: TaskStore, root_task_id: str, *, actor: str,
     INTO their children: a finished middle node must not shield a queued
     grandchild from the parent's cancellation.
 
+    Runs inside the same persistent boundary as creation, so a child cannot
+    be created behind the cancellation's back.
+
     ``skip_root`` is for callers that already cancelled the root through
     their own governed entry (``workflow_service.cancel_task`` keeps the
     caller's expected_version and principal verification there); the root
     is then traversed but not cancelled again."""
+    with creation_boundary(store):
+        return _cancel_subtree_locked(store, root_task_id, actor=actor,
+                                      reason=reason, skip_root=skip_root)
+
+
+def _cancel_subtree_locked(store: TaskStore, root_task_id: str, *, actor: str,
+                           reason: str, skip_root: bool = False) -> Dict[str, Any]:
     cancelled: List[Dict[str, Any]] = []
     stack = [str(root_task_id)]
     seen = set()
@@ -466,20 +595,11 @@ def cancel_subtree(store: TaskStore, root_task_id: str, *, actor: str,
         if task_id in seen:
             continue
         seen.add(task_id)
-        task = store.get_task(task_id)
         already_root = skip_root and task_id == str(root_task_id)
-        if not already_root and task["status"] not in TERMINAL_STATUSES:
-            try:
-                fresh = store.request_cancel(
-                    task_id, actor=actor, reason=reason,
-                    expected_version=task["version"])
+        if not already_root:
+            fresh = _cancel_node(store, task_id, actor=actor, reason=reason)
+            if fresh is not None:
                 cancelled.append({"task_id": task_id, "status": fresh["status"]})
-            except TaskRuntimeError:
-                # A worker may have finished this node between the read and
-                # the write. If it is terminal NOW its history stands and the
-                # traversal still descends; any other error is real.
-                if store.get_task(task_id)["status"] not in TERMINAL_STATUSES:
-                    raise
         stack.extend(child["task_id"] for child in _children_of(store, task_id))
     return {"root_task_id": str(root_task_id), "cancelled": cancelled,
             "count": len(cancelled)}

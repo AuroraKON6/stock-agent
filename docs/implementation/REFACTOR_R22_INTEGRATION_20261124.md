@@ -30,7 +30,7 @@
   - 访问沿用既有裁决器：要求 `read_research` scope 与案件范围；根任务有服务端 owner 绑定的个人任务只允许该 owner 读取（`personal_owner_mismatch` / `personal_owner_required`）。只调用 store 的读接口，不写库。
 - `stock_agent/rule_candidates.py`（新）
   - `propose_rule_change` 只派生新的冻结制品并标 `pending_review`，不注册、不批准、不改动基线 digest；`RuleCandidateBook.approve` 是唯一写注册表的路径，且拒绝任何自动化/模型角色审批人。
-- `tests/test_refactor_r22_integration.py`（新，25 例）
+- `tests/test_refactor_r22_integration.py`（新，36 例）
   - 同一冻结合成事件双模式对照、复盘溯源、归因、身份/案件/只读、依赖/环/越案件/深度/扇出、重复与预算、并发提交（同身份收敛/不同角色争用上限）、终态中间节点的取消穿透、正常取消入口的子任务传播、投递账本对账、`provide_input`/`reject` 非签收、规则候选冻结与 digest 复核、父取消、部分失败。
 - `deploy/dify/r17_drill.py` / `scripts/r17_role_drill.py`
   - 新增容器内探针 `review` / `r22-rule` / `r22-graph` 与 11 条 R22 检查，C 层在同一隔离栈、同一实时任务库上取证。
@@ -42,7 +42,7 @@ Python 3.12.15，仓库锁定 `pyyaml==6.0.3`。全部在仓库根目录执行�
 | 命令 | 结果 |
 | --- | --- |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22.py` | 9 OK / exit 0 |
-| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 25 OK / exit 0（本单专项） |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 36 OK / exit 0（本单专项） |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17.py` | 12 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17_role_api.py` | 19 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r18.py` | 34 OK / exit 0 |
@@ -65,18 +65,19 @@ python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run2 --port 18185
 
 首次演练（`../r22-claudecode-run1-fail`）在产品行为全部正确的情况下报 1 项 FAIL：验收表达式把三类依赖拒绝（自依赖/环/未知引用）都期望成各自名字，实际稳定返回 `dependency_invalid`。修正的是检查映射，未改产品代码；随后重跑得到上述 53/53。该目录保留作对照。
 
-### 4.1 复验返工后的独立重跑（run3 / run4）
+### 4.1 复验返工后的独立重跑（run3 / run4 / run5）
 
 返回 `in_progress` 修复后，用**新的**证据目录与回环端口重跑，仍经共享锁串行：
 
 ```sh
 python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run3 --port 18186
 python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run4 --port 18187
+python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run5 --port 18189
 ```
 
-- 两次均为 `summary.json` **PASS，53/53**，12 个 Dify run，0 FAIL，exit 0。
-- `cleanup.json`: `down --volumes` exit 0，残留容器/网络/卷均为 0，端口已释放（run4 记录 `loopback_port_rebind=18187`）。
-- run4 在最终交付代码树上重跑（工作区干净），是本轮 C 层的主证据；run3 为同轮首次通过记录。
+- 三次均为 `summary.json` **PASS，53/53**，12 个 Dify run，0 FAIL，exit 0。
+- `cleanup.json`: `down --volumes` exit 0，残留容器/网络/卷均为 0，端口已释放（run4 `loopback_port_rebind=18187`，run5 `18189`）。
+- run5 在第三轮返工后的代码树上重跑（工作区干净），是该轮 C 层的主证据；run3/run4 为前一轮记录。
 - 证据：`r22-review.json`、`r22-rule.json`、`r22-graph.json`。
 - 同轮把 Celery 就绪探测从 240s/80 行放宽到 420s/200 行（sol 首跑曾遇就绪超时，产品无变化），只影响等待窗口，不放宽任何断言。
 - 该目录中的 R22 取消检查与 O 层回归共同覆盖：正常 `cancel_task` 入口传播、终态中间节点穿透（O 层）。
@@ -140,7 +141,7 @@ sol 在 `279968d` 上以 `focused_checks.py` 复现 10 项失败。逐项修复�
 | 命令 | 结果 |
 | --- | --- |
 | sol `focused_checks.py`（解压到仓库根，`PYTHONPATH=.:tests:scripts python3.12 -B focused_checks.py`） | 10/10 PASS，exit 0（该脚本为 sol 附件，未提交进仓库） |
-| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 25 OK / exit 0 |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 36 OK / exit 0 |
 | R22 / R17 / R17 role API / R18 / R15 citation / R10 既有模式 | 9 / 12 / 19 / 34 / 5 / 11 OK，均 exit 0 |
 | 相邻回归：R03 / R19 / R20 / R15 personal / R16 / R14 browser | 14 / 8 / 40 / 10 / 4 / 24 OK，均 exit 0 |
 | C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run4 --port 18187` | PASS 53/53，cleanup 残留 0，端口可重绑 |
@@ -148,3 +149,33 @@ sol 在 `279968d` 上以 `focused_checks.py` 复现 10 项失败。逐项修复�
 新增回归（`tests/test_refactor_r22_integration.py`）：并发不同角色争用上限、同身份并发收敛、重复项未知依赖整批拒绝、终态中间节点取消穿透、正常取消入口传播、投递账本对账、`provide_input`/`reject` 非签收、orchestrator 凭据后缀自动化、候选冻结与 digest 复核。
 
 `workflow_service.cancel_task` 不在 KONM-80（zcode）已推送分支的改动集中（其分支只动 R18 connector / 文档 / R18 测试）；`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 本单未改动，因此无共享文件串行冲突。
+
+## 9. 第三轮复验返工（sol 的 9 个反例 + 跨进程锁）
+
+sol 在 `c2c22f1` 上以 `followup_checks.py` / `process_check.py` 复现 9 个反例，并确认正常 POSIX 锁下两进程预算约束有效。逐项修复：
+
+| # | 失败项 | 修复 | 回归 / 证据 |
+| --- | --- | --- | --- |
+| 1 | 取消与创建竞态：晚到子任务 `queued`、取消事件 0 | 创建与取消共用同一 per-DB 持久化边界（RLock + `flock`），取消在根任务取消前先取边界；边界内重读父任务，已取消则零创建，已创建则随后被取消 | `test_cancel_waits_for_an_in_flight_child_creation`；followup `cancel_while_creating`（child cancelled, 1 event） |
+| 2 | worker 在取消读写间领取子任务 → 两次 `TaskVersionConflictError` | 子节点取消在版本冲突时重读并重试（上限 8 次），对 leased 任务记录 `cancel_requested`；已请求的任务不重复写事件；根任务仍严格使用调用方 `expected_version` 与主体核销 | `test_cancel_absorbs_a_worker_claim_version_race`；followup `cancel_while_child_is_leased`（leased + cancel_requested，1 event） |
+| 3 | `flock` 抛 `OSError` 时两边各创建 1 个 | 取不到跨进程锁即 `graph_lock_unavailable` 拒绝创建，绝不降级为仅进程内互斥 | `test_missing_cross_process_lock_refuses_creation`；process `unavailable_posix_flock`（children=0） |
+| 4 | `TaskStore(read_only=True)` 被静默升级为读写并创建 | `propose_subtasks` 在任何写入/加锁前拒绝只读连接（`read_only_store`） | `test_read_only_store_refuses_creation`；followup `read_only_store_preserved` |
+| 5 | `:memory:` 存储被关闭并写出锁文件 | 内存库只用进程内锁、不写锁边车；只关闭本函数新开的连接，调用方连接保持可用 | `test_in_memory_store_keeps_caller_connection_and_writes_no_sidecar`；followup `in_memory_store_preserved` |
+| 6 | 重复项声明的依赖与批内/既有任务冲突仍创建 2 个 | 对每条规范化提案记录首个声明的依赖；批内重复或既有子任务的声明必须与其已记录依赖（按角色解析）完全一致，否则整批 `dependency_invalid`；精确重试仍是 duplicate | `test_duplicate_line_cannot_redeclare_a_conflicting_dependency`、`test_duplicate_of_existing_child_cannot_add_dependencies`、`test_dependency_batch_retry_stays_a_pure_duplicate`；followup `cycle_via_duplicate_line` |
+| 7 | 规范化前 40 字符相同的两个合法问题触发幂等冲突 | 子任务幂等键使用完整规范化身份（不再截断） | `test_task_key_uses_the_full_normalized_question`；followup `full_question_identity`（2 tasks, 2 created events） |
+| 8 | 只有准备态（无回放答案、无供应商调用）也计 2 条已投递 | 复盘按执行凭证分档：`sent`（live 调用返回）、`replayed`（消费回放）、`send_unknown`（结果未知）、`prepared_only`、`no_execution_record`；仅前两档认定允许集合与独立证据 | `test_prepared_context_without_execution_is_not_delivered`；followup `prepared_context_without_execution`（projected_delivered=0） |
+| 9 | 纯合成输出字段被计作人工签收 | 只认 TaskStore 写入的 `personal_acknowledgement` 事件；输出字段无匹配事件时列入 `untrusted_output_claims`，不计归因 | `test_output_field_alone_is_not_a_signoff`；followup `signoff_requires_store_event` |
+
+复验命令与结果：
+
+| 命令 | 结果 |
+| --- | --- |
+| sol `followup_checks.py`（仓库根，`PYTHONPATH=.:tests:scripts python3.12 -B followup_checks.py`） | 9/9 PASS，exit 0 |
+| sol `process_check.py`（仓库根，`PYTHONPATH=.:scripts python3.12 -B process_check.py`） | 2/2 PASS（正常 flock 1 创建；锁异常两边拒绝），exit 0 |
+| 上轮 `focused_checks.py` | 10/10 PASS，exit 0 |
+| `test_refactor_r22_integration.py` | 36 OK / exit 0 |
+| R22 / R17 / R17 role API / R18 / R15 citation / R10 | 9 / 12 / 19 / 34 / 5 / 11 OK，均 exit 0 |
+| 相邻 R03 / R19 / R20 / R15 personal / R16 / R14 browser | 14 / 8 / 40 / 10 / 4 / 24 OK，均 exit 0 |
+| C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run5 --port 18189` | PASS 53/53，cleanup 残留 0，端口可重绑 |
+
+边界说明：创建与取消现在全库串行（同一任务库的图变更），这是让预算/扇出/重复/取消在同一持久化边界内成立的代价；跨进程互斥依赖 POSIX `flock`，不可用时拒绝而非降级。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 仍未改动。
