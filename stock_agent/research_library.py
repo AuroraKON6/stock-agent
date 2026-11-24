@@ -315,12 +315,12 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
     bytes: that one authorized them. Held nowhere: judged in the task's own
     namespace, which fails. Both apply: the title the worker recorded as
     delivered names the copy the report used when exactly one of the two
-    COMPLETE ledgers ever recorded that title. Anywhere the record and the
-    ledgers cannot prove the source — both ledgers recorded that title or
-    neither did, or one ledger cannot be read and verified — the entry is
+    COMPLETE ledgers could have delivered that title. Anywhere the record and
+    the ledgers cannot prove the source — both ledgers could have, or
+    neither, or one ledger cannot be read and verified — the entry is
     ``source_unverified``: excluded from default retrieval and the timeline
-    as a whole even when a copy still verifies, and kept for the audit view
-    with ``unverified_sources``.
+    as a whole, whether or not a copy still verifies or every copy is
+    withdrawn, and kept for the audit view with ``unverified_sources``.
 
     An entry whose evidence fully left its authorizing projection is
     ``evidence_revoked``; one that lost part of it is
@@ -398,10 +398,10 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
                         title[:DELIVERED_TITLE_LIMIT] for title in state["titles"].get(sha, ())}]
                     if not unprovable and len(named) == 1:
                         return sha in named[0]["live"], False
-                    if not unprovable and len(holders) == len(provable) and not any(
-                            sha in state["live"] for state in holders):
-                        return False, False          # withdrawn in every ledger that holds it
-                    return False, True               # cannot be proven: needs review
+                    # Cannot be proven. It stays unproven even when every
+                    # copy is withdrawn: nothing then says which one the
+                    # report cited, so the entry keeps the review marker.
+                    return False, True
             return sha in verifies(source, _owner), False
 
         live, unverified = [], []

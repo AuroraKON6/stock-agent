@@ -697,9 +697,12 @@ class ReportTimeSourceTests(ScopeTestCase, SourceFixtures):
         self.assertEqual((entry["evidence_sources"], entry["delivered_titles"]), ({sha: "unrecorded"}, {}))
         self._roster([{"actor_id": ALICE, "principal_type": "human", "active": True,
                        "roles": ["quality_reviewer"], "information_side": "public"}])
-        for step in ("both verify", "shared withdrawn"):
+        for step in ("both verify", "shared withdrawn", "both withdrawn"):
             if step == "shared withdrawn":
                 self._withdraw(content)   # the shared original; the personal copy stays
+            elif step == "both withdrawn":
+                self._withdraw(content, personal_vault_view(self.config, ALICE))
+                self.assertNotIn(sha, verified_evidence_documents(personal_vault_view(self.config, ALICE)))
             result = query_library(cached, self.config, ALICE, query="跨版本")
             audit = query_library(cached, self.config, ALICE, query="跨版本", include_stale=True)
             self.assertEqual((result["result_count"], audit["result_count"]), (0, 1), step)
@@ -1011,6 +1014,39 @@ class LedgerIntegrityHttpTests(ScopeTestCase, SourceFixtures):
                               [r["question"] for r in body["results"]],
                               (body["filters"]["since"], body["filters"]["until"])),
                              (200, 1, [wanted], (since, until)))
+
+    def test_unproven_source_keeps_the_review_marker_over_http_when_all_copies_go(self):
+        """Same title and bytes in both vaults, no delivered title on record.
+        Withdrawing first the shared copy and then the personal one too
+        leaves the source as unproven as before."""
+        document_id, sha, content = self._personal_document(ALICE, "同字节原件正文。", "同标题原件")
+        import_document(self.config, self.root, content=content, title="同标题原件",
+                        signal_ids=[], seed_signals=False)
+        task = self._personal(ALICE, "同标题研究", document_ids=[document_id])
+        self._roster([{"actor_id": ALICE, "principal_type": "human", "active": True,
+                       "roles": ["quality_reviewer"], "information_side": "public"}])
+        cookie = self._login(ALICE)
+        path = "/api/v1/library?query=" + quote("同标题研究")
+        timeline = "/api/v1/library/timeline?task_id=" + task["task_id"]
+
+        def get(url, suffix=""):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            try:
+                conn.request("GET", url + suffix, None, {"Cookie": cookie})
+                response = conn.getresponse()
+                return json.loads(response.read().decode("utf-8"))
+            finally:
+                conn.close()
+
+        for step in ("both verify", "shared withdrawn", "both withdrawn"):
+            if step == "shared withdrawn":
+                self._withdraw(content)
+            elif step == "both withdrawn":
+                self._withdraw(content, personal_vault_view(self.config, ALICE))
+            self.assertEqual((get(path)["result_count"], get(timeline)["result_count"]), (0, 0), step)
+            audit = get(path, "&include_stale=1")
+            self.assertEqual([(r["stale_reason"], r["unverified_sources"]) for r in audit["results"]],
+                             [("source_unverified", [sha])], step)
 
     def test_default_and_audit_over_http_when_the_shared_ledger_fails(self):
         self._proven_shared_record()
