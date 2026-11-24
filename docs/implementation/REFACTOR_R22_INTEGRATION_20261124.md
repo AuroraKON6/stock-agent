@@ -65,16 +65,18 @@ python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run2 --port 18185
 
 首次演练（`../r22-claudecode-run1-fail`）在产品行为全部正确的情况下报 1 项 FAIL：验收表达式把三类依赖拒绝（自依赖/环/未知引用）都期望成各自名字，实际稳定返回 `dependency_invalid`。修正的是检查映射，未改产品代码；随后重跑得到上述 53/53。该目录保留作对照。
 
-### 4.1 复验返工后的独立重跑（run3）
+### 4.1 复验返工后的独立重跑（run3 / run4）
 
 返回 `in_progress` 修复后，用**新的**证据目录与回环端口重跑，仍经共享锁串行：
 
 ```sh
 python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run3 --port 18186
+python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run4 --port 18187
 ```
 
-- `summary.json`: **PASS，53/53**，12 个 Dify run，0 FAIL，exit 0。
-- `cleanup.json`: `down --volumes` exit 0，残留容器/网络/卷均为 0，端口已释放。
+- 两次均为 `summary.json` **PASS，53/53**，12 个 Dify run，0 FAIL，exit 0。
+- `cleanup.json`: `down --volumes` exit 0，残留容器/网络/卷均为 0，端口已释放（run4 记录 `loopback_port_rebind=18187`）。
+- run4 在最终交付代码树上重跑（工作区干净），是本轮 C 层的主证据；run3 为同轮首次通过记录。
 - 证据：`r22-review.json`、`r22-rule.json`、`r22-graph.json`。
 - 同轮把 Celery 就绪探测从 240s/80 行放宽到 420s/200 行（sol 首跑曾遇就绪超时，产品无变化），只影响等待窗口，不放宽任何断言。
 - 该目录中的 R22 取消检查与 O 层回归共同覆盖：正常 `cancel_task` 入口传播、终态中间节点穿透（O 层）。
@@ -118,7 +120,7 @@ python3.12 -B scripts/r17_role_drill.py all <新证据目录> --port <空闲端�
 
 ## 8. 复验返工记录（sol 的 10 项复现）
 
-sol 在 `279968d` 上以 `focused_checks.py` 复现 10 项失败。逐项修复如下，均补了 O 层回归并在 `run3` 重新取证。
+sol 在 `279968d` 上以 `focused_checks.py` 复现 10 项失败。逐项修复如下，均补了 O 层回归并在 `run3` / `run4` 重新取证。
 
 | # | 失败项（sol 复现） | 根因 | 修复 |
 | --- | --- | --- | --- |
@@ -141,7 +143,7 @@ sol 在 `279968d` 上以 `focused_checks.py` 复现 10 项失败。逐项修复�
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 25 OK / exit 0 |
 | R22 / R17 / R17 role API / R18 / R15 citation / R10 既有模式 | 9 / 12 / 19 / 34 / 5 / 11 OK，均 exit 0 |
 | 相邻回归：R03 / R19 / R20 / R15 personal / R16 / R14 browser | 14 / 8 / 40 / 10 / 4 / 24 OK，均 exit 0 |
-| C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run3 --port 18186` | PASS 53/53，cleanup 残留 0 |
+| C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run4 --port 18187` | PASS 53/53，cleanup 残留 0，端口可重绑 |
 
 新增回归（`tests/test_refactor_r22_integration.py`）：并发不同角色争用上限、同身份并发收敛、重复项未知依赖整批拒绝、终态中间节点取消穿透、正常取消入口传播、投递账本对账、`provide_input`/`reject` 非签收、orchestrator 凭据后缀自动化、候选冻结与 digest 复核。
 
