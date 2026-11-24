@@ -11,13 +11,16 @@ import importlib.util
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from stock_agent.config import project_path_override
 from stock_agent.observability import (
+    DEFAULT_ALERT_THRESHOLDS,
     aggregate_attempts,
+    event_type_counts,
     build_alert_candidates,
     build_observability_report,
     build_observability_status,
@@ -28,6 +31,7 @@ from stock_agent.observability import (
     observability_settings,
     project_log_fields,
     read_query_ledgers,
+    safe_label,
 )
 from stock_agent.ops_view import build_ops_view
 from stock_agent.task_runtime import TaskStore
@@ -503,6 +507,256 @@ class MetricsTests(unittest.TestCase):
         by_name = {row["name"]: row for row in rows}
         self.assertEqual(by_name["stock_agent_usage_real_supplier"]["evidence"], "unknown")
         self.assertEqual(by_name["stock_agent_tasks_replay_mode"]["evidence"], "replay")
+
+
+class BoundaryTests(unittest.TestCase):
+    """sol round 3: labels, one consistent read, corrupt ledgers, non-finite
+    thresholds, intake sidecar files. Each test gets its own temporary store."""
+    BODY_AS_ID = "Synthetic restricted prose fixture for R23"
+    KEY_LIKE_LABEL = "sk-R23SyntheticProviderFixture0001"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+        self.enterContext(project_path_override(lambda value: self.base / value))
+        self.store = TaskStore(self.base / "tasks.sqlite3")
+        self.addCleanup(self.store.close)
+        task, _ = self.store.create_task(
+            title="合成边界任务",
+            input_payload={"research_question": "合成", "data_classification": "public"},
+            execution_mode="replay")
+        self.task_id = task["task_id"]
+
+    def _prepare_attempt(self, store=None, provider="synthetic"):
+        store = store or self.store
+        claim = store.claim_task(self.task_id, "w-b", ttl_seconds=120)
+        store.mark_running(self.task_id, worker_id="w-b", fencing_token=claim["fencing_token"],
+                           expected_version=claim["version"])
+        return store.prepare_invocation_attempt(
+            self.task_id, worker_id="w-b", fencing_token=claim["fencing_token"], round_index=1,
+            provider=provider, request_model="synthetic-model", prompt_sha256="b" * 64)
+
+    @staticmethod
+    def _query_alert(report):
+        return next(c for c in report["alert_candidates"]["candidates"]
+                    if c["rule"] == "query_outcome_unknown")
+
+    # ---- 1. external correlation values ----
+    def test_body_in_a_run_id_is_published_only_as_a_digest(self):
+        self.store.attach_platform_run(self.task_id, run={
+            "platform": "dify", "run_id": self.BODY_AS_ID, "workflow_version": "wf", "actor": "a"})
+        trace = build_trace(self.store, self.task_id)
+        self.assertNotIn(self.BODY_AS_ID, json.dumps(trace, ensure_ascii=False))
+        run_id = trace["platform_runs"][0]["run_id"]
+        self.assertEqual(run_id, safe_label(self.BODY_AS_ID))
+        self.assertTrue(run_id.startswith("sha256:") and len(run_id) == 23)
+        self.assertEqual(safe_label(self.BODY_AS_ID), run_id, "the digest is stable")
+        # Valid identifiers are kept as they are, so traces stay joinable.
+        self.assertEqual(trace["task"]["task_id"], self.task_id)
+        self.assertEqual(trace["platform_runs"][0]["platform"], "dify")
+
+    def test_key_like_provider_label_is_shared_by_detail_and_aggregate(self):
+        self._prepare_attempt(provider=self.KEY_LIKE_LABEL)
+        report = build_observability_report(self.store, task_id=self.task_id)
+        self.assertNotIn(self.KEY_LIKE_LABEL, json.dumps(report, ensure_ascii=False))
+        providers = report["reconciliation"]["invocations"]["by_provider"]
+        self.assertEqual(list(providers), [report["trace"]["attempts"][0]["provider"]])
+        self.assertEqual(list(providers), [safe_label(self.KEY_LIKE_LABEL)])
+        self.assertEqual(sum(providers.values()), 1, "the count survives the label")
+        self.assertEqual(sum(report["reconciliation"]["invocations"]["states"].values()), 1)
+
+    def test_sentence_as_run_id_through_the_dify_http_entry(self):
+        from test_dify_api_v1 import ApiServerTests
+
+        http = ApiServerTests("test_create_and_status_round_trip")
+        self.addCleanup(http.doCleanups)
+        http.setUp()
+        status, response = http._request("POST", "/api/dify/v1/create-research", {
+            "title": "Synthetic R23 boundary", "case_id": "case-alpha", "input_version": 1,
+            "research_question": "Synthetic research?", "dify_run_id": self.BODY_AS_ID,
+            "workflow_version": "wf-demo-1", "business_intent_id": "r23-boundary-intent",
+            "execution_mode": "replay"})
+        self.assertEqual(status, 200, response)
+        trace = build_trace(http.store, response["data"]["task_id"])
+        self.assertNotIn(self.BODY_AS_ID, json.dumps(trace, ensure_ascii=False))
+        self.assertEqual(trace["platform_runs"][0]["run_id"], safe_label(self.BODY_AS_ID))
+
+    # ---- 2. one consistent ledger reading per report ----
+    def test_commit_during_a_report_does_not_mix_aggregate_reads(self):
+        from unittest.mock import patch
+
+        import stock_agent.observability as obs
+
+        real_aggregate = obs.aggregate_attempts
+        reads = []
+
+        def aggregate_then_commit(reader):
+            data = real_aggregate(reader)
+            reads.append(reader)
+            if len(reads) == 1:
+                self._prepare_attempt(self.store)
+            return data
+
+        reader = TaskStore(self.store.db_path, read_only=True)
+        self.addCleanup(reader.close)
+        with patch.object(obs, "aggregate_attempts", side_effect=aggregate_then_commit):
+            report = build_observability_report(reader, task_id=self.task_id)
+        invocation = report["reconciliation"]["invocations"]
+        self.assertEqual(len(reads), 1, "the attempt ledger is aggregated once per report")
+        self.assertEqual(sum(invocation["states"].values()),
+                         sum(invocation["by_provider"].values()))
+        self.assertEqual(report["trace"]["attempts"], [],
+                         "the trace reads the same snapshot as the totals")
+        self.assertFalse(reader._conn.in_transaction, "the read snapshot is released")
+
+    def test_snapshot_sees_one_committed_state_for_every_section(self):
+        from unittest.mock import patch
+
+        import stock_agent.observability as obs
+
+        real = obs.event_type_counts
+        calls = []
+
+        def then_commit(store):
+            data = real(store)
+            if not calls:
+                calls.append(1)
+                self._prepare_attempt(self.store)  # adds events + one attempt
+            return data
+
+        reader = TaskStore(self.store.db_path, read_only=True)
+        self.addCleanup(reader.close)
+        with patch.object(obs, "event_type_counts", side_effect=then_commit):
+            report = build_observability_report(reader)
+        recon = report["reconciliation"]
+        self.assertEqual(sum(recon["invocations"]["states"].values()), 0)
+        self.assertNotIn("invocation_dispatched", recon["authoritative"]["event_type_counts"],
+                         "the event counts come from the same pre-commit snapshot")
+        after = event_type_counts(self.store)["counts"]
+        self.assertLess(recon["authoritative"]["event_scan"]["total"],
+                        sum(after.values()), "the writer really did commit more afterwards")
+
+    # ---- 3. corrupt audit ledger ----
+    def _report_with_ledger(self, text):
+        (self.base / "audit.jsonl").write_text(text, encoding="utf-8")
+        config = {"kimi_sources": {"ledger_path": "audit.jsonl",
+                                   "query_store_path": "intake.sqlite3"}}
+        return build_observability_report(self.store, config=config, task_id=self.task_id)
+
+    def test_ledger_with_no_parseable_record_is_unreadable_not_empty(self):
+        report = self._report_with_ledger("{\n[]\n")
+        queries, coverage, recon = (report["reconciliation"]["queries"],
+                                    report["trace"]["coverage"], report["reconciliation"])
+        alert = self._query_alert(report)
+        self.assertEqual(queries["ledger_state"], "unreadable")
+        self.assertEqual((queries["ledger_available"], coverage["query_ledger_available"]),
+                         (False, False))
+        self.assertEqual((alert["observed"], alert["evidence"], alert["candidate"]),
+                         ("unknown", "unknown", False))
+        self.assertIn("data_query_ledger", recon["unknown_items"])
+        self.assertEqual(queries["outcome_counts"], {}, "0 is never offered as ledger evidence")
+
+    def test_partially_unparseable_ledger_is_unknown(self):
+        good = json.dumps({"record_type": "query_result", "request_id": "r1",
+                           "outcome": "outcome_unknown"})
+        report = self._report_with_ledger(good + "\n{\n")
+        queries = report["reconciliation"]["queries"]
+        self.assertEqual(queries["ledger_state"], "partially_unreadable")
+        self.assertEqual(queries["ledger_unreadable_lines"], 1)
+        self.assertFalse(queries["ledger_available"], "a partial count is an unknown count")
+        self.assertEqual(self._query_alert(report)["evidence"], "unknown")
+        self.assertIn("data_query_ledger", report["reconciliation"]["unknown_items"])
+
+    def test_truly_empty_and_fully_valid_ledgers_stay_available(self):
+        report = self._report_with_ledger("")
+        self.assertEqual(report["reconciliation"]["queries"]["ledger_state"], "readable_empty")
+        self.assertTrue(report["reconciliation"]["queries"]["ledger_available"])
+        self.assertEqual(self._query_alert(report)["observed"], 0)
+        good = json.dumps({"record_type": "query_result", "request_id": "r1",
+                           "outcome": "outcome_unknown"})
+        report = self._report_with_ledger(good + "\n")
+        self.assertEqual(report["reconciliation"]["queries"]["ledger_state"], "readable")
+        self.assertEqual(report["reconciliation"]["queries"]["outcome_counts"],
+                         {"outcome_unknown": 1})
+        alert = self._query_alert(report)
+        self.assertEqual((alert["observed"], alert["evidence"]), (1, "ledger"))
+
+    # ---- 4. non-finite thresholds ----
+    def test_non_finite_thresholds_fail_closed_and_keep_strict_json(self):
+        for literal in ("NaN", "Infinity", "-Infinity"):
+            config = json.loads('{"observability":{"alerts":{"enabled":true,"thresholds":'
+                                '{"stale_leases":' + literal + '}}}}')
+            report = build_observability_report(self.store, config=config)
+            settings = report["settings"]
+            self.assertEqual((settings["config_valid"], settings["alerts_enabled"]), (False, False),
+                             literal)
+            self.assertIn("alerts", settings["invalid"])
+            self.assertEqual(settings["thresholds"]["stale_leases"],
+                             DEFAULT_ALERT_THRESHOLDS["stale_leases"])
+            json.dumps(report, allow_nan=False)  # must not raise
+            self.assertFalse(report["alert_candidates"]["enabled"])
+
+    # ---- 5/6/7. intake files ----
+    def test_reading_a_cleanly_closed_intake_creates_no_file(self):
+        from stock_agent.connector_runtime.queries import ConnectorQueryStore
+
+        path = self.base / "connector.sqlite3"
+        with ConnectorQueryStore(path):
+            pass
+        before = {p.name for p in self.base.iterdir()}
+        read = read_query_ledgers({"kimi_sources": {"query_store_path": str(path)}})
+        self.assertEqual(read["intake_state"], "readable_empty")
+        self.assertEqual({p.name for p in self.base.iterdir()} - before, set())
+
+    def _intake_with_one_consumption(self, path):
+        from stock_agent.connector_runtime.queries import ConnectorQueryStore
+
+        store = ConnectorQueryStore(path)
+        store.reserve_query("k-r23", source_id="file_price", upstream="ifind", purpose="r23",
+                            per_source_rpm=60, per_source_rpd=10, group_daily_limit=10,
+                            request_id="req-r23")
+        intent_id = store._conn.execute("SELECT intent_id FROM query_intents").fetchone()[0]
+        store.record_query_consumption(intent_id, "task-r23")
+        return store
+
+    def test_live_wal_keeps_committed_records_visible(self):
+        path = self.base / "connector.sqlite3"
+        store = self._intake_with_one_consumption(path)  # connection stays open: WAL pending
+        try:
+            self.assertGreater(Path(str(path) + "-wal").stat().st_size, 0)
+            read = read_query_ledgers({"kimi_sources": {"query_store_path": str(path)}})
+        finally:
+            store.close()
+        self.assertEqual(read["intake_state"], "readable")
+        self.assertEqual((len(read["intents"]), len(read["consumptions"])), (1, 1))
+        self.assertFalse(read["intake_wal_pending"])
+        self.assertEqual(read["consumptions"][0]["task_id"], "task-r23")
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory mode bits")
+    def test_read_only_directory_intake_is_readable_and_untouched(self):
+        directory = self.base / "readonly"
+        directory.mkdir()
+        path = directory / "connector.sqlite3"
+        store = self._intake_with_one_consumption(path)
+        store.close()
+        directory.chmod(0o555)
+        try:
+            before = {p.name for p in directory.iterdir()}
+            read = read_query_ledgers({"kimi_sources": {"query_store_path": str(path)}})
+            after = {p.name for p in directory.iterdir()}
+        finally:
+            directory.chmod(0o755)
+        self.assertEqual(read["intake_state"], "readable")
+        self.assertEqual(len(read["consumptions"]), 1)
+        self.assertEqual(after - before, set())
+
+    def test_plain_identifiers_and_timestamps_are_not_hashed(self):
+        for value in ("task_abc", "att_1", "dify-run-001", "2026-11-24T00:00:00+00:00",
+                      "invocation_failed_known", "sha256:0123456789abcdef"):
+            self.assertEqual(safe_label(value), value, value)
+        self.assertEqual(safe_label(""), "")
+        self.assertNotEqual(safe_label("has space"), "has space")
 
 
 class ZeroSideEffectsTests(FrozenCaseTestCase):

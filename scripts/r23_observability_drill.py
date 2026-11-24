@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import contextlib
 import io
+import shutil
 import sqlite3
+import tempfile
 import json
 import os
 import sys
@@ -802,6 +804,222 @@ def scale_check(root: Path) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# boundaries (sol round 3): labels, one consistent read, corrupt ledgers,
+# non-finite thresholds, intake sidecar files
+# --------------------------------------------------------------------------- #
+
+BODY_AS_ID = "Synthetic restricted prose fixture for R23"
+KEY_LIKE_LABEL = "sk-R23SyntheticProviderFixture0001"
+
+
+def boundary_checks(root: Path) -> dict:
+    """All on their own temporary stores under ``root``; returns a checks dict."""
+    from unittest.mock import patch
+
+    import stock_agent.observability as obs
+    from stock_agent.config import project_path_override
+    from stock_agent.connector_runtime.queries import ConnectorQueryStore
+    from stock_agent.task_runtime import TaskStore
+
+    checks = {}
+
+    def check(name, expected, actual):
+        checks[name] = {"expected": expected, "actual": actual, "ok": expected == actual}
+        return expected == actual
+
+    base = root / "r23_boundaries"
+    if base.exists():
+        shutil.rmtree(base)
+    base.mkdir(parents=True)
+
+    def new_store(name):
+        path = base / (name + ".sqlite3")
+        store = TaskStore(path)
+        task, _ = store.create_task(
+            title="合成边界任务", input_payload={"research_question": "合成", "data_classification": "public"},
+            execution_mode="replay")
+        return store, task["task_id"]
+
+    def prepare(store, task_id, provider="synthetic", worker="w-b"):
+        claim = store.claim_task(task_id, worker, ttl_seconds=120)
+        store.mark_running(task_id, worker_id=worker, fencing_token=claim["fencing_token"],
+                           expected_version=claim["version"])
+        return store.prepare_invocation_attempt(
+            task_id, worker_id=worker, fencing_token=claim["fencing_token"], round_index=1,
+            provider=provider, request_model="synthetic-model", prompt_sha256="b" * 64)
+
+    # 1. External correlation values: a sentence as a run id, a key as a provider.
+    store, task_id = new_store("labels")
+    store.attach_platform_run(task_id, run={"platform": "dify", "run_id": BODY_AS_ID,
+                                            "workflow_version": "wf", "actor": "a"})
+    prepare(store, task_id, provider=KEY_LIKE_LABEL)
+    report = obs.build_observability_report(store, task_id=task_id)
+    blob = json.dumps(report, ensure_ascii=False)
+    check("boundary.label.no_body", False, BODY_AS_ID in blob)
+    check("boundary.label.no_key", False, KEY_LIKE_LABEL in blob)
+    run_id = report["trace"]["platform_runs"][-1]["run_id"]
+    check("boundary.label.run_id_is_digest", True, run_id.startswith("sha256:") and len(run_id) == 23)
+    trace_label = report["trace"]["attempts"][0]["provider"]
+    providers = report["reconciliation"]["invocations"]["by_provider"]
+    check("boundary.label.detail_and_aggregate_share_label", [trace_label], list(providers))
+    check("boundary.label.digest_is_stable", run_id, obs.safe_label(BODY_AS_ID))
+    check("boundary.label.count_reconciles", 1, sum(providers.values()))
+    check("boundary.label.identifier_kept", True, report["trace"]["task"]["task_id"] == task_id)
+    store.close()
+
+    # 2. A writer commits between two aggregate reads: one report, one reading.
+    store, task_id = new_store("commit")
+    real_aggregate = obs.aggregate_attempts
+    reads = [0]
+
+    def aggregate_then_commit(reader):
+        data = real_aggregate(reader)
+        reads[0] += 1
+        if reads[0] == 1:
+            prepare(store, task_id)
+        return data
+
+    reader = TaskStore(store.db_path, read_only=True)
+    try:
+        with patch.object(obs, "aggregate_attempts", side_effect=aggregate_then_commit):
+            report = obs.build_observability_report(reader)
+    finally:
+        reader.close()
+    invocation = report["reconciliation"]["invocations"]
+    states, providers = (sum(invocation["states"].values()),
+                         sum(invocation["by_provider"].values()))
+    check("boundary.commit.one_aggregate_read", 1, reads[0])
+    check("boundary.commit.consistent_totals", (states, states), (states, providers))
+    store.close()
+
+    # 3. Corrupt audit ledgers never present 0 as ledger evidence.
+    def corrupt(name, text):
+        directory = base / name
+        directory.mkdir()
+        (directory / "audit.jsonl").write_text(text, encoding="utf-8")
+        config = {"kimi_sources": {"ledger_path": "audit.jsonl", "query_store_path": "none.sqlite3"}}
+        s = TaskStore(directory / "t.sqlite3")
+        try:
+            t, _ = s.create_task(title="合成", input_payload={
+                "research_question": "合成", "data_classification": "public"}, execution_mode="replay")
+            with project_path_override(lambda value: directory / value):
+                r = obs.build_observability_report(s, config=config, task_id=t["task_id"])
+        finally:
+            s.close()
+        q, trace, recon = r["reconciliation"]["queries"], r["trace"]["coverage"], r["reconciliation"]
+        alert = next(c for c in r["alert_candidates"]["candidates"]
+                     if c["rule"] == "query_outcome_unknown")
+        return (q["ledger_state"], q["ledger_available"], trace["query_ledger_available"],
+                alert["observed"], alert["evidence"], alert["candidate"],
+                "data_query_ledger" in recon["unknown_items"], q["outcome_counts"],
+                True)
+
+    bad = ("unreadable", False, False, "unknown", "unknown", False, True, {}, True)
+    check("boundary.ledger.all_bad_lines", bad, corrupt("all_bad", "{\n[]\n"))
+    check("boundary.ledger.partial", ("partially_unreadable", False, False, "unknown", "unknown",
+                                       False, True, {}, True),
+          corrupt("partial", json.dumps({"record_type": "query_result", "request_id": "r1",
+                                         "outcome": "ok"}) + "\n{\n"))
+    check("boundary.ledger.truly_empty", ("readable_empty", True, True, 0, "ledger", False,
+                                          False, {}, True), corrupt("empty", ""))
+    # (state, report available, trace available, alert observed, alert evidence,
+    #  alert fires, data_query_ledger unknown, outcome counts, constant True)
+    check("boundary.ledger.valid", ("readable", True, True, 0, "ledger", False, False, {"ok": 1}, True),
+          corrupt("valid", json.dumps({"record_type": "query_result", "request_id": "r1",
+                                       "outcome": "ok"}) + "\n"))
+
+    # 4. Non-finite thresholds: capability off, config invalid, strict JSON.
+    store, task_id = new_store("nan")
+    for name, literal in (("nan", "NaN"), ("inf", "Infinity")):
+        config = json.loads('{"observability":{"alerts":{"enabled":true,"thresholds":'
+                            '{"stale_leases":' + literal + '}}}}')
+        r = obs.build_observability_report(store, config=config, task_id=task_id)
+        try:
+            json.dumps(r, allow_nan=False)
+            strict = True
+        except ValueError:
+            strict = False
+        check("boundary.config." + name, (False, False, True),
+              (r["settings"]["config_valid"], r["settings"]["alerts_enabled"], strict))
+    store.close()
+
+    # 5. Reading a cleanly closed WAL intake creates no file.
+    directory = base / "closed"
+    directory.mkdir()
+    with ConnectorQueryStore(directory / "connector.sqlite3"):
+        pass
+    before = {p.name for p in directory.iterdir()}
+    read = obs.read_query_ledgers({"kimi_sources": {"query_store_path": str(directory / "connector.sqlite3")}})
+    check("boundary.intake.closed_no_sidecar", [], sorted({p.name for p in directory.iterdir()} - before))
+    check("boundary.intake.closed_readable_empty", "readable_empty", read["intake_state"])
+
+    # 6. A live WAL keeps committed records visible to the reader.
+    directory = base / "live"
+    directory.mkdir()
+    config = {"kimi_sources": {"query_store_path": str(directory / "connector.sqlite3")}}
+    live = ConnectorQueryStore(directory / "connector.sqlite3")
+    try:
+        live.reserve_query("k-r23-live", source_id="file_price", upstream="ifind",
+                           purpose="r23 drill", per_source_rpm=60, per_source_rpd=10,
+                           group_daily_limit=10, request_id="req-r23-live")
+        intents = live._conn.execute("SELECT intent_id FROM query_intents").fetchall()
+        live.record_query_consumption(intents[0][0], "task-r23-live")
+        wal_size = (directory / "connector.sqlite3-wal").stat().st_size
+        read = obs.read_query_ledgers(config)
+    finally:
+        live.close()
+    check("boundary.intake.live_wal_visible", ("readable", 1, 1, False),
+          (read["intake_state"], len(read["intents"]), len(read["consumptions"]),
+           read["intake_wal_pending"]))
+    check("boundary.intake.live_wal_really_pending", True, wal_size > 0)
+
+    # 7. A read-only DIRECTORY (not root): the read still works and writes nothing.
+    directory = base / "readonly"
+    directory.mkdir()
+    with ConnectorQueryStore(directory / "connector.sqlite3") as closed:
+        closed.reserve_query("k-r23-ro", source_id="file_price", upstream="ifind",
+                             purpose="r23 drill", per_source_rpm=60, per_source_rpd=10,
+                             group_daily_limit=10, request_id="req-r23-ro")
+        intents = closed._conn.execute("SELECT intent_id FROM query_intents").fetchall()
+        closed.record_query_consumption(intents[0][0], "task-r23-ro")
+    if os.geteuid() == 0:
+        check("boundary.intake.readonly_dir", "skipped: running as root bypasses mode bits",
+              "skipped: running as root bypasses mode bits")
+    else:
+        directory.chmod(0o555)
+        try:
+            before = {p.name for p in directory.iterdir()}
+            read = obs.read_query_ledgers({"kimi_sources": {
+                "query_store_path": str(directory / "connector.sqlite3")}})
+            after = {p.name for p in directory.iterdir()}
+        finally:
+            directory.chmod(0o755)
+        check("boundary.intake.readonly_dir", ("readable", 1, 1, []),
+              (read["intake_state"], len(read["consumptions"]), len(read["intents"]),
+               sorted(after - before)))
+    return checks
+
+
+def cmd_rointake(directory: str) -> int:
+    """The intake on a READ-ONLY MOUNT (container): readable, nothing created."""
+    import stock_agent.observability as obs
+
+    target = Path(directory)
+    intake = target / "connector.sqlite3"
+    before = {p.name for p in target.iterdir()}
+    read = obs.read_query_ledgers({"kimi_sources": {"query_store_path": str(intake)}})
+    after = {p.name for p in target.iterdir()}
+    created = sorted(after - before)
+    writable = os.access(target, os.W_OK)
+    ok = read["intake_state"] == "readable" and not created and not writable
+    emit({"phase": "rointake", "ok": ok, "directory": directory, "mount_writable": writable,
+          "intake_state": read["intake_state"], "intents": len(read["intents"]),
+          "consumptions": len(read["consumptions"]),
+          "intake_wal_pending": read["intake_wal_pending"], "created_by_read": created})
+    return 0 if ok else 13
+
+
+# --------------------------------------------------------------------------- #
 # subcommands
 # --------------------------------------------------------------------------- #
 
@@ -876,11 +1094,16 @@ def cmd_report() -> int:
             for leftover in sorted(off_db.parent.glob(off_db.name + "*")):
                 leftover.unlink()
         scale = scale_check(root)
-    failed = [name for name, c in result["checks"].items() if not c["ok"]]
-    ok = result["ok"] and off["ok"] and scale["ok"]
+    # The boundary checks use their own temporary stores, outside the project
+    # root, under the system temp dir.
+    boundaries = boundary_checks(Path(tempfile.gettempdir()))
+    failed = [name for name, c in list(result["checks"].items()) + list(boundaries.items())
+              if not c["ok"]]
+    ok = (result["ok"] and off["ok"] and scale["ok"]
+          and all(c["ok"] for c in boundaries.values()))
     emit({"phase": "report", "ok": ok,
-          "checks_total": len(result["checks"]), "checks_failed": failed,
-          "checks": result["checks"], "zero_side_effects": {
+          "checks_total": len(result["checks"]) + len(boundaries), "checks_failed": failed,
+          "checks": result["checks"], "boundaries": boundaries, "zero_side_effects": {
               "before": result["counts_before"], "after": result["counts_after"]},
           "business_with_sampling_off": off, "scale": scale})
     return 0 if ok else 13
@@ -939,6 +1162,7 @@ COMMANDS = {
     "serve": lambda args: cmd_serve(),
     "probe": lambda args: cmd_probe(),
     "cross": lambda args: cmd_cross(args[0], args[1]),
+    "rointake": lambda args: cmd_rointake(args[0]),
 }
 
 

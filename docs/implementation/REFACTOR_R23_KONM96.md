@@ -4,7 +4,7 @@
 （[REFACTOR_R23_20261023.md](REFACTOR_R23_20261023.md)），基线 `dc8a4cffd51663c0b4f1c67b1f5c03d7f3422071`。
 全部输入为合成案件；真实供应商、真实外发、R18 真传输、生产告警接收均为 `NOT_RUN`。
 
-本文件描述第 2 轮（sol 校验返工后）的行为。第 1 轮的五处缺陷及对应改动见 §6。
+本文件描述第 3 轮（sol 第二轮校验返工后）的行为。前两轮缺陷及对应改动见 §6。
 
 ## 1. 结论一览
 
@@ -17,16 +17,17 @@
 
 ## 2. 改动文件
 
-- `stock_agent/observability.py`（追加；`build_observability_status` 的键不变，`technical.scope` 为新增键）：
-  `build_trace`、`build_reconciliation`、`build_metrics`、`build_alert_candidates`、
-  `emit_observability_log`、`project_log_fields`、`observability_settings`、`read_query_ledgers`、
-  `queries_for_task`、`aggregate_attempts`、`event_type_counts`、`error_code`、`build_observability_report`。
+- `stock_agent/observability.py`（追加；`build_observability_status` 的键不变，`technical.scope`、
+  `label_note` 为新增键）：`build_trace`、`build_reconciliation`、`build_metrics`、
+  `build_alert_candidates`、`emit_observability_log`、`project_log_fields`、`observability_settings`、
+  `read_query_ledgers`、`queries_for_task`、`aggregate_attempts`、`event_type_counts`、`error_code`、
+  `safe_label`、`build_observability_report`。
 - `stock_agent/research_worker.py`：`run_research_task` 成为薄封装，正常入口结束时上送一条结构化记录；
   原函数体改名 `_run_research_task`，逻辑未动。
 - `stock_agent/ops_view.py`：`recent_failures[].error` 由错误原文改为稳定错误码。
 - `stock_agent/cli.py`：只读子命令 `observability`（`read_only=True` 开库，库不存在时拒绝、不创建）。
 - `scripts/r23_observability_drill.py`、`deploy/testing/r23_observability.compose.yaml`：容器演练。
-- `tests/test_refactor_r23_trace.py`：31 项定向用例，与容器演练共用同一冻结合成案例。
+- `tests/test_refactor_r23_trace.py`：44 项定向用例，与容器演练共用同一冻结合成案例。
 - `tests/test_ops_view.py`：`recent_failures` 排序用例改为断言错误码（见 §6 第 2 项）。
 
 未改 TaskStore、预算、采纳或 worker 状态流。`aggregate_attempts` / `event_type_counts` 通过
@@ -53,6 +54,20 @@
   为空，intake 不可读时 `query_consumption_binding` 进 `unknown_items`。读取 intake 用 `mode=ro`，
   文件不存在时如实报告、不创建。
 - **不抽样。** attempt 五态、供应商计数、待对账数和 outbox 事件类型计数都是全量聚合。
+- **一份报告一次账本读数。** 整份报告在一个 SQLite 只读快照里构建（`BEGIN` … `ROLLBACK`，不写任何东西），
+  attempt 只聚合一次并由状态与各节共用。写入方在报告中途提交，不会让同一报告里的两节对不上。
+- **外部关联值只以安全标签出现。** 平台 run ID、provider / 模型名、来源 ID 这类值由外部输入，
+  Dify 入口接受一句话当 run ID，provider 名也可以长得像密钥。凡不是合规标识符或带凭据形态的值，
+  一律输出 `sha256:` 加 16 位十六进制的稳定摘要；明细（trace 的 attempt）与聚合（`by_provider`）
+  用同一个标签函数，计数可对账。
+- **查询账本解析失败不等于空账本。** JSONL 非空但没有一条能解析 → `unreadable`；部分行坏 →
+  `partially_unreadable`。两者都算不可用：告警观测值为 `unknown`、结果计数为空、
+  `data_query_ledger` 进 `unknown_items`。只有真正零行的文件才是 `readable_empty`。
+- **读 intake 不创建文件。** 没有 pending WAL 的 intake 以 `immutable` 只读打开（只读挂载同样可用，
+  不会生成 `-wal` / `-shm`）。有 pending WAL 的 intake 需要普通只读打开才能看到已提交记录；若做不到
+  （例如只读挂载上没有共享内存文件），回退到主文件并置 `intake_wal_pending=true`、
+  `query_consumption_binding_wal_pending` 进 `unknown_items`。
+- **阈值拒收非有限值。** `NaN` / `Infinity` 使告警能力关闭、配置标无效，报告可被严格 JSON 解析。
 - **用量三分列。** `ledger`（预算账本与五态 attempt）、`replay`（回放模式任务数）、`estimated` 与
   `real_supplier` 一律 `unknown`——仓库没有估算账本，也没有供应商回执，不编造数字。
 - **配置失败关闭。** `observability.sampling` 与 `observability.alerts` 各自严格校验；哪一块畸形，
@@ -78,16 +93,20 @@ python3.12 -B scripts/run_isolated_tests.py --pattern test_ops_view.py
 ```
 C="docker compose -f deploy/testing/r23_observability.compose.yaml"
 $C run --rm -T drill python -B /drills/r23_observability_drill.py seed      # exit 0；真实入口建案，worker 采样开启
-$C run --rm -T drill python -B /drills/r23_observability_drill.py report    # exit 0；断言、零副作用、关采样、5001 任务超限
+$C run --rm -T drill python -B /drills/r23_observability_drill.py report    # exit 0；断言、零副作用、关采样、5001 任务超限、边界检查
 $C run -d --name r23-serve-konm96 serve
 $C exec -T serve python -B /drills/r23_observability_drill.py probe        # exit 0
 $C run --rm -T drill python -B /drills/r23_observability_drill.py cross http://<serve 容器 IP>:8770 http://<serve 容器 IP>:8769   # exit 0，4×403
 $C run --rm -T drill python -B -m stock_agent observability --config data/config/watchlist.r23.json --task-id <seed 输出的 task_id>
+$C run --rm -T -v <宿主目录含已关闭的 connector.sqlite3>:/ro-intake:ro drill python -B /drills/r23_observability_drill.py rointake /ro-intake   # exit 0；只读挂载可读、不创建文件
 $C down --volumes --remove-orphans
 ```
 
 `seed` 是唯一写演练库的步骤。`report` 里的「关闭采样」检查会真实运行 worker，它在演练库的副本上
-执行，所以 `report` 可以重复运行，结果一致。
+执行；边界检查用系统临时目录下各自的独立库。所以 `report` 可以重复运行，结果一致。
+
+容器以 root 运行，目录权限位对它无效，`report` 里的「只读目录」一项会明确标注跳过；只读场景由
+`rointake` 用真正的只读挂载验证。
 
 ## 5. 边界
 
@@ -109,3 +128,12 @@ $C down --volumes --remove-orphans
 | 3 | 查询账本缺失被报告为可读 | `read_query_ledgers` 区分四种状态，报告与 trace 共用一次读取 | 演练 `ledger.missing` / `unreadable` / `readable_empty` / `readable`；`LedgerAvailabilityTests` |
 | 4 | 超过 5000 任务后 attempt 漏计 | 改为全量 `GROUP BY` 聚合，回退路径显式标范围 | 演练 `scale`（5001 任务，1 个 attempt，五态合计 1）；`test_attempt_beyond_the_old_sample_cap_is_counted` |
 | 5 | 畸形配置仍显示告警启用 | 两个能力各自严格校验，失败关闭 | 演练 `config.malformed`、`config.alerts_only_malformed`；`ConfigTests` |
+
+### 第 2 轮（sol 第二轮校验，`d1aa255`）
+
+| # | 缺陷 | 改动 | 新证据 |
+| --- | --- | --- | --- |
+| 1 | 一句话填进 run ID 被原样输出；像密钥的 provider 名在 `by_provider` 里原样作键 | `safe_label` + 全视图标签化；明细与聚合同一标签 | 演练 `boundary.label.*`；`BoundaryTests`（含 Dify HTTP 入口一例） |
+| 2 | 写入方在报告中途提交，五态总计 0、供应商总计 1 | 整份报告一个只读快照；attempt 只聚合一次 | 演练 `boundary.commit.*`；`test_commit_during_a_report_does_not_mix_aggregate_reads` |
+| 3 | 坏 JSONL 被当成空账本；读已关闭的 WAL intake 留下 `-wal` / `-shm` | 解析失败与空账本分开，不完整计量为未知；无 pending WAL 用 `immutable` 打开，有则普通只读打开 | 演练 `boundary.ledger.*`、`boundary.intake.*`、容器 `rointake`；`BoundaryTests` |
+| 4 | `NaN` 阈值通过校验 | 拒收非有限值 | 演练 `boundary.config.nan` / `.inf`；`test_non_finite_thresholds_fail_closed_and_keep_strict_json` |

@@ -16,7 +16,10 @@ must never be reported as a technical failure (or vice versa).
 """
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
+import math
 import re
 import sys
 from datetime import datetime
@@ -73,8 +76,14 @@ def _categorize_gate(error: str) -> str:
     return GATE_OTHER
 
 
-def build_observability_status(store: Any, *, now: Optional[datetime] = None) -> Dict[str, Any]:
-    """Read-only layered status. ``now`` defaults to UTC (persistence clock)."""
+def build_observability_status(store: Any, *, now: Optional[datetime] = None,
+                               attempt_ledger: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Read-only layered status. ``now`` defaults to UTC (persistence clock).
+
+    ``attempt_ledger`` lets a caller that already aggregated the attempts
+    (the reconciliation) share that one read, so a report never mixes two
+    aggregate reads taken at different moments.
+    """
     moment = now or utc_now()
     tasks = store.list_tasks()
     queued = [t for t in tasks if t.get("status") == "queued"]
@@ -91,7 +100,7 @@ def build_observability_status(store: Any, *, now: Optional[datetime] = None) ->
             stale_leases += 1
 
     # Full ledger, never a sample: an attempt on the 5,001st task counts.
-    ledger = aggregate_attempts(store)
+    ledger = attempt_ledger if attempt_ledger is not None else aggregate_attempts(store)
     attempts, reconciliations_waiting = ledger["states"], ledger["reconciliations_waiting"]
 
     business_gate_counts: Dict[str, int] = {GATE_BUDGET: 0, GATE_EVIDENCE_QUALITY: 0,
@@ -123,14 +132,15 @@ def build_observability_status(store: Any, *, now: Optional[datetime] = None) ->
         "gate_counts": business_gate_counts,
         "blocked_sample": blocked_sample,
     }
-    return {
+    return _safe_tree({
         "schema_version": OBSERVABILITY_SCHEMA,
         "generated_at": moment.isoformat(timespec="seconds"),
         "technical": technical,
         "business": business,
         "scope_note": "只读分层状态：technical=机器健康，business=研究门禁；二者独立报告，互不冒充",
         "side_effects": "none",
-    }
+        "label_note": LABEL_NOTE,
+    })
 
 
 
@@ -179,6 +189,7 @@ MAX_EVENTS = 100000
 LEDGER_NOT_CONFIGURED = "not_configured"
 LEDGER_MISSING = "missing"
 LEDGER_UNREADABLE = "unreadable"
+LEDGER_PARTIAL = "partially_unreadable"
 LEDGER_READABLE_EMPTY = "readable_empty"
 LEDGER_READABLE = "readable"
 _LEDGER_READ_STATES = (LEDGER_READABLE, LEDGER_READABLE_EMPTY)
@@ -228,6 +239,75 @@ def error_code(text: Any) -> str:
         if any(marker in lowered for marker in markers):
             return code
     return "other"
+
+
+# A value that reached a view from OUTSIDE the ledger's control (a platform
+# run id, a provider or model name, a source id) is free text: the Dify entry
+# accepted a sentence as a run id, and a provider label can look like a key.
+# Such a value is published only as a validated identifier or as a stable
+# irreversible digest — never as itself.
+LABEL_NOTE = ("外部关联值只以校验通过的标识或 sha256 稳定摘要呈现；明细与聚合同一标签，计数可对账")
+_LABEL = re.compile(r"^[A-Za-z0-9_.:+\-/]{1,80}$")
+_LABEL_DIGEST_PREFIX = "sha256:"
+# Fields whose value is this module's own prose (Chinese notes / details),
+# not a value read from a ledger; they are exempt from labelling.
+PROSE_KEYS = frozenset({"note", "reason", "scope_note", "projection_note", "detail",
+                        "ledger_detail", "intake_detail", "label_note"})
+
+
+def safe_label(value: Any) -> str:
+    """A validated identifier, or ``sha256:<16 hex>`` of the exact value."""
+    text = str(value or "")
+    if text == "":
+        return ""
+    if _LABEL.match(text) and not contains_secret_marker(text):
+        return text
+    return _LABEL_DIGEST_PREFIX + hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_tree(value: Any) -> Any:
+    """Label every string value in a view; leaves non-string data alone."""
+    if isinstance(value, dict):
+        return {str(key): (str(item) if key in PROSE_KEYS and isinstance(item, str)
+                           else _safe_tree(item))
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_safe_tree(item) for item in value]
+    if isinstance(value, str):
+        return safe_label(value)
+    return value
+
+
+@contextlib.contextmanager
+def _consistent_read(store: Any):
+    """One SQLite read snapshot for a whole view.
+
+    A read-only connection can still ``BEGIN``: every SELECT inside the block
+    then sees the same committed state, so an attempt committed by a writer
+    midway through a report cannot appear in one section and not another.
+    Nothing is written and the transaction is rolled back. Stores without a
+    usable connection, or a caller already inside a transaction, are passed
+    through unchanged.
+    """
+    conn = getattr(store, "_conn", None)
+    if conn is None:
+        yield
+        return
+    try:
+        if conn.in_transaction:
+            yield
+            return
+        conn.execute("BEGIN")
+    except Exception:  # noqa: BLE001 — consistency is best effort, never a failure
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def redact(value: Any, limit: int = 200) -> str:
@@ -291,8 +371,10 @@ def observability_settings(config: Any = None) -> Dict[str, Any]:
     if alerts_valid:
         if isinstance(thresholds, dict):
             for name, value in thresholds.items():
+                # NaN / inf compare ">= 0" as False, so test finiteness first.
                 if name not in DEFAULT_ALERT_THRESHOLDS or isinstance(value, bool) \
-                        or not isinstance(value, (int, float)) or value < 0:
+                        or not isinstance(value, (int, float)) or not math.isfinite(value) \
+                        or value < 0:
                     alerts_valid = False
                     break
                 settings["thresholds"][name] = value
@@ -354,7 +436,8 @@ def aggregate_attempts(store: Any) -> Dict[str, Any]:
         if state == ATTEMPT_OUTCOME_UNKNOWN and not reconciled:
             result["reconciliations_waiting"] += count
         if provider:
-            result["providers"][provider] = result["providers"].get(provider, 0) + count
+            label = safe_label(provider)
+            result["providers"][label] = result["providers"].get(label, 0) + count
         result["with_error"] += int(with_error or 0)
     result["providers"] = dict(sorted(result["providers"].items()))
     return result
@@ -367,14 +450,14 @@ def event_type_counts(store: Any) -> Dict[str, Any]:
         try:
             rows = conn.execute(
                 "SELECT event_type, COUNT(*) AS n FROM task_outbox GROUP BY event_type").fetchall()
-            return {"counts": {str(r[0]): int(r[1]) for r in rows},
+            return {"counts": {safe_label(r[0]): int(r[1]) for r in rows},
                     "scanned": sum(int(r[1]) for r in rows), "complete": True}
         except Exception:  # noqa: BLE001
             pass
     events = store.events(limit=MAX_EVENTS)
     counts: Dict[str, int] = {}
     for event in events:
-        name = str(event.get("event_type") or "")
+        name = safe_label(event.get("event_type") or "")
         counts[name] = counts.get(name, 0) + 1
     summary = getattr(store, "summary", None)
     total = int((summary() or {}).get("outbox_events") or 0) if callable(summary) else None
@@ -389,19 +472,28 @@ def read_query_ledgers(config: Any = None) -> Dict[str, Any]:
     """Read both query records ONCE, reporting exactly what was found.
 
     - ``state``: the JSONL audit ledger — not_configured / missing /
-      unreadable / readable_empty / readable. Only the last two mean the
-      query counts below mean anything.
+      unreadable / partially_unreadable / readable_empty / readable. A file
+      with no parseable record is ``unreadable`` even when it is non-empty,
+      and a file with SOME bad lines is ``partially_unreadable``: only the
+      last two states mean the query counts below mean anything, so a
+      corrupt ledger can never present 0 as ledger evidence.
     - ``intake_state``: the connector intake (reservation -> consumption
-      binding). It is the authority that ties a query to the task that
-      consumed it; without it only legacy ``task_id`` links can be used.
+      binding), the authority that ties a query to the task that consumed
+      it. Reported with the same vocabulary.
 
-    The intake is opened with ``mode=ro``: a missing intake is reported, never
-    created (the production ``ConnectorQueryStore`` would create the schema).
+    Reading never creates a file. A WAL database normally leaves no
+    ``-wal``/``-shm`` behind once the last connection closes, and opening it
+    read-only would CREATE those sidecars — so an intake with no pending
+    WAL is opened ``immutable`` (works on a read-only mount too, touches
+    nothing). An intake that still has committed frames in a live ``-wal``
+    needs a real read-only open to see them; if that is impossible (for
+    example a read-only mount without the shared-memory file) the immutable
+    fallback is used and ``intake_wal_pending`` says the WAL was not seen.
     """
     read: Dict[str, Any] = {"state": LEDGER_NOT_CONFIGURED, "detail": "",
-                            "records": [], "unreadable_lines": 0,
+                            "records": [], "unreadable_lines": 0, "line_count": 0,
                             "intake_state": LEDGER_NOT_CONFIGURED, "intake_detail": "",
-                            "consumptions": [], "intents": {}}
+                            "intake_wal_pending": False, "consumptions": [], "intents": {}}
     if not isinstance(config, dict):
         return read
     import sqlite3
@@ -419,14 +511,28 @@ def read_query_ledgers(config: Any = None) -> Dict[str, Any]:
                     line = line.strip()
                     if not line:
                         continue
+                    read["line_count"] += 1
                     try:
                         record = json.loads(line)
                     except json.JSONDecodeError:
+                        record = None
+                    if not isinstance(record, dict):
                         read["unreadable_lines"] += 1
                         continue
-                    if isinstance(record, dict):
-                        read["records"].append(record)
-            read["state"] = LEDGER_READABLE if read["records"] else LEDGER_READABLE_EMPTY
+                    read["records"].append(record)
+            if read["line_count"] == 0:
+                read["state"] = LEDGER_READABLE_EMPTY
+            elif not read["records"]:
+                read["state"] = LEDGER_UNREADABLE
+                read["detail"] = "query ledger has no parseable record ({0} bad lines)".format(
+                    read["unreadable_lines"])
+            elif read["unreadable_lines"]:
+                read["state"] = LEDGER_PARTIAL
+                read["detail"] = ("query ledger partially unparseable ({0} of {1} lines); "
+                                  "counts would be incomplete").format(
+                                      read["unreadable_lines"], read["line_count"])
+            else:
+                read["state"] = LEDGER_READABLE
         except (OSError, UnicodeDecodeError) as exc:
             read["state"] = LEDGER_UNREADABLE
             read["detail"] = "query ledger unreadable: {0}".format(type(exc).__name__)
@@ -437,27 +543,56 @@ def read_query_ledgers(config: Any = None) -> Dict[str, Any]:
         read["intake_detail"] = "query intake file absent"
         return read
     try:
-        conn = sqlite3.connect(intake_path.resolve().as_uri() + "?mode=ro", uri=True,
-                               timeout=30, isolation_level=None, check_same_thread=False)
+        rows = _read_intake(intake_path, read)
+    except sqlite3.Error as exc:
+        read["intake_state"] = LEDGER_UNREADABLE
+        read["intake_detail"] = "query intake unreadable: {0}".format(type(exc).__name__)
+        return read
+    names, intent_rows, consumption_rows = rows
+    if not {"query_intents", "query_consumptions"} <= names:
+        read["intake_state"] = LEDGER_READABLE_EMPTY
+        read["intake_detail"] = "intake has no query tables yet"
+        return read
+    read["intents"] = {str(r["intent_id"]): dict(r) for r in intent_rows}
+    read["consumptions"] = [dict(r) for r in consumption_rows]
+    read["intake_state"] = LEDGER_READABLE if read["intents"] else LEDGER_READABLE_EMPTY
+    return read
+
+
+def _read_intake(intake_path: Path, read: Dict[str, Any]):
+    """(table names, intent rows, consumption rows) without creating files."""
+    import sqlite3
+
+    wal = Path(str(intake_path) + "-wal")
+    wal_pending = wal.exists() and wal.stat().st_size > 0
+    base = intake_path.resolve().as_uri()
+
+    def load(uri: str) -> tuple:
+        conn = sqlite3.connect(uri, uri=True, timeout=30, isolation_level=None,
+                               check_same_thread=False)
         try:
             conn.row_factory = sqlite3.Row
             names = {str(r[0]) for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'")}
             if not {"query_intents", "query_consumptions"} <= names:
-                read["intake_state"] = LEDGER_READABLE_EMPTY
-                read["intake_detail"] = "intake has no query tables yet"
-            else:
-                read["intents"] = {str(r["intent_id"]): dict(r) for r in conn.execute(
-                    "SELECT * FROM query_intents")}
-                read["consumptions"] = [dict(r) for r in conn.execute(
-                    "SELECT * FROM query_consumptions ORDER BY consumed_at, intent_id")]
-                read["intake_state"] = LEDGER_READABLE if read["intents"] else LEDGER_READABLE_EMPTY
+                return names, [], []
+            intents = conn.execute("SELECT * FROM query_intents").fetchall()
+            consumptions = conn.execute(
+                "SELECT * FROM query_consumptions ORDER BY consumed_at, intent_id").fetchall()
+            return names, intents, consumptions
         finally:
             conn.close()
-    except sqlite3.Error as exc:
-        read["intake_state"] = LEDGER_UNREADABLE
-        read["intake_detail"] = "query intake unreadable: {0}".format(type(exc).__name__)
-    return read
+
+    if not wal_pending:
+        return load(base + "?mode=ro&immutable=1")
+    try:
+        return load(base + "?mode=ro")
+    except sqlite3.Error:
+        # The live WAL could not be read here (e.g. a read-only mount without
+        # its shared-memory file): fall back to the main file and SAY so.
+        read["intake_wal_pending"] = True
+        read["intake_detail"] = "query intake WAL not visible from this reader; main file only"
+        return load(base + "?mode=ro&immutable=1")
 
 
 def queries_for_task(task_id: str, read: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -527,6 +662,8 @@ def queries_for_task(task_id: str, read: Dict[str, Any]) -> List[Dict[str, Any]]
 
 def ledger_unknown_items(read: Dict[str, Any]) -> List[str]:
     unknown = []
+    if read.get("intake_wal_pending"):
+        unknown.append("query_consumption_binding_wal_pending")
     if read.get("state") not in _LEDGER_READ_STATES:
         unknown.append("data_query_ledger")
     if read.get("intake_state") not in _LEDGER_READ_STATES:
@@ -565,6 +702,11 @@ def build_trace(store: Any, task_id: str, *, config: Any = None,
     ``query_read`` (from :func:`read_query_ledgers`) is shared with the
     reconciliation so both report the same availability.
     """
+    with _consistent_read(store):
+        return _build_trace(store, task_id, config, ledger, query_read)
+
+
+def _build_trace(store: Any, task_id: str, config: Any, ledger, query_read) -> Dict[str, Any]:
     task = store.get_task(str(task_id))
     read = dict(query_read) if query_read is not None else (
         {"state": LEDGER_READABLE if ledger else LEDGER_READABLE_EMPTY, "records": list(ledger or []),
@@ -577,8 +719,10 @@ def build_trace(store: Any, task_id: str, *, config: Any = None,
         "round_index": a.get("round_index"),
         "worker_id": str(a.get("worker_id") or ""),
         "fencing_token": a.get("fencing_token"),
-        "provider": redact(a.get("provider"), 60),
-        "request_model": redact(a.get("request_model"), 80),
+        # Raw on purpose: the labelling pass turns both into the SAME safe
+        # label the aggregate uses, so detail and counts reconcile.
+        "provider": str(a.get("provider") or ""),
+        "request_model": str(a.get("request_model") or ""),
         "state": str(a.get("state") or ""),
         "sent": str(a.get("sent") or ""),
         "reconciled": bool(a.get("reconciled_at")),
@@ -618,7 +762,7 @@ def build_trace(store: Any, task_id: str, *, config: Any = None,
             kinds.append("outstanding")
         else:
             kinds.append("success" if state == ATTEMPT_SUCCEEDED else state)
-    return {
+    return _safe_tree({
         "schema_version": TRACE_SCHEMA,
         "generated_at": utc_now().isoformat(timespec="seconds"),
         "task": {
@@ -659,7 +803,8 @@ def build_trace(store: Any, task_id: str, *, config: Any = None,
         },
         "side_effects": "none",
         "projection_note": "仅标识/状态/时间/稳定错误码；不含输入输出正文、提示词或错误原文",
-    }
+        "label_note": LABEL_NOTE,
+    })
 
 
 # -------- reconciliation (view vs authoritative ledgers) -------- #
@@ -675,8 +820,15 @@ def build_reconciliation(store: Any, *, config: Any = None,
     supplier), ``estimated`` (no estimator exists, so the value stays
     ``unknown`` rather than being invented).
     """
+    with _consistent_read(store):
+        return _build_reconciliation(store, config, now, ledger, query_read)
+
+
+def _build_reconciliation(store: Any, config: Any, now, ledger, query_read) -> Dict[str, Any]:
     moment = now or utc_now()
-    status = build_observability_status(store, now=moment)
+    # ONE aggregate read, shared by the status and every section below.
+    attempt_ledger = aggregate_attempts(store)
+    status = build_observability_status(store, now=moment, attempt_ledger=attempt_ledger)
     technical, business = status["technical"], status["business"]
     tasks = list(store.list_tasks())
     summary = store.summary() or {}
@@ -710,7 +862,6 @@ def build_reconciliation(store: Any, *, config: Any = None,
         mode = str(task.get("execution_mode") or "live")
         by_mode[mode] = by_mode.get(mode, 0) + 1
 
-    attempt_ledger = aggregate_attempts(store)
     attempt_states = technical["invocation_attempts"]
     replay_tasks = sum(n for mode, n in by_mode.items() if mode in REPLAY_EXECUTION_MODES)
 
@@ -731,13 +882,14 @@ def build_reconciliation(store: Any, *, config: Any = None,
     if not events["complete"]:
         unknown_items.add("outbox_event_type_counts")
 
-    return {
+    return _safe_tree({
         "schema_version": RECONCILIATION_SCHEMA,
         "generated_at": moment.isoformat(timespec="seconds"),
         "technical": technical,
         "business": business,
         "authoritative": {
-            "task_status_counts": dict(summary.get("task_counts") or {}),
+            "task_status_counts": {safe_label(k): int(v)
+                                    for k, v in dict(summary.get("task_counts") or {}).items()},
             "outbox_events": outbox_total,
             "consumption": store.consumption_summary(),
             "event_type_counts": dict(sorted(event_counts.items())),
@@ -814,7 +966,8 @@ def build_reconciliation(store: Any, *, config: Any = None,
         },
         "unknown_items": sorted(unknown_items),
         "side_effects": "none",
-    }
+        "label_note": LABEL_NOTE,
+    })
 
 
 def _db_bytes(store: Any) -> Optional[int]:
@@ -975,7 +1128,10 @@ def build_observability_report(store: Any, *, config: Any = None,
     availability."""
     settings = observability_settings(config)
     query_read = read_query_ledgers(config)
-    reconciliation = build_reconciliation(store, config=config, now=now, query_read=query_read)
+    with _consistent_read(store):
+        reconciliation = build_reconciliation(
+            store, config=config, now=now, query_read=query_read)
+        trace = build_trace(store, task_id, query_read=query_read) if task_id else None
     report = {
         "schema_version": RECONCILIATION_SCHEMA,
         "generated_at": reconciliation["generated_at"],
@@ -986,8 +1142,9 @@ def build_observability_report(store: Any, *, config: Any = None,
         "alert_candidates": build_alert_candidates(
             reconciliation, reconciliation, thresholds=settings["thresholds"],
             alerts_enabled=settings["alerts_enabled"]),
-        "trace": build_trace(store, task_id, query_read=query_read) if task_id else None,
+        "trace": trace,
         "settings": settings,
         "side_effects": "none",
+        "label_note": LABEL_NOTE,
     }
-    return report
+    return _safe_tree(report)
