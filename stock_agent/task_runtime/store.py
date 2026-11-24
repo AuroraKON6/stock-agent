@@ -182,6 +182,12 @@ CREATE TABLE IF NOT EXISTS task_platform_runs (
     recorded_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_platform_runs_task ON task_platform_runs(task_id, recorded_at);
+CREATE TABLE IF NOT EXISTS task_input_bindings (
+    task_id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    via TEXT NOT NULL,
+    bound_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS task_input_snapshots (
     task_id TEXT NOT NULL,
     input_version INTEGER NOT NULL,
@@ -385,6 +391,7 @@ class TaskStore:
         actor: str = "operator",
         consume_event: Optional[Dict[str, Any]] = None,
         platform_run: Optional[Dict[str, Any]] = None,
+        input_owner_binding: Optional[Dict[str, str]] = None,
     ) -> Tuple[Dict[str, Any], str]:
         """Create (or deduplicate) a task; optionally record its event consumption atomically.
 
@@ -460,6 +467,20 @@ class TaskStore:
                 "base_key": str(consume_event.get("base_key") or "").strip(),
                 "signal_id": str(consume_event.get("signal_id") or "").strip(),
             }
+        binding: Optional[Dict[str, str]] = None
+        if input_owner_binding is not None:
+            # R15: a SERVER-SIDE ownership record, written only inside the
+            # create transaction by the calling code path — business input
+            # (the payload) can never produce a row here, and the DUPLICATE
+            # path never writes one, so a deduplicated retry keeps the
+            # original task's ownership exactly as it was bound at creation.
+            if not isinstance(input_owner_binding, dict):
+                raise TaskRuntimeError("input_owner_binding must be an object")
+            binding_owner = str(input_owner_binding.get("owner") or "").strip()
+            binding_via = str(input_owner_binding.get("via") or "").strip()
+            if not binding_owner or not binding_via:
+                raise TaskRuntimeError("input_owner_binding requires owner and via")
+            binding = {"owner": binding_owner, "via": binding_via}
         if not idempotency_key:
             # Default identity: same case/role/prompt/model/mode AND the exact
             # same input content. Independent requests (different question,
@@ -584,6 +605,11 @@ class TaskStore:
             )
             self._write_input_snapshot(task_id, input_version, input_payload,
                                        created_by=actor, reason="created", created_at=created)
+            if binding is not None:
+                self._conn.execute(
+                    "INSERT INTO task_input_bindings (task_id, owner, via, bound_at) VALUES (?,?,?,?)",
+                    (task_id, binding["owner"], binding["via"], created),
+                )
             if run_record is not None:
                 self._record_platform_run(task_id, business_intent_id, run_record)
             if consumption is not None:
@@ -777,6 +803,51 @@ class TaskStore:
             ("{0}::{1}".format(str(platform), str(run_id)),),
         ).fetchone()
         return dict(row) if row is not None else None
+
+    def input_owner_binding(self, task_id: str) -> Optional[Dict[str, str]]:
+        """The task's server-side input-owner binding, or None.
+
+        Written only inside the create transaction when the calling code
+        path supplied one (R15: the personal workspace entry binds its
+        session-verified principal). Business input can never produce a
+        row, and a deduplicated retry keeps the original task's binding."""
+        row = self._conn.execute(
+            "SELECT owner, via, bound_at FROM task_input_bindings WHERE task_id = ?",
+            (str(task_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"owner": str(row["owner"]), "via": str(row["via"]),
+                "bound_at": str(row["bound_at"])}
+
+    def input_owner_bindings(self, task_ids: Optional[List[str]] = None) -> Dict[str, Dict[str, str]]:
+        """Batch form of :meth:`input_owner_binding` (read-only).
+
+        One query per 500 ids (SQLite host-parameter bound) so the board and
+        its realtime stream can scope a page of tasks without N+1 reads.
+        ``task_ids`` omitted = every binding row."""
+        if task_ids is None:
+            rows = self._conn.execute(
+                "SELECT task_id, owner, via, bound_at FROM task_input_bindings"
+            ).fetchall()
+        else:
+            ids = [str(item) for item in task_ids]
+            if not ids:
+                return {}
+            rows = []
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                rows.extend(self._conn.execute(
+                    "SELECT task_id, owner, via, bound_at FROM task_input_bindings "
+                    "WHERE task_id IN ({0})".format(placeholders), chunk).fetchall())
+        return {
+            str(row["task_id"]): {
+                "owner": str(row["owner"]), "via": str(row["via"]),
+                "bound_at": str(row["bound_at"]),
+            }
+            for row in rows
+        }
 
     def input_snapshots(self, task_id: str) -> List[Dict[str, Any]]:
         """Immutable per-version input history (payload decoded, sha preserved)."""
@@ -1374,10 +1445,32 @@ class TaskStore:
         if int(row["fencing_token"]) != int(fencing_token):
             raise TaskFencingError("stale fencing token {0} (current {1}); the task was reclaimed".format(fencing_token, row["fencing_token"]))
 
-    def summary(self) -> Dict[str, Any]:
-        rows = self._conn.execute("SELECT status, COUNT(*) AS n FROM research_tasks GROUP BY status").fetchall()
+    def summary(self, task_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Workbench counts; ``task_ids`` narrows them to a caller's scope.
+
+        The scoped form powers the session board: a personal session must
+        never see counts (or outbox totals) for tasks outside its own
+        shared + personal visibility. Omitted = whole-store projection, the
+        legacy/CLI behavior."""
+        if task_ids is None:
+            rows = self._conn.execute("SELECT status, COUNT(*) AS n FROM research_tasks GROUP BY status").fetchall()
+            outbox_count = int(self._conn.execute("SELECT COUNT(*) FROM task_outbox").fetchone()[0])
+        else:
+            ids = [str(item) for item in task_ids]
+            counts_acc: Dict[str, int] = {}
+            outbox_count = 0
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in self._conn.execute(
+                        "SELECT status, COUNT(*) AS n FROM research_tasks "
+                        "WHERE task_id IN ({0}) GROUP BY status".format(placeholders), chunk):
+                    counts_acc[str(row["status"])] = counts_acc.get(str(row["status"]), 0) + int(row["n"])
+                outbox_count += int(self._conn.execute(
+                    "SELECT COUNT(*) FROM task_outbox WHERE task_id IN ({0})".format(placeholders),
+                    chunk).fetchone()[0])
+            rows = [{"status": status, "n": count} for status, count in counts_acc.items()]
         counts = {row["status"]: int(row["n"]) for row in rows}
-        outbox_count = int(self._conn.execute("SELECT COUNT(*) FROM task_outbox").fetchone()[0])
         return {"schema_version": TASK_SCHEMA_VERSION, "task_counts": counts, "outbox_events": outbox_count}
 
     # -------- event consumption ledger --------

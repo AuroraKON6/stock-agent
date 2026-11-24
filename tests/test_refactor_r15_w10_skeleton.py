@@ -54,7 +54,11 @@ class W10SkeletonTestCase(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        # Resolve the temp root (same practice as the isolated browser
+        # driver's realpath): under a symlinked TMPDIR (e.g. /var on macOS)
+        # the vault's reparse-point guard would otherwise reject the object
+        # path. The production guard itself stays untouched.
+        self.root = Path(temporary.name).resolve()
         self.enterContext(project_path_override(lambda value: self.root / value))
         self.config = vault_config(self.root, {})
         mdg = self.config.setdefault("market_data_governance", {})
@@ -64,6 +68,23 @@ class W10SkeletonTestCase(unittest.TestCase):
         mdg["allow_degraded_offhours_llm"] = True
         self.store = TaskStore(self.root / "tasks.sqlite3")
         self.addCleanup(self.store.close)
+        # One fixture filing signal the task's plan binds (R15 rework: the
+        # excerpt-fact association gate requires the source document to carry
+        # a task-bound signal, same rule as evidence summaries).
+        from stock_agent.models import AnalyzedSignal, now_iso
+        from stock_agent.storage import SignalStore
+
+        signals = SignalStore(Path(self.config["storage"]["sqlite_path"]))
+        try:
+            signals.upsert_many([AnalyzedSignal(
+                signal_id="sig-w10-skeleton", source="manual", source_type="filing",
+                title="W10骨架样本公告信号", summary="fixture filing signal",
+                url="https://www.cninfo.com.cn/new/disclosure/detail?fixture=w10-skeleton",
+                published_at=now_iso(), collected_at=now_iso(), symbols=["600519"],
+                payload={"data_classification": "public"},
+            )])
+        finally:
+            signals.close()
 
         def authenticator(config, actor, symbols):
             if actor != OWNER:
@@ -143,6 +164,17 @@ class W10SkeletonTestCase(unittest.TestCase):
         document = imported["document"]
         audit = personal_import_audit(self.config, OWNER)
         self.assertEqual(audit[-1]["institutional_admission"], "NOT_REQUESTED")
+        # R15 rework: associate the fixture document with the plan signal the
+        # task binds (the vault's own reviewed API), so its excerpt fact and
+        # its summary pass the same association gate.
+        from stock_agent.evidence_vault import link_evidence_to_signal
+
+        link_evidence_to_signal(
+            personal_vault_view(self.config, OWNER),
+            document_id=document["document_id"],
+            signal_id="sig-w10-skeleton", actor=OWNER,
+            actor_role="information_analyst",
+            notes="W10 skeleton fixture: 关联计划信号")
 
         # 3) Body → located excerpt (R12a) → typed fact (R05), all inside the
         #    personal namespace view.

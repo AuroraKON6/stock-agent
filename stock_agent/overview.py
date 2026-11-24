@@ -16,6 +16,15 @@ RECENT_EVENT_LIMIT = 10
 EVENT_LOOKBACK_HOURS = 24
 
 
+def _visible_task_ids(store: Any, actor: Optional[str]) -> Optional[set]:
+    """None = unscoped legacy projection; a set = the caller's scope."""
+    if actor is None:
+        return None
+    from .personal_evidence import visible_task_ids
+
+    return visible_task_ids(store, actor)
+
+
 def _topic_symbols(config: Dict[str, Any]) -> list:
     symbols: list = []
     seen: set = set()
@@ -30,7 +39,8 @@ def _topic_symbols(config: Dict[str, Any]) -> list:
     return symbols
 
 
-def build_overview(config: Dict[str, Any], *, store: Optional[Any] = None) -> Dict[str, Any]:
+def build_overview(config: Dict[str, Any], *, store: Optional[Any] = None,
+                   actor: Optional[str] = None) -> Dict[str, Any]:
     from .models import now_iso
 
     config = config or {}
@@ -78,10 +88,17 @@ def build_overview(config: Dict[str, Any], *, store: Optional[Any] = None) -> Di
     tasks: Dict[str, Any] = {"available": False}
     budget: Dict[str, Any] = {"calls_today": 0, "limit": 0, "enabled": False}
     if store is not None:
-        summary = store.summary() or {}
+        # ``actor`` present = session-scoped workbench: counts and the
+        # awaiting list cover shared + the caller's own personal research
+        # only, on the same trusted-input-binding contract as the task list.
+        visible_ids = _visible_task_ids(store, actor)
+        summary = (store.summary(task_ids=sorted(visible_ids))
+                   if visible_ids is not None else store.summary()) or {}
         status_counts = dict(summary.get("task_counts") or {})
         awaiting = []
         for task in store.list_tasks(status="awaiting_human"):
+            if visible_ids is not None and str(task.get("task_id")) not in visible_ids:
+                continue
             request = task.get("human_request") if isinstance(task.get("human_request"), dict) else {}
             awaiting.append({
                 "task_id": str(task.get("task_id") or ""),

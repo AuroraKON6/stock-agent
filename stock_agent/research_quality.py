@@ -92,8 +92,10 @@ def _normalize_token(token: str) -> str:
 
 def context_text_for_quality(safe_context: Dict[str, Any]) -> str:
     """Deterministic text of EVERYTHING delivered to the model: evidence
-    summaries (vault projection + explicitly-unverified human notes) and the
-    approved quote snapshots. A number is verifiable only if it was delivered."""
+    summaries (vault projection + explicitly-unverified human notes), the
+    approved fact bundle's delivered contents (R13 verified_facts ride the
+    same context), and the approved quote snapshots. A number is verifiable
+    only if it was delivered."""
     parts: List[str] = []
     evidence = safe_context.get("evidence_summaries") if isinstance(safe_context, dict) else None
     if isinstance(evidence, dict):
@@ -101,6 +103,10 @@ def context_text_for_quality(safe_context: Dict[str, Any]) -> str:
             entry = evidence[ref] or {}
             parts.append(str(entry.get("summary") or ""))
             parts.append(str(entry.get("human_note") or ""))
+    facts = safe_context.get("verified_facts") if isinstance(safe_context, dict) else None
+    if isinstance(facts, list):
+        for fact in facts:
+            parts.append(str((fact or {}).get("content") or ""))
     quotes = safe_context.get("quote_snapshots") if isinstance(safe_context, dict) else None
     if isinstance(quotes, dict):
         for symbol in sorted(quotes):

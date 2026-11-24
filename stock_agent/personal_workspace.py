@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from .models import now_iso
+from .personal_evidence import PERSONAL_ORIGIN_VIA
 from .task_intake import ensure_question_task
 from .task_runtime import TaskStore
 from .task_runtime.store import (
@@ -43,7 +44,21 @@ from .task_runtime.store import (
 class WorkspaceError(ValueError):
     """reason codes: empty_question, no_symbols, unknown_task, task_terminal,
     not_awaiting, not_succeeded, cancel_terminal, unknown_document,
-    empty_note, already_acknowledged"""
+    invalid_fact_selector, empty_note, already_acknowledged"""
+
+
+class WorkspaceForbidden(WorkspaceError):
+    """The session principal is not the owner of the targeted personal task.
+
+    Raised BEFORE any create/mutate work so a denied request leaves the task
+    store, input bindings, queue and model dispatch byte-for-byte unchanged.
+    Shared research (no trusted personal binding) stays available to every
+    signed-in principal — the documented legacy compatibility path."""
+
+
+# Same cap the R13 fact bundle enforces; the entry rejects instead of letting
+# the bundle silently truncate a user's selection.
+MAX_CREATE_FACT_SELECTORS = 50
 
 
 def _resolve_personal_documents(config: Optional[Dict[str, Any]], actor: str,
@@ -73,11 +88,48 @@ def _resolve_personal_documents(config: Optional[Dict[str, Any]], actor: str,
     }
 
 
+def _resolve_personal_fact_selectors(config: Optional[Dict[str, Any]], actor: str,
+                                     fact_selectors: Optional[list]) -> List[Dict[str, Any]]:
+    """Validate the user's excerpt-selector submission against the OWNER's
+    personal namespace BEFORE anything is created (same fail-closed contract
+    as the document selection): a selector that does not verify against the
+    owner's own vault view — foreign namespace, stale hash, shifted range —
+    never rides a task input, and a rejected create leaves the queue
+    untouched. This grants no egress right: the worker re-verifies every
+    selector against the CURRENT vault and host egress policy when it freezes
+    the attempt's fact bundle (R13/A60–A63)."""
+    wanted = list(fact_selectors or [])
+    if not wanted:
+        return []
+    if len(wanted) > MAX_CREATE_FACT_SELECTORS:
+        raise WorkspaceError(
+            "invalid_fact_selector: at most {0} selectors per research".format(
+                MAX_CREATE_FACT_SELECTORS))
+    from .evidence_excerpts import SELECTOR_FIELDS, EvidenceExcerptError, verify_excerpt_selection
+    from .personal_evidence import personal_vault_view
+
+    view = personal_vault_view(config or {}, actor)
+    resolved: List[Dict[str, Any]] = []
+    for item in wanted:
+        if not isinstance(item, dict) or set(item) != set(SELECTOR_FIELDS):
+            raise WorkspaceError(
+                "invalid_fact_selector: expected exactly the excerpt selector fields")
+        try:
+            verify_excerpt_selection(view, item)
+        except EvidenceExcerptError as exc:
+            raise WorkspaceError(
+                "invalid_fact_selector: not verifiable in the personal namespace of {0}: {1}".format(
+                    actor, exc))
+        resolved.append({field: item[field] for field in SELECTOR_FIELDS})
+    return resolved
+
+
 def create_personal_research(store: TaskStore, *, actor: str, question: str,
                              symbols: list, execution_mode: str = "replay",
                              config: Optional[Dict[str, Any]] = None,
                              intent_id: str = "",
-                             document_ids: Optional[list] = None) -> Dict[str, Any]:
+                             document_ids: Optional[list] = None,
+                             fact_selectors: Optional[list] = None) -> Dict[str, Any]:
     question = str(question or "").strip()
     symbols = [str(s).strip() for s in (symbols or []) if str(s).strip()]
     if not question:
@@ -88,20 +140,66 @@ def create_personal_research(store: TaskStore, *, actor: str, question: str,
     # untouched, so retrying with a corrected selection creates exactly one
     # task (a leftover orphan would swallow the retry as DUPLICATE).
     attachments = _resolve_personal_documents(config, actor, document_ids)
-    # The selected documents ride the task's FIRST input version, inside the
-    # same create transaction: the task becomes claimable only WITH its
-    # complete input, so any worker's first claim already sees the sources.
-    # The R01 snapshot chain stays fully intact (v1 snapshot written at
-    # creation; every later follow-up keeps bumping immutable versions).
+    selectors = _resolve_personal_fact_selectors(config, actor, fact_selectors)
+    if selectors:
+        # Every accepted fact rides WITH its source: a selector's document
+        # joins the delivered evidence summaries (vault projection) even
+        # when the user did not tick it separately, so each delivered fact
+        # has a citable original. Worker-side gates still apply unchanged.
+        from .personal_evidence import personal_documents
+
+        projection = {str(item.get("document_id") or ""): item
+                      for item in personal_documents(config or {}, actor).get("documents") or []}
+        for selector in selectors:
+            document_id = str(selector.get("document_id") or "")
+            if not document_id or document_id in attachments:
+                continue
+            document = projection.get(document_id) or {}
+            attachments[document_id] = {
+                "summary": str(document.get("title") or "")[:1000] or "vault document",
+                "sha256": str(document.get("sha256") or ""),
+            }
+    # The selected documents AND facts ride the task's FIRST input version,
+    # inside the same create transaction: the task becomes claimable only
+    # WITH its complete input, so any worker's first claim already sees the
+    # sources. The R01 snapshot chain stays fully intact (v1 snapshot written
+    # at creation; every later follow-up keeps bumping immutable versions).
+    overrides: Dict[str, Any] = {}
+    if attachments:
+        overrides["public_context"] = {"evidence_summaries": attachments}
+    if selectors:
+        # R15: the user's approved announcement facts enter as excerpt
+        # SELECTORS — content stays in the vault; the worker rebuilds and
+        # re-verifies everything at attempt time (A62/A63).
+        overrides["approved_facts"] = selectors
     result = ensure_question_task(
         store, research_question=question, symbols=symbols,
         config=config, actor=actor, execution_mode=execution_mode,
         intent_id=intent_id,
-        spec_overrides=(
-            {"public_context": {"evidence_summaries": attachments}}
-            if attachments else None))
-    if attachments and str(result.get("status") or "") == "RECORDED":
-        result["documents_attached"] = len(attachments)
+        spec_overrides=(overrides or None),
+        # R15 ownership: the session-verified principal is bound to the task
+        # in a SERVER-SIDE record written inside the create transaction —
+        # business input can never write it, and a deduplicated retry keeps
+        # the original task's binding.
+        input_owner_binding={"owner": actor, "via": PERSONAL_ORIGIN_VIA})
+    if str(result.get("status") or "") == "DUPLICATE":
+        # Question identity is global (question + scope + mode), so a matching
+        # case may already belong to another personal owner. Never hand that
+        # task back: the duplicate submission is a read of someone else's case.
+        # The DUPLICATE branch writes no new task/binding/queue row, so the
+        # refusal leaves the store exactly as it was.
+        from .personal_evidence import task_personal_owner
+
+        existing = result.get("task") or {}
+        existing_owner = task_personal_owner(store, str(existing.get("task_id") or ""))
+        if existing_owner and existing_owner != str(actor or "").strip():
+            raise WorkspaceForbidden(
+                "not_owner: the matching case belongs to another principal")
+    if str(result.get("status") or "") == "RECORDED":
+        if attachments:
+            result["documents_attached"] = len(attachments)
+        if selectors:
+            result["facts_attached"] = len(selectors)
     return result
 
 
@@ -141,8 +239,20 @@ def rerun_completed_research(store: TaskStore, *, actor: str, task_id: str,
 
     The ORIGINAL task keeps its terminal state and output; the rerun is a NEW
     business intent (uuid minted by the intake) whose origin links
-    prior_task_id + as_of, so the case page can show both versions."""
+    prior_task_id + as_of, so the case page can show both versions.
+
+    Write ownership: only the session principal the original task's trusted
+    input binding names may re-research it. The check runs before the intake,
+    so a denied rerun creates no task, no binding, no queued row and triggers
+    no model dispatch. Shared research (no personal binding) remains
+    rerunnable — the compatibility path for generic/pipeline/historical
+    tasks, whose content is already visible to signed-in principals."""
     task = store.get_task(str(task_id or ""))
+    from .personal_evidence import task_personal_owner
+
+    owner = task_personal_owner(store, str(task["task_id"]))
+    if owner and owner != str(actor or "").strip():
+        raise WorkspaceForbidden("not_owner: the original case belongs to another principal")
     payload = task.get("input_payload") or {}
     question = str(payload.get("research_question") or "").strip()
     symbols = [str(s).strip() for s in (payload.get("symbols") or []) if str(s).strip()]
@@ -155,7 +265,8 @@ def rerun_completed_research(store: TaskStore, *, actor: str, task_id: str,
     return ensure_question_task(
         store, research_question=question, symbols=symbols,
         config=config, actor=actor, execution_mode=execution_mode,
-        new_research=True, as_of=now_iso())
+        new_research=True, as_of=now_iso(),
+        input_owner_binding={"owner": actor, "via": PERSONAL_ORIGIN_VIA})
 
 
 def follow_up_completed_research(store: TaskStore, *, actor: str, task_id: str,
@@ -220,13 +331,15 @@ def follow_up_completed_research(store: TaskStore, *, actor: str, task_id: str,
             config=config, actor=actor,
             execution_mode=str(task.get("execution_mode") or "replay"),
             intent_id=intent_id,
-            spec_overrides={"origin": origin_override})
+            spec_overrides={"origin": origin_override},
+            input_owner_binding={"owner": actor, "via": PERSONAL_ORIGIN_VIA})
     return ensure_question_task(
         store, research_question=note, symbols=symbols,
         config=config, actor=actor,
         execution_mode=str(task.get("execution_mode") or "replay"),
         new_research=True,
-        spec_overrides={"origin": origin_override})
+        spec_overrides={"origin": origin_override},
+        input_owner_binding={"owner": actor, "via": PERSONAL_ORIGIN_VIA})
 
 
 def acknowledge_completed_research(store: TaskStore, *, actor: str, task_id: str,

@@ -33,6 +33,15 @@ PERSONAL_NAMESPACE = "personal_research"
 PERSONAL_ROOT_DEFAULT = "data/personal_evidence"
 _PERSONAL_ROOT_OVERRIDE = {"personal_evidence": "root"}
 
+# The `via` value of the SERVER-SIDE input-owner binding the personal
+# workspace entry writes inside the create transaction (TaskStore's
+# task_input_bindings row): the session-verified principal, bound to the
+# task id by calling-code authority. Business input (the payload) can never
+# write that row, and a deduplicated retry keeps the original task's
+# binding — the worker joins the personal vault view only for tasks that
+# carry this binding; pipeline/normal/historical tasks use the shared view.
+PERSONAL_ORIGIN_VIA = "personal_workspace_session"
+
 # Personal import policy (fixed for the first case; widening needs a review):
 # retained for the owner's own review only, never sent to external models
 # from this namespace (R13 fact bundles decide egress separately).
@@ -42,6 +51,56 @@ PERSONAL_EXTERNAL_SEND_POLICY = False
 
 class PersonalEvidenceError(ValueError):
     pass
+
+
+def task_personal_owner(store: Any, task_id: str) -> str:
+    """Trusted personal owner of a task, or "" for shared research.
+
+    The ONLY authority is the server-side ``task_input_bindings`` row written
+    inside the create transaction by the personal workspace entry (``via`` ==
+    ``PERSONAL_ORIGIN_VIA``). No binding on historical/generic/pipeline tasks
+    means shared research — a business-input field can never widen or forge
+    ownership. This mirrors the R20 library scope contract, so the board,
+    the realtime stream and retrieval agree on one boundary."""
+    reader = getattr(store, "input_owner_binding", None)
+    if reader is None:
+        return ""
+    binding = reader(str(task_id)) or {}
+    if str(binding.get("via") or "") != PERSONAL_ORIGIN_VIA:
+        return ""
+    return str(binding.get("owner") or "").strip()
+
+
+def task_visible_to(store: Any, task_id: str, actor: str) -> bool:
+    """Shared research, or the caller's OWN personal research."""
+    owner = task_personal_owner(store, task_id)
+    return not owner or owner == str(actor or "").strip()
+
+
+def visible_task_ids(store: Any, actor: Optional[str]) -> Optional[set]:
+    """Batch scope for workbench projections.
+
+    ``None`` = unscoped (legacy, no session store). A set = exactly the task
+    ids the principal may read: every shared task plus the personal ones it
+    owns. A logged-out session (``actor == ""``) gets the empty set."""
+    if actor is None:
+        return None
+    actor = str(actor or "").strip()
+    if not actor:
+        return set()
+    tasks = store.list_tasks()
+    reader = getattr(store, "input_owner_bindings", None)
+    bindings = (reader([str(task.get("task_id") or "") for task in tasks])
+                if reader is not None else {})
+    visible = set()
+    for task in tasks:
+        task_id = str(task.get("task_id") or "")
+        binding = bindings.get(task_id) or {}
+        owner = (str(binding.get("owner") or "").strip()
+                 if str(binding.get("via") or "") == PERSONAL_ORIGIN_VIA else "")
+        if not owner or owner == actor:
+            visible.add(task_id)
+    return visible
 
 
 def personal_root(config: Dict[str, Any], owner: str) -> Path:
@@ -75,6 +134,28 @@ def personal_vault_view(config: Dict[str, Any], owner: str) -> Dict[str, Any]:
         "report_dir": str(root / "reports"),
     }
     return view
+
+
+def task_evidence_views(config: Optional[Dict[str, Any]], owner: str) -> List[Dict[str, Any]]:
+    """Config views for ONE task's evidence resolution, in trusted order.
+
+    The base (institutional) vault always comes first — institutional
+    admission outranks personal retention when the same content sits in both.
+    The task owner's personal namespace joins only when that owner actually
+    OWNS one (the root exists): the owner must come from a trusted record
+    (the store's input-owner), never from the task payload, so a task can
+    never reach into another user's namespace by naming it."""
+    views: List[Dict[str, Any]] = [config or {}]
+    owner = str(owner or "").strip()
+    if not owner:
+        return views
+    try:
+        if not personal_root(config or {}, owner).is_dir():
+            return views
+    except PersonalEvidenceError:
+        return views
+    views.append(personal_vault_view(config or {}, owner))
+    return views
 
 
 def import_personal_document(config: Dict[str, Any], owner: str, file_path: str, *,
