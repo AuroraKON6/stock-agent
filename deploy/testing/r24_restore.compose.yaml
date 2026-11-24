@@ -1,0 +1,13 @@
+# Overlay for r25_precheck.compose.yaml. Use only the one-shot drill service.
+services:
+  drill:
+    volumes:
+      - r24-archive:/app/drill-archive
+      - r24-negatives:/app/drill-negatives
+      - ../../scripts/r24_restore_drill.py:/drills/r24_restore_drill.py:ro
+      - ../../config/candidates/dify/flows/single-research-replay.manifest.json:/fixtures/single-research-replay.manifest.json:ro
+      - ../../config/candidates/dify/flows/single-research-replay.yml:/fixtures/single-research-replay.yml:ro
+
+volumes:
+  r24-archive:
+  r24-negatives:

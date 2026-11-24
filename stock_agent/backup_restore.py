@@ -791,6 +791,20 @@ def _discover_sources(
                 add_path(path, project_relative_path(path),
                          "personal_evidence_object")
 
+    # Frozen workflow exports are state artifacts, separate from deployed
+    # configuration. Include only the DSL and manifest in a digest directory.
+    workflow_root = project_path("data/workflow_artifacts")
+    if workflow_root.is_dir() and not workflow_root.is_symlink():
+        for version_dir in workflow_root.iterdir():
+            if (not HEX_64.fullmatch(version_dir.name) or not version_dir.is_dir()
+                    or version_dir.is_symlink()):
+                continue
+            for path in version_dir.iterdir():
+                if path.name.endswith(".manifest.json"):
+                    add_path(path, project_relative_path(path), "workflow_manifest")
+                elif path.suffix in {".yaml", ".yml"}:
+                    add_path(path, project_relative_path(path), "workflow_dsl")
+
     return [found[key] for key in sorted(found)], _unique(missing)
 
 
