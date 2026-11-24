@@ -1605,6 +1605,29 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
             return
         from .personal_evidence import PERSONAL_ORIGIN_VIA
 
+        # R10/A48: an OPEN stream keeps obeying the server-side session. A
+        # session is only decided at resolve() time (revoke/expiry take effect
+        # on the next check), so the stream re-resolves on every poll and
+        # before every write: a revoked or expired session ends the connection
+        # instead of streaming its old scope until SSE_MAX_SECONDS.
+        sessions = getattr(self.server, "session_store", None) if scoped else None
+        session_cookie = ""
+        if scoped:
+            from .identity_providers import SESSION_COOKIE_NAME, PersonalSessionError
+
+            session_cookie = self._session_cookie(SESSION_COOKIE_NAME)
+
+        def _session_still_authorized() -> bool:
+            if not scoped:
+                return True
+            if sessions is None:
+                return False
+            try:
+                current = sessions.resolve(session_cookie)
+            except PersonalSessionError:
+                return False
+            return str(getattr(current, "actor", "")) == actor
+
         binding_cache: Dict[str, str] = {}
 
         def _visible(task_id: str) -> bool:
@@ -1634,6 +1657,11 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
         idle_since = _time.monotonic()
         try:
             while _time.monotonic() < deadline:
+                # A session revoked or expired while this stream is open stops
+                # the stream HERE, on the next poll — before any new event is
+                # read, so nothing from the old scope is pushed afterwards.
+                if not _session_still_authorized():
+                    return
                 try:
                     with self.server.board_lock:
                         events = store.events_after(last_id, limit=50)
@@ -1646,6 +1674,8 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     last_id = int(event["sequence"])
                     if not _visible(str(event.get("task_id") or "")):
                         continue
+                    if not _session_still_authorized():
+                        return
                     message = {
                         "sequence": event["sequence"],
                         "event_id": event["event_id"],

@@ -21,7 +21,9 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from stock_agent.config import project_path_override
@@ -48,10 +50,11 @@ def _spec(question: str, config=None) -> dict:
 
 
 class _Board:
-    def __init__(self, store, config, *, sessions=True):
+    def __init__(self, store, config, *, sessions=True, clock=None):
         self.store = store
         self.config = config
-        self.session_store = PersonalSessionStore(ttl_seconds=900) if sessions else None
+        self.session_store = (PersonalSessionStore(ttl_seconds=900, clock=clock)
+                              if sessions else None)
 
         def authenticator(config, actor, symbols):
             if actor not in (ALICE, BOB) or "600519" not in symbols:
@@ -145,7 +148,11 @@ class WorkspaceOwnershipTests(unittest.TestCase):
         mdg["allow_degraded_offhours_llm"] = True
         self.store = TaskStore(self.root / "tasks.sqlite3")
         self.addCleanup(self.store.close)
-        self.board = _Board(self.store, self.config)
+        # Mutable clock: every session decision (login/resolve) reads it, so
+        # a test can expire an ALREADY OPEN stream deterministically.
+        self.clock_now = [datetime.now(timezone.utc)]
+        self.board = _Board(self.store, self.config,
+                            clock=lambda: self.clock_now[0])
         self.addCleanup(self.board.close)
         self.alice_cookie = self.board.login(ALICE)
         self.bob_cookie = self.board.login(BOB)
@@ -281,6 +288,67 @@ class WorkspaceOwnershipTests(unittest.TestCase):
                 if event["data"].get("task_id") == alice_id:
                     break
             self.assertNotIn(bob_id, seen, "a foreign task event reached the stream")
+        finally:
+            conn.close()
+
+    def _create_for_alice_directly(self, question):
+        """An ALICE-owned task created WITHOUT the HTTP session (the session
+        is revoked/expired in these tests, but the event is still ALICE's)."""
+        from stock_agent.personal_workspace import create_personal_research
+
+        result = create_personal_research(
+            self.store, actor=ALICE, question=question,
+            symbols=["600519"], config=self.config)
+        return result["task"]["task_id"]
+
+    def _assert_stream_closes_without_events(self, response, deadline_seconds=6.0):
+        """Read until EOF; any delivered event fails (post-revocation push)."""
+        deadline = time.monotonic() + deadline_seconds
+        while time.monotonic() < deadline:
+            line = response.readline()
+            if line == b"":
+                return
+            if line.decode("utf-8", "replace").startswith("data:"):
+                self.fail("the open stream pushed an event after its session ended")
+        self.fail("the open stream did not close after its session ended")
+
+    def test_open_stream_stops_after_session_revocation(self):
+        self._create_personal(self.alice_cookie, "ALICE 撤销前研究？")
+        cursor = max(event["sequence"] for event in self.store.events(limit=1000))
+        conn, response = self.board.sse(cookie=self.alice_cookie, last_event_id=cursor)
+        self.assertEqual(response.status, 200)
+        try:
+            # The stream is genuinely open and authorized for ALICE.
+            live_id = self._create_personal(self.alice_cookie, "ALICE 撤销前实时事件？")
+            event = _read_sse_event(response)
+            self.assertEqual(event["data"].get("task_id"), live_id)
+
+            status, _, _ = self.board.request(
+                "POST", "/api/v1/personal/logout", {}, cookie=self.alice_cookie)
+            self.assertEqual(status, 200)
+
+            # This event belongs to ALICE and would have reached the old
+            # scope; A48 says the open stream must stop instead.
+            self._create_for_alice_directly("ALICE 撤销后不应推送？")
+            self._assert_stream_closes_without_events(response)
+        finally:
+            conn.close()
+
+    def test_open_stream_stops_after_session_expiry(self):
+        self._create_personal(self.alice_cookie, "ALICE 过期前研究？")
+        cursor = max(event["sequence"] for event in self.store.events(limit=1000))
+        conn, response = self.board.sse(cookie=self.alice_cookie, last_event_id=cursor)
+        self.assertEqual(response.status, 200)
+        try:
+            live_id = self._create_personal(self.alice_cookie, "ALICE 过期前实时事件？")
+            event = _read_sse_event(response)
+            self.assertEqual(event["data"].get("task_id"), live_id)
+
+            # Move the server-side clock past the 900s session TTL: resolve()
+            # now rejects the session, and the OPEN stream must honor it.
+            self.clock_now[0] = self.clock_now[0] + timedelta(seconds=901)
+            self._create_for_alice_directly("ALICE 过期后不应推送？")
+            self._assert_stream_closes_without_events(response)
         finally:
             conn.close()
 
