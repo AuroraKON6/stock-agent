@@ -65,7 +65,7 @@ python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run2 --port 18185
 
 首次演练（`../r22-claudecode-run1-fail`）在产品行为全部正确的情况下报 1 项 FAIL：验收表达式把三类依赖拒绝（自依赖/环/未知引用）都期望成各自名字，实际稳定返回 `dependency_invalid`。修正的是检查映射，未改产品代码；随后重跑得到上述 53/53。该目录保留作对照。
 
-### 4.1 复验返工后的独立重跑（run3 / run4 / run5）
+### 4.1 复验返工后的独立重跑（run3 / run4 / run5 / run6）
 
 返回 `in_progress` 修复后，用**新的**证据目录与回环端口重跑，仍经共享锁串行：
 
@@ -73,11 +73,12 @@ python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run2 --port 18185
 python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run3 --port 18186
 python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run4 --port 18187
 python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run5 --port 18189
+python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run6 --port 18190
 ```
 
-- 三次均为 `summary.json` **PASS，53/53**，12 个 Dify run，0 FAIL，exit 0。
-- `cleanup.json`: `down --volumes` exit 0，残留容器/网络/卷均为 0，端口已释放（run4 `loopback_port_rebind=18187`，run5 `18189`）。
-- run5 在第三轮返工后的代码树上重跑（工作区干净），是该轮 C 层的主证据；run3/run4 为前一轮记录。
+- 四次均为 `summary.json` **PASS，53/53**，12 个 Dify run，0 FAIL，exit 0。
+- `cleanup.json`: `down --volumes` exit 0，残留容器/网络/卷均为 0，端口已释放（run4 `18187`，run5 `18189`，run6 `18190`）。
+- run6 在第三轮返工的交付提交上重跑（工作区干净），是该轮 C 层的主证据；run5/run3/run4 为同轮前序记录。
 - 证据：`r22-review.json`、`r22-rule.json`、`r22-graph.json`。
 - 同轮把 Celery 就绪探测从 240s/80 行放宽到 420s/200 行（sol 首跑曾遇就绪超时，产品无变化），只影响等待窗口，不放宽任何断言。
 - 该目录中的 R22 取消检查与 O 层回归共同覆盖：正常 `cancel_task` 入口传播、终态中间节点穿透（O 层）。
@@ -176,6 +177,6 @@ sol 在 `c2c22f1` 上以 `followup_checks.py` / `process_check.py` 复现 9 个�
 | `test_refactor_r22_integration.py` | 36 OK / exit 0 |
 | R22 / R17 / R17 role API / R18 / R15 citation / R10 | 9 / 12 / 19 / 34 / 5 / 11 OK，均 exit 0 |
 | 相邻 R03 / R19 / R20 / R15 personal / R16 / R14 browser | 14 / 8 / 40 / 10 / 4 / 24 OK，均 exit 0 |
-| C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run5 --port 18189` | PASS 53/53，cleanup 残留 0，端口可重绑 |
+| C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run6 --port 18190` | PASS 53/53，cleanup 残留 0，端口可重绑 |
 
 边界说明：创建与取消现在全库串行（同一任务库的图变更），这是让预算/扇出/重复/取消在同一持久化边界内成立的代价；跨进程互斥依赖 POSIX `flock`，不可用时拒绝而非降级。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 仍未改动。
