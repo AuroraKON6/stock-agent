@@ -31,6 +31,10 @@ SCOPES = frozenset({
     "read_fact_bundle",
     "submit_result",
     "submit_feedback",
+    # R17: drive a bound task's role flow (bind, one role step, completion).
+    # Never implies create/read; the role entry re-checks order, ownership,
+    # input version, case and the approved flow digest on every call.
+    "run_role_flow",
 })
 
 CREDENTIAL_FIELDS = frozenset({

@@ -173,6 +173,235 @@ def validate_replay_workflow(manifest_path: Path, *, approved_version: str | Non
     return version
 
 
+# ---- R17: the role flow candidate --------------------------------------- #
+_R17_ORIGIN = _R16_ORIGIN
+_R17_CALLS = {
+    # node: (title, operation, form fields, read timeout seconds)
+    "17011": ("Create or recover task", "create-research", {
+        "title": "{{#17001.title#}}", "case_id": "{{#17001.case_id#}}",
+        "research_question": "{{#17001.research_question#}}",
+        "input_version": "{{#17001.input_version#}}",
+        "business_intent_id": "{{#17001.business_intent_id#}}",
+        "dify_run_id": "{{#sys.workflow_run_id#}}",
+        "workflow_version": "{{#env.STOCK_AGENT_WORKFLOW_VERSION#}}",
+        "execution_mode": "replay"}, 30),
+    "17021": ("Bind approved role flow", "role-bind", {
+        "task_id": "{{#17011.headers.r16_task_id#}}", "case_id": "{{#17001.case_id#}}",
+        "dify_run_id": "{{#sys.workflow_run_id#}}",
+        "workflow_version": "{{#env.STOCK_AGENT_WORKFLOW_VERSION#}}",
+        "flow_sha256": "{{#env.STOCK_AGENT_ROLE_FLOW_SHA256#}}",
+        # The task's authoritative version as the create receipt reported it:
+        # a run continuing an already-bound task finds it at a later version.
+        "input_version": "{{#17011.headers.r17_input_version#}}"}, 30),
+    "17031": ("Role step: event_analyst", "role-step", {
+        "task_id": "{{#17011.headers.r16_task_id#}}", "case_id": "{{#17001.case_id#}}",
+        "dify_run_id": "{{#sys.workflow_run_id#}}",
+        "workflow_version": "{{#env.STOCK_AGENT_WORKFLOW_VERSION#}}",
+        "flow_sha256": "{{#env.STOCK_AGENT_ROLE_FLOW_SHA256#}}",
+        "input_version": "{{#17021.headers.r17_input_version#}}",
+        "role_id": "event_analyst"}, 120),
+    "17041": ("Role step: counter_evidence", "role-step", {
+        "task_id": "{{#17011.headers.r16_task_id#}}", "case_id": "{{#17001.case_id#}}",
+        "dify_run_id": "{{#sys.workflow_run_id#}}",
+        "workflow_version": "{{#env.STOCK_AGENT_WORKFLOW_VERSION#}}",
+        "flow_sha256": "{{#env.STOCK_AGENT_ROLE_FLOW_SHA256#}}",
+        "input_version": "{{#17031.headers.r17_input_version#}}",
+        "role_id": "counter_evidence"}, 120),
+    "17051": ("Role step: synthesis_drafter", "role-step", {
+        "task_id": "{{#17011.headers.r16_task_id#}}", "case_id": "{{#17001.case_id#}}",
+        "dify_run_id": "{{#sys.workflow_run_id#}}",
+        "workflow_version": "{{#env.STOCK_AGENT_WORKFLOW_VERSION#}}",
+        "flow_sha256": "{{#env.STOCK_AGENT_ROLE_FLOW_SHA256#}}",
+        "input_version": "{{#17041.headers.r17_input_version#}}",
+        "role_id": "synthesis_drafter"}, 120),
+    "17061": ("Finish role flow", "role-finish", {
+        "task_id": "{{#17011.headers.r16_task_id#}}", "case_id": "{{#17001.case_id#}}",
+        "dify_run_id": "{{#sys.workflow_run_id#}}",
+        "workflow_version": "{{#env.STOCK_AGENT_WORKFLOW_VERSION#}}",
+        "flow_sha256": "{{#env.STOCK_AGENT_ROLE_FLOW_SHA256#}}",
+        "input_version": "{{#17051.headers.r17_input_version#}}"}, 30),
+}
+# gate: (title, the call it checks, body literal that proves the RECORDED outcome, receipt header)
+_R17_GATES = {
+    "17012": ("Task confirmed?", "17011", '{"ok": true, "data": {"task_id": "task_', "r16_task_id"),
+    "17022": ("Flow bound?", "17021", '"outcome": "bound"', "r17_input_version"),
+    "17032": ("event_analyst succeeded?", "17031", '"step_status": "succeeded"', "r17_step_status"),
+    "17042": ("counter_evidence succeeded?", "17041", '"step_status": "succeeded"', "r17_step_status"),
+    "17052": ("synthesis_drafter succeeded?", "17051", '"step_status": "succeeded"', "r17_step_status"),
+    "17062": ("Root completed?", "17061", '"status": "succeeded"', "r17_root_status"),
+}
+# halt end: (title, gate whose refusal branch it closes, env fallback)
+_R17_HALTS = {
+    "17091": ("Stop: create unconfirmed", "17012", "R17_CREATE_UNCONFIRMED"),
+    "17092": ("Stop: bind refused", "17022", "R17_BIND_UNCONFIRMED"),
+    "17093": ("Stop: step halted", "17032", "R17_STEP_HALTED"),
+    "17094": ("Stop: step halted", "17042", "R17_STEP_HALTED"),
+    "17095": ("Stop: step halted", "17052", "R17_STEP_HALTED"),
+    "17096": ("Stop: finish refused", "17062", "R17_FINISH_UNCONFIRMED"),
+}
+_R17_ENVIRONMENT = {
+    "STOCK_AGENT_SERVICE_SECRET": ("secret", ""),
+    "STOCK_AGENT_WORKFLOW_VERSION": ("string", ""),
+    "STOCK_AGENT_ROLE_FLOW_SHA256": ("string", ""),
+    "R17_CREATE_UNCONFIRMED": ("string", "create_unconfirmed"),
+    "R17_BIND_UNCONFIRMED": ("string", "bind_refused"),
+    "R17_STEP_HALTED": ("string", "step_halted"),
+    "R17_FINISH_UNCONFIRMED": ("string", "finish_refused"),
+    "R17_FLOW_COMPLETE": ("string", "role_flow_complete"),
+    "R17_CASE_PATH_DEFAULT": ("string", "/"),
+}
+
+
+def _validate_role_graph(graph: dict) -> None:
+    nodes = graph["nodes"]
+    by_id = {node["id"]: node["data"] for node in nodes}
+    if len(nodes) != len(by_id) or {key: node["type"] for key, node in by_id.items()} != {
+        "17001": "start", **{call: "http-request" for call in _R17_CALLS},
+        **{gate: "if-else" for gate in _R17_GATES},
+        **{halt: "end" for halt in _R17_HALTS}, "17063": "end",
+    }:
+        raise DeploymentCandidateError("role workflow must use only its reviewed native nodes")
+    # Bind, then each role step in the frozen order, then finish: the canvas
+    # may not skip, reorder or repeat a call.
+    order = ["17011", "17012", "17021", "17022", "17031", "17032", "17041", "17042",
+             "17051", "17052", "17061", "17062"]
+    edges = [(edge["source"], edge["sourceHandle"], edge["target"]) for edge in graph["edges"]]
+    if sorted(edges) != sorted(
+            [(source, "true" if index % 2 else "source", order[index + 1])
+             for index, source in enumerate(order[:-1])]
+            + [(order[-1], "true", "17063"), ("17001", "source", "17011")]
+            + [(gate, "false", halt) for halt, (_t, gate, _e) in _R17_HALTS.items()]):
+        raise DeploymentCandidateError("workflow must bind once and call each role step once, in order")
+    inputs = {item["variable"]: (item["type"], item["required"]) for item in by_id["17001"]["variables"]}
+    if inputs != {"title": ("text-input", True), "case_id": ("text-input", True),
+                  "research_question": ("paragraph", True), "input_version": ("number", True),
+                  "business_intent_id": ("text-input", True)}:
+        raise DeploymentCandidateError("workflow inputs must be the frozen event request")
+    for node_id, (title, operation, fields, read) in _R17_CALLS.items():
+        call = by_id[node_id]
+        if call.get("title") != title:
+            raise DeploymentCandidateError("HTTP node titles are part of the reviewed canvas")
+        if call.get("authorization") != _R16_AUTH or call.get("headers") != "" or call.get("params") != "":
+            raise DeploymentCandidateError("HTTP node must use the runtime bearer secret and no custom headers or query")
+        if (call.get("url") != _R17_ORIGIN + operation or call.get("method") != "POST"
+                or call.get("retry_config") != {"retry_enabled": False, "max_retries": 0, "retry_interval": 0}
+                or call.get("timeout") != {"connect": 10, "read": read, "write": 10}):
+            raise DeploymentCandidateError("HTTP destination, method, retry or timeout exceeds the role flow policy")
+        if call.get("body") != {"type": "x-www-form-urlencoded", "data": [
+            {"type": "text", "key": key, "value": value} for key, value in fields.items()
+        ]}:
+            raise DeploymentCandidateError("HTTP node must send the reviewed role flow form")
+        if call.get("error_strategy") != "default-value" or call.get("default_value") != [
+            {"key": "body", "type": "string", "value": "{}"},
+            {"key": "status_code", "type": "number", "value": 0},
+            {"key": "headers", "type": "object", "value": "{}"},
+        ]:
+            raise DeploymentCandidateError("HTTP errors must route to a halt branch")
+
+    for gate, (title, reply, literal, header) in _R17_GATES.items():
+        branch = by_id[gate]
+        cases = branch["cases"]
+        if branch.get("title") != title or len(cases) != 1 \
+                or cases[0]["case_id"] != "true" or cases[0]["logical_operator"] != "and":
+            raise DeploymentCandidateError("workflow must gate the confirmed branch")
+        conditions = [(item["variable_selector"], item["comparison_operator"], item["value"])
+                      for item in cases[0]["conditions"]]
+        if conditions != [
+            ([reply, "status_code"], "=", "200"),
+            ([reply, "body"], "contains", literal),
+            ([reply, "headers", header], "not empty", ""),
+        ]:
+            # HTTP 200 alone never continues the canvas: the Python side's
+            # RECORDED outcome (bound / step succeeded / root succeeded) does.
+            raise DeploymentCandidateError("HTTP status alone cannot confirm a role flow receipt")
+
+    task_id, case_path = ["17011", "headers", "r16_task_id"], ["17011", "headers", "r16_case_path"]
+    for node_id, (title, _gate, fallback) in _R17_HALTS.items():
+        outputs = by_id[node_id]["outputs"]
+        # Only a refused create leaves no task to point at.
+        linked = node_id != "17091"
+        if by_id[node_id].get("title") != title or [
+                (item["variable"], item["value_selector"]) for item in outputs] != [
+                ("status", ["env", fallback]), ("task_id", task_id if linked else []),
+                ("case_path", case_path if linked else ["env", "R17_CASE_PATH_DEFAULT"]),
+                ("case_id", ["17001", "case_id"]),
+                ("business_intent_id", ["17001", "business_intent_id"])]:
+            raise DeploymentCandidateError("halt outputs must use the reviewed receipt projection")
+    if by_id["17063"].get("title") != "Return completed role report" or [
+            (item["variable"], item["value_selector"]) for item in by_id["17063"]["outputs"]] != [
+            ("status", ["env", "R17_FLOW_COMPLETE"]), ("task_id", task_id), ("case_path", case_path),
+            ("case_id", ["17001", "case_id"]), ("business_intent_id", ["17001", "business_intent_id"])]:
+        # The completed branch is only reachable through the finish gate, which
+        # itself requires the Python side's recorded "succeeded".
+        raise DeploymentCandidateError("workflow outputs must use the reviewed receipt projection")
+
+def validate_role_workflow(manifest_path: Path, *, approved_version: str | None = None) -> str:
+    """Return the digest-based version of the R17 candidate after offline validation.
+
+    Also binds the canvas to the frozen prompt artifact: the manifest's
+    ``flow_sha256`` must be the digest of the referenced flow file AND of its
+    approval record, so a canvas or prompt edit is a new candidate that no
+    old approval covers.
+    """
+    from .release_controls import build_secret_scan
+
+    try:
+        import yaml
+    except ImportError as exc:
+        raise DeploymentCandidateError("workflow validation requires the locked PyYAML dependency") from exc
+    try:
+        manifest = json.loads(manifest_path.read_bytes())
+        if (set(manifest) != {"schema_version", "dify_release", "dify_release_commit", "execution_mode",
+                             "artifact", "flow_artifact", "flow_sha256", "workflow_version"}
+                or manifest["schema_version"] != 1 or manifest["dify_release"] != _R16_RELEASE
+                or manifest["dify_release_commit"] != _R16_RELEASE_COMMIT
+                or manifest["execution_mode"] != "replay"
+                or manifest["artifact"] != "event-role-flow.yml"
+                or manifest["flow_artifact"] != "event-role-flow.flow.json"):
+            raise DeploymentCandidateError("unexpected role workflow manifest")
+        artifact = manifest_path.with_name(manifest["artifact"])
+        raw = artifact.read_bytes()
+        if len(raw) > 64 * 1024:
+            raise DeploymentCandidateError("workflow DSL exceeds the size limit")
+        version = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if version != manifest["workflow_version"] or (approved_version is not None and version != approved_version):
+            raise DeploymentCandidateError("workflow digest does not match the manifest or reviewed version")
+        from .role_execution import ArtifactFlowRegistry
+
+        try:
+            registry = ArtifactFlowRegistry.from_directory(manifest_path.parent)
+        except ValueError as exc:
+            raise DeploymentCandidateError("role flow artifacts are not an approved candidate: {0}".format(exc)) from None
+        flow = registry.by_digest(str(manifest["flow_sha256"]))
+        if str(manifest["flow_sha256"]) != str(flow["flow_sha256"]):
+            raise DeploymentCandidateError("manifest flow digest is not the approved flow")
+        roles = [role for group in flow["groups"] for role in group["roles"]]
+        if roles != ["event_analyst", "counter_evidence", "synthesis_drafter"]:
+            raise DeploymentCandidateError("canvas calls must follow the frozen flow's role order")
+        if any(isinstance(token, (yaml.tokens.AliasToken, yaml.tokens.AnchorToken)) for token in yaml.scan(raw)):
+            raise DeploymentCandidateError("workflow DSL must not use YAML aliases or anchors")
+        document = yaml.safe_load(raw)
+        if (document["kind"] != "app" or document["version"] != "0.3.1"
+                or document["app"]["mode"] != "workflow"
+                or document.get("dependencies") != []):
+            raise DeploymentCandidateError("workflow must be a standalone app with no plugin dependencies")
+        workflow = document["workflow"]
+        variables = workflow["environment_variables"]
+        if (len(variables) != len(_R17_ENVIRONMENT)
+                or {item["name"]: (item["value_type"], item["value"]) for item in variables} != _R17_ENVIRONMENT):
+            raise DeploymentCandidateError("workflow environment must use empty runtime values and fixed fallbacks")
+        if any(isinstance(feature, dict) and feature.get("enabled") for feature in workflow["features"].values()):
+            raise DeploymentCandidateError("workflow features must be disabled for replay")
+        _validate_role_graph(workflow["graph"])
+    except DeploymentCandidateError:
+        raise
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, yaml.YAMLError):
+        raise DeploymentCandidateError("invalid role workflow manifest or DSL") from None
+    if build_secret_scan([artifact], [], datetime.now(timezone.utc))["status"] != "PASS":
+        raise DeploymentCandidateError("workflow DSL did not pass the release secret scan")
+    return version
+
+
 def deployment_candidate() -> Dict[str, Any]:
     """The pinned, secret-free deployment candidate for DF-01 review.
 

@@ -367,6 +367,8 @@ def run_research_task(
     config: Optional[Dict[str, Any]] = None,
     ttl_seconds: int = 120,
     max_rounds: int = MAX_RESEARCH_ROUNDS,
+    approved_role_prompt_sha256: str = "",
+    prior_role_results: Optional[list] = None,
 ) -> Dict[str, Any]:
     """Run one leased task to a terminal, blocked, or awaiting-human state.
 
@@ -391,13 +393,24 @@ def run_research_task(
     # role orchestrator alone — the Python full chain must not advance it.
     # The primary protection is the claim-path exclusion; this entry check
     # keeps a misrouted hand-off from spending even one attempt.
-    if (task.get("input_payload") or {}).get("role_flow"):
+    payload = task.get("input_payload") or {}
+    role_step = payload.get("role_step") or {}
+    role_owned = task.get("parent_task_id") and store.is_role_owned(task_id)
+    if payload.get("role_flow") or ((role_step or role_owned) and not approved_role_prompt_sha256):
         return {
             "status": "refused_role_flow",
             "model_call": {"mode": str(task.get("execution_mode") or "replay"),
                            "called": False, "rounds": [], "steps": []},
             "error": "role_flow_not_owned_by_full_chain",
         }
+    system_prompt = _SYSTEM_PROMPT
+    if approved_role_prompt_sha256:
+        role_text = str(payload.get("role_prompt") or "")
+        if (not role_owned or role_step.get("role_id") != task.get("role_id")
+                or role_step.get("role_prompt_sha256") != approved_role_prompt_sha256
+                or hashlib.sha256(role_text.encode("utf-8")).hexdigest() != approved_role_prompt_sha256):
+            raise ResearchWorkerError("role step prompt does not match the approved artifact")
+        system_prompt += "\n\nRole instructions:\n" + role_text
     store.mark_running(task_id, worker_id=worker_id, fencing_token=task["fencing_token"], expected_version=task["version"])
     task = store.get_task(task_id)
     started = time.perf_counter()
@@ -413,6 +426,8 @@ def run_research_task(
         "prompt_version": RESEARCH_PROMPT_VERSION,
         "rounds": [],
     }
+    if approved_role_prompt_sha256:
+        model_call["role_prompt_sha256"] = approved_role_prompt_sha256
     # R02/F04: a lease renewal failure during ANY call revokes this worker's
     # right to start NEW outbound requests, even if the between-rounds renewal
     # would happen to succeed afterwards.
@@ -525,7 +540,7 @@ def run_research_task(
                                  ttl_seconds=ttl_seconds) as heartbeat:
                 runner = heartbeat
                 response = call_pi_agent(
-                    system_prompt=_SYSTEM_PROMPT,
+                    system_prompt=system_prompt,
                     user_content=user_prompt,
                     provider=provider,
                     config=config,
@@ -671,6 +686,12 @@ def run_research_task(
                 model_call["context_delivery"] = delivery
                 model_call["outbound_context"] = safe_context
 
+            if prior_role_results:
+                allowed_refs = safe_context.get("evidence_summaries") or {}
+                safe_context = dict(safe_context, prior_role_drafts=[
+                    {**result, "evidence_refs": [ref for ref in result["evidence_refs"] if ref in allowed_refs]}
+                    for result in prior_role_results
+                ])
             user_prompt = build_user_prompt(task, safe_payload, safe_context, prior_rounds=prior_rounds)
             try:
                 assert_payload_external_safe(user_prompt)
