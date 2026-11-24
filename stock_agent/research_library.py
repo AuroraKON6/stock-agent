@@ -40,9 +40,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional
 
 from .evidence_context import verified_evidence_documents
+from .evidence_vault import load_evidence_vault
 from .personal_evidence import PERSONAL_ORIGIN_VIA, task_evidence_views
 from .task_runtime.store import TERMINAL_STATUSES
 
@@ -63,6 +66,11 @@ REPORT_IDENTITY_SCHEME = "rv1"
 
 class LibraryError(ValueError):
     pass
+
+
+class LibraryTimeWindowError(LibraryError):
+    """A ``since``/``until`` bound that is not an offset-bearing timestamp or
+    a bare calendar date."""
 
 
 def _canonical(value: Any) -> str:
@@ -168,6 +176,79 @@ def verified_shas(views: Iterable[Dict[str, Any]]) -> set:
     return live
 
 
+def _source_state(views: List[Dict[str, Any]]) -> Dict[str, bool]:
+    """Per SHA: whether the vault that AUTHORIZES it still verifies it.
+
+    A document's authorizing vault is the FIRST view (trusted order: shared
+    vault, then the caller's personal namespace) that holds those bytes at
+    all, in any status — the same shadowing rule the worker applies when it
+    delivers evidence (admission outranks personal retention for identical
+    content). Revocation is judged there and only there: a copy of the same
+    bytes surviving in a later namespace cannot keep a report alive once its
+    authorizing vault withdrew the original, and the reverse holds too. A
+    SHA no view holds is not verified."""
+    authorizing: Dict[str, int] = {}
+    for position, view in enumerate(views):
+        for document in (load_evidence_vault(view or {}).get("documents") or {}).values():
+            if isinstance(document, dict) and document.get("sha256"):
+                authorizing.setdefault(str(document["sha256"]), position)
+    live_by_view = [set(verified_evidence_documents(view or {}).keys()) for view in views]
+    return {sha: sha in live_by_view[position] for sha, position in authorizing.items()}
+
+
+_DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _bound(text: str, name: str):
+    """Parse a time bound. Accepted: an offset-bearing ISO timestamp
+    (compared as an instant) or a bare ``YYYY-MM-DD`` calendar date
+    (returned as a ``date``, compared against the completion's own local
+    calendar day: ``since`` includes that day, ``until`` includes that whole
+    day). Anything else — naive timestamps, partial or impossible dates — is
+    rejected rather than guessed."""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    if _DATE_ONLY.match(text):
+        try:
+            return datetime.strptime(text, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    elif text:
+        try:
+            moment = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+            if moment.tzinfo is not None and moment.utcoffset() is not None:
+                return moment
+        except ValueError:
+            pass
+    raise LibraryTimeWindowError(
+        "invalid {0}: use an offset-bearing timestamp (2026-11-24T17:08:52+08:00 "
+        "or 2026-11-24T09:08:52Z) or a calendar date (2026-11-24)".format(name))
+
+
+def _in_window(completed_at: str, since, until) -> bool:
+    """Window test on real instants. ``since``/``until`` are ``None``, an
+    aware ``datetime`` or a ``date``. A completion without an offset-bearing
+    timestamp lies outside every bounded window."""
+    if since is None and until is None:
+        return True
+    try:
+        completed = datetime.fromisoformat(str(completed_at or ""))
+        if completed.tzinfo is None or completed.utcoffset() is None:
+            return False
+    except ValueError:
+        return False
+    if isinstance(since, datetime) and completed < since:
+        return False
+    if isinstance(until, datetime) and completed > until:
+        return False
+    if not isinstance(since, datetime) and since is not None and completed.date() < since:
+        return False
+    if not isinstance(until, datetime) and until is not None and completed.date() > until:
+        return False
+    return True
+
+
 def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
                         actor: str = "") -> Dict[str, Any]:
     """Re-check every entry's evidence against the CURRENT authorized views.
@@ -177,16 +258,22 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
     is checked as well, so personal originals are judged live in the
     namespace that owns them instead of being misreported as revoked.
 
-    An entry whose evidence fully left the projection is ``evidence_revoked``;
+    Each SHA is judged in the vault that authorizes it (first view holding
+    those bytes — shared before personal), so a surviving copy in another
+    namespace cannot mask a revocation. An entry whose evidence fully left
+    the projection is ``evidence_revoked``;
     one that lost part of it is ``evidence_partially_revoked`` with the
     surviving shas in ``live_evidence_shas``. BOTH are stale and excluded
     by default: the summary may rest on the revoked original. An explicit
     ``include_stale`` (audit) still shows them, labelled."""
-    live_shas = verified_shas(task_evidence_views(config, actor))
+    # The authorizing vault is resolved per SHA over the caller's authorized
+    # views, so an entry is judged against the namespace its evidence came
+    # from even when the same bytes also sit in another one.
+    live_by_sha = _source_state(task_evidence_views(config, actor))
     checked = []
     for entry in index.get("entries", []):
         shas = entry.get("evidence_shas") or []
-        live = [sha for sha in shas if sha in live_shas]
+        live = [sha for sha in shas if live_by_sha.get(sha, False)]
         entry = dict(entry)
         entry["live_evidence_shas"] = live
         if shas and not live:
@@ -242,12 +329,17 @@ def query_library(index: Dict[str, Any], config: Dict[str, Any], actor: str, *,
     actor = str(actor or "").strip()
     if not actor:
         raise LibraryError("library queries are scoped: an authenticated actor is required")
+    since_at, until_at = _bound(since, "since"), _bound(until, "until")
+    if (since_at is not None and until_at is not None and type(since_at) is type(until_at)
+            and since_at > until_at):
+        raise LibraryTimeWindowError("invalid time window: since is after until")
     checked = annotate_revocation(index, config, actor=actor)
     scoped = [entry for entry in checked["entries"] if _authorized(entry, actor)]
     audit = bool(include_stale) and can_audit(config, actor)
     result = search_library({**checked, "entries": scoped}, query,
-                            symbols=symbols, task_id=task_id, since=since,
-                            until=until, status=status, include_stale=audit)
+                            symbols=symbols, task_id=task_id,
+                            since_at=since_at, until_at=until_at, status=status,
+                            include_stale=audit)
     if timeline_of:
         result["results"] = [entry for entry in result["results"]
                              if entry["task_id"] == timeline_of
@@ -269,7 +361,8 @@ def search_library(index: Dict[str, Any], query: str = "", *,
                    task_id: str = "",
                    since: str = "", until: str = "",
                    status: str = "",
-                   include_stale: bool = False) -> Dict[str, Any]:
+                   include_stale: bool = False,
+                   since_at=None, until_at=None) -> Dict[str, Any]:
     """Structured + full-text filter over a revocation-annotated index.
 
     This is the filter step, not a retrieval entry: it trusts the
@@ -279,15 +372,19 @@ def search_library(index: Dict[str, Any], query: str = "", *,
     that was never annotated is refused.
 
     Full-text is case-insensitive substring over question/summary/findings.
-    Date bounds compare against ``completed_at`` ISO strings lexically, so
-    they must use the store's own offset format (full timestamps, not bare
-    dates)."""
+    Time bounds are real instants: an offset-bearing timestamp compares as a
+    moment whatever its offset, a bare calendar date covers that whole day
+    in the completion's own offset (``until`` is inclusive), and an
+    unparseable bound is refused. :func:`query_library` parses the bounds
+    once and hands them over pre-parsed."""
     if not isinstance(index, dict) or index.get("schema_version") != LIBRARY_SCHEMA:
         raise LibraryError("not a research library index")
     if not index.get("revocation_checked"):
         raise LibraryError("index is not revocation-checked: query through query_library")
     needle = str(query or "").strip().lower()
     wanted_symbols = {str(s) for s in (symbols or []) if str(s).strip()}
+    if since_at is None and until_at is None and (since or until):
+        since_at, until_at = _bound(since, "since"), _bound(until, "until")
     results = []
     for entry in index.get("entries", []):
         if not include_stale and entry.get("stale_reason"):
@@ -298,10 +395,7 @@ def search_library(index: Dict[str, Any], query: str = "", *,
             continue
         if wanted_symbols and not (wanted_symbols & set(entry.get("symbols") or [])):
             continue
-        completed = str(entry.get("completed_at") or "")
-        if since and completed < str(since):
-            continue
-        if until and completed > str(until):
+        if not _in_window(entry.get("completed_at"), since_at, until_at):
             continue
         if needle and needle not in _entry_text(entry).lower():
             continue

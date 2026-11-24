@@ -1184,7 +1184,12 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
         from urllib.parse import parse_qs as _parse_qs
 
         from .personal_evidence import PersonalEvidenceError
-        from .research_library import LibraryError, build_library_index, query_library
+        from .research_library import (
+            LibraryError,
+            LibraryTimeWindowError,
+            build_library_index,
+            query_library,
+        )
 
         if getattr(self.server, "session_store", None) is None:
             self._send_json(503, {"error": "workspace_requires_sessions"})
@@ -1218,6 +1223,12 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     status=first("status", 40),
                     include_stale=first("include_stale", 8) in {"1", "true"},
                     timeline_of=task_id if timeline else "")
+            except LibraryTimeWindowError as exc:
+                # Contract: since/until are offset-bearing timestamps
+                # (compared as instants) or bare calendar dates (the whole
+                # day, inclusive); anything else is a 400, never a guess.
+                self._send_json(400, {"error": "invalid_time_window", "detail": str(exc)})
+                return
             except (LibraryError, PersonalEvidenceError) as exc:
                 self._send_json(400, {"error": "library query failed", "detail": str(exc)})
                 return
@@ -1738,13 +1749,48 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
         })
 
 
-def serve_task_board(config: Dict[str, Any], host: str = "127.0.0.1", port: int = 8768) -> None:
+def _session_components():
+    from .identity_providers import PersonalSessionStore, authenticate_with_provider
+    from .identity_providers.sessions import DEFAULT_SESSION_TTL_SECONDS
+    from .identity_providers.providers import PROVIDER_WINDOWS_LOCAL
+
+    return DEFAULT_SESSION_TTL_SECONDS, PersonalSessionStore, authenticate_with_provider, PROVIDER_WINDOWS_LOCAL
+
+
+def serve_task_board(config: Dict[str, Any], host: str = "127.0.0.1", port: int = 8768, *,
+                   ready: Optional[Any] = None) -> None:
+    """Serve the board until interrupted.
+
+    ``ready(server)`` runs once the socket is bound and before the serve
+    loop starts, so a caller (a test, a supervisor) can learn the bound port
+    (``port=0``) and drive the real server."""
     db_path = project_path(
         str((config.get("task_runtime") or {}).get("db_path") or "data/task_runtime/tasks.sqlite3")
     )
     store = TaskStore(db_path)
-    server = create_task_board_server(store, host=host, port=port, config=config)
-    print("task board: http://{0}:{1}/".format(host, port))
+    # Sessions are part of the supported start: the personal workspace and
+    # the R20 research library both resolve the caller from a server-side
+    # session, so the standard entry attaches the session store and the
+    # provider-registry authenticator. ``task_board.sessions_enabled=false``
+    # keeps the explicit rollback: no store, and every session route fails
+    # closed (503) exactly as before.
+    (DEFAULT_SESSION_TTL_SECONDS, PersonalSessionStore,
+     authenticate_with_provider, PROVIDER_WINDOWS_LOCAL) = _session_components()
+    board = config.get("task_board") or {}
+    provider = str(board.get("identity_provider") or PROVIDER_WINDOWS_LOCAL)
+    sessions = None
+    if board.get("sessions_enabled", True):
+        sessions = PersonalSessionStore(
+            ttl_seconds=int(board.get("session_ttl_seconds") or DEFAULT_SESSION_TTL_SECONDS))
+    server = create_task_board_server(
+        store, host=host, port=port, config=config, session_store=sessions,
+        login_authenticator=(lambda cfg, actor, symbols: authenticate_with_provider(
+            provider, cfg, actor, symbols)) if sessions is not None else None)
+    host_, port_ = server.server_address[:2]
+    print("task board: http://{0}:{1}/ (sessions {2})".format(
+        host_, port_, "on" if sessions is not None else "off"), flush=True)
+    if ready is not None:
+        ready(server)
     try:
         server.serve_forever()
     finally:

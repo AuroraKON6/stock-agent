@@ -19,7 +19,9 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import quote
@@ -31,10 +33,12 @@ from stock_agent.personal_evidence import (
     import_personal_document,
     personal_vault_view,
 )
+from stock_agent.evidence_context import verified_evidence_documents
 from stock_agent.research_library import (
     AUDIT_ROLES,
     LIBRARY_SCHEMA,
     LibraryError,
+    LibraryTimeWindowError,
     annotate_revocation,
     build_library_index,
     query_library,
@@ -495,6 +499,191 @@ class LibraryHttpTests(ScopeTestCase):
                              {k: row[k] for k in identity_fields})
         self.assertTrue(all(r["input_version"] == 1 for r in body["results"]))
         self.assertEqual(self._request("/api/v1/timeline?task_id=" + first["task_id"], cookie)[0], 404)
+
+
+class AuthorizingVaultTests(ScopeTestCase):
+    CONTENT = "双金库同字节原件正文。"
+
+    def test_shared_withdrawal_is_not_masked_by_a_personal_copy(self):
+        _, sha = import_document(self.config, self.root, content=self.CONTENT, title="共享原件")
+        self._shared("共享原件研究", evidence={"ev-1": {"summary": "s", "sha256": sha}})
+        bob_copy = self._personal_document(BOB, self.CONTENT, "Bob的同字节副本")
+        self.assertEqual(bob_copy[1], sha, "same bytes, same digest, other namespace")
+        cached = build_library_index(self.store)
+        ask = lambda actor: query_library(cached, self.config, actor, query="共享原件")["result_count"]  # noqa: E731
+        self.assertEqual((ask(ALICE), ask(BOB)), (1, 1))
+        self._withdraw(self.CONTENT)   # the SHARED vault withdraws its original
+        self.assertNotIn(sha, verified_evidence_documents(self.config), "shared projection dropped it")
+        self.assertIn(sha, verified_evidence_documents(personal_vault_view(self.config, BOB)),
+                      "the personal copy is untouched")
+        retained = Path(personal_vault_view(self.config, BOB)["official_evidence_vault"]["objects_dir"])
+        self.assertTrue(any(p.stat().st_size == len(self.CONTENT.encode("utf-8"))
+                            for p in retained.rglob(sha)), "no byte was deleted")
+        self.assertEqual((ask(ALICE), ask(BOB)), (0, 0),
+                         "the report cites the shared original: its revocation decides for everybody")
+        rebuilt = build_library_index(self.store)
+        self.assertEqual(query_library(rebuilt, self.config, BOB, query="共享原件")["result_count"], 0)
+
+    def test_personal_original_is_judged_in_its_own_namespace(self):
+        document_id, sha, content = self._personal_document(BOB, "仅个人金库持有。", "个人原件")
+        self.assertNotIn(sha, verified_evidence_documents(self.config))
+        self._personal(BOB, "个人原件研究", document_ids=[document_id])
+        cached = build_library_index(self.store)
+        self.assertEqual(query_library(cached, self.config, BOB, query="个人原件")["result_count"], 1)
+        self._withdraw(content, personal_vault_view(self.config, BOB))
+        self.assertEqual(query_library(cached, self.config, BOB, query="个人原件")["result_count"], 0)
+
+
+class TimeWindowTests(ScopeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.task = self._shared("时间窗研究")
+        self.index = annotate_revocation(build_library_index(self.store), self.config)
+
+    def _count(self, **bounds):
+        return query_library(self.index, self.config, ALICE, **bounds)["result_count"]
+
+    def test_same_instant_in_any_offset_bounds_identically(self):
+        completed = datetime.fromisoformat(self.task["updated_at"])
+        local = completed.isoformat(timespec="seconds")
+        utc = completed.astimezone(timezone.utc).isoformat(timespec="seconds")
+        z = utc.replace("+00:00", "Z")
+        self.assertNotEqual(local, utc)
+        for bound in (local, utc, z):
+            self.assertEqual(self._count(since=bound, until=bound), 1, bound)
+            self.assertEqual(self._count(until=bound), 1, bound)
+            self.assertEqual(self._count(since=bound), 1, bound)
+        minute = timedelta(minutes=1)
+        self.assertEqual(self._count(since=(completed - minute).astimezone(timezone.utc).isoformat(),
+                                     until=(completed + minute).isoformat()), 1)
+        self.assertEqual(self._count(until=(completed - minute).isoformat()), 0)
+        self.assertEqual(self._count(since=(completed + minute).astimezone(timezone.utc).isoformat()), 0)
+
+    def test_mixed_offset_completions_order_by_instant(self):
+        time.sleep(1.1)  # completions carry second-resolution timestamps
+        self._shared("较晚完成研究")
+        index = annotate_revocation(build_library_index(self.store), self.config)
+        by_question = {e["question"]: e for e in index["entries"]}
+        early, late = by_question["时间窗研究"], by_question["较晚完成研究"]
+        # Same instants, different stored offsets: the earlier completion is
+        # rewritten to UTC+14 and the later one to UTC. Their lexical order
+        # flips; their instant order must not.
+        early["completed_at"] = datetime.fromisoformat(early["completed_at"]).astimezone(
+            timezone(timedelta(hours=14))).isoformat()
+        late["completed_at"] = datetime.fromisoformat(late["completed_at"]).astimezone(timezone.utc).isoformat()
+        self.assertGreater(early["completed_at"], late["completed_at"], "lexical order is now misleading")
+        cut = (datetime.fromisoformat(late["completed_at"]) - timedelta(seconds=1)).isoformat()
+        seen = [r["question"] for r in query_library(index, self.config, ALICE, until=cut)["results"]]
+        self.assertEqual(seen, ["时间窗研究"])
+
+    def test_bare_dates_cover_the_whole_day(self):
+        day = self.task["updated_at"][:10]
+        before = (datetime.fromisoformat(self.task["updated_at"]).date() - timedelta(days=1)).isoformat()
+        after = (datetime.fromisoformat(self.task["updated_at"]).date() + timedelta(days=1)).isoformat()
+        self.assertEqual(self._count(since=day, until=day), 1, "until on a date includes that day")
+        self.assertEqual(self._count(until=day), 1)
+        self.assertEqual(self._count(since=day), 1)
+        self.assertEqual(self._count(until=before), 0)
+        self.assertEqual(self._count(since=after), 0)
+
+    def test_unparseable_bounds_are_refused(self):
+        for bad in ("2026-11-24T17:08:52", "yesterday", "2026-13-40", "2026-11", "17:08"):
+            with self.subTest(bound=bad), self.assertRaises(LibraryTimeWindowError):
+                self._count(since=bad)
+            with self.subTest(until=bad), self.assertRaises(LibraryTimeWindowError):
+                self._count(until=bad)
+        with self.assertRaises(LibraryTimeWindowError):
+            self._count(since="2999-01-01", until="2000-01-01")
+
+
+class StandardStartTests(ScopeTestCase):
+    """The supported start entry assembles sessions: login, scoped retrieval
+    and the timeline work from ``serve_task_board`` (what ``cli task-board``
+    calls), with a provider from the registry — here a synthetic one."""
+
+    PROVIDER = "konm75-synthetic"
+
+    def _authenticator(self, config, actor, symbols):
+        if actor not in (ALICE, BOB):
+            raise ValueError("unknown principal")
+        return {"actor": actor, "provider": self.PROVIDER, "subject": "S-1-{0}".format(actor),
+                "policy_sha256": "a" * 64}
+
+    def _serve(self, sessions_enabled=True):
+        from stock_agent.identity_providers import providers
+
+        self.config["task_runtime"] = {"db_path": str(self.root / "tasks.sqlite3")}
+        self.config["task_board"] = {"identity_provider": self.PROVIDER,
+                                     "sessions_enabled": sessions_enabled}
+        self.enterContext(patch.dict(providers._REGISTRY, {self.PROVIDER: self._authenticator}))
+        from stock_agent import task_board
+
+        held = {}
+        thread = threading.Thread(
+            target=task_board.serve_task_board,
+            args=(self.config,), kwargs={"host": "127.0.0.1", "port": 0,
+                                   "ready": lambda server: held.__setitem__("server", server)},
+            daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 10
+        while "server" not in held and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertIn("server", held, "the standard entry never bound")
+        self.addCleanup(held["server"].shutdown)
+        self.addCleanup(held["server"].server_close)
+        return held["server"]
+
+    def _call(self, server, method, path, body=None, cookie=None):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        try:
+            headers = {"Content-Type": "application/json"} if body is not None else {}
+            if cookie:
+                headers["Cookie"] = cookie
+            conn.request(method, path, json.dumps(body) if body is not None else None, headers)
+            response = conn.getresponse()
+            return response.status, json.loads(response.read().decode("utf-8")), response.getheader("Set-Cookie")
+        finally:
+            conn.close()
+
+    def _login(self, server, actor):
+        status, body, cookie = self._call(server, "POST", "/api/v1/personal/login",
+                                          {"actor": actor, "symbols": ["600519"]})
+        self.assertEqual(status, 200, body)
+        return cookie.split(";")[0]
+
+    def test_login_then_scoped_retrieval_and_timeline_from_the_standard_entry(self):
+        shared = self._shared("共享流水线研究")
+        alice = self._personal(ALICE, "Alice自有研究甲")
+        self._personal(BOB, "Bob自有研究乙")
+        rerun = self._personal(ALICE, "", rerun_of=alice["task_id"])
+        server = self._serve()
+        self.assertIsNotNone(server.session_store)
+        self.assertEqual(self._call(server, "GET", "/health")[0], 200)
+        self.assertEqual(self._call(server, "GET", "/api/v1/library")[0], 403)
+        bob = self._login(server, BOB)
+        seen = self._call(server, "GET", "/api/v1/library", cookie=bob)[1]
+        self.assertEqual(sorted(r["question"] for r in seen["results"]),
+                         sorted(["共享流水线研究", "Bob自有研究乙"]))
+        alice_cookie = self._login(server, ALICE)
+        status, timeline, _ = self._call(
+            server, "GET", "/api/v1/library/timeline?task_id=" + alice["task_id"], cookie=alice_cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(sorted(r["task_id"] for r in timeline["results"]),
+                         sorted([alice["task_id"], rerun["task_id"]]))
+        self.assertEqual(len({r["report_version"] for r in timeline["results"]}), 2)
+        self.assertEqual(self._call(
+            server, "GET", "/api/v1/library?since=2026-11-24T17:08:52", cookie=alice_cookie)[1]["error"],
+            "invalid_time_window")
+        self.assertEqual(self._call(server, "GET", "/api/v1/library?actor=" + BOB, cookie=alice_cookie)[0], 403)
+
+    def test_sessions_explicitly_disabled_fails_closed(self):
+        server = self._serve(sessions_enabled=False)
+        self.assertIsNone(server.session_store)
+        self.assertEqual(self._call(server, "GET", "/health")[0], 200)
+        self.assertEqual(self._call(server, "POST", "/api/v1/personal/login",
+                                    {"actor": ALICE, "symbols": ["600519"]})[0], 503)
+        self.assertEqual(self._call(server, "GET", "/api/v1/library")[0], 503)
+        self.assertEqual(self._call(server, "GET", "/api/v1/library/timeline?task_id=x")[0], 503)
 
 
 class EmbeddingFreeTests(ScopeTestCase):
