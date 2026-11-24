@@ -1079,6 +1079,117 @@ class RuntimeEdgeTests(unittest.TestCase):
                          correlation("r23-runtime-edges"))
 
 
+class QueryProjectionTests(unittest.TestCase):
+    """sol round 5: the governed query's OUTCOME string comes from the
+    provider's answer (file fixture / gateway); only a supported name is
+    published, anything else is a controlled state."""
+
+    def test_provider_supplied_outcomes_do_not_echo_raw_text(self):
+        import test_dify_api_v1
+        import test_refactor_r11
+
+        for marker in ("sha256:synthetic restricted prose", "token_syntheticfixture20261125"):
+            with self.subTest(marker=marker):
+                http = test_dify_api_v1.ApiServerTests("test_create_and_status_round_trip")
+                supply = test_refactor_r11.R11SupplyTestCase()
+                try:
+                    http.setUp()
+                    status, response = http._request("POST", "/api/dify/v1/create-research", {
+                        "title": "Synthetic query projection", "case_id": "case-alpha",
+                        "input_version": 1, "research_question": "Synthetic research?",
+                        "dify_run_id": "r23-query-projection", "workflow_version": "wf-demo-1",
+                        "business_intent_id": "r23-query-projection", "execution_mode": "replay"})
+                    self.assertEqual(status, 200, response)
+                    task_id = response["data"]["task_id"]
+                    supply.setUp()
+                    fixture = Path(supply.config["kimi_sources"]["file_fixture_path"])
+                    document = json.loads(fixture.read_text(encoding="utf-8"))
+                    document["apis"]["file_get_price"] = {"outcome": marker}
+                    fixture.write_text(json.dumps(document), encoding="utf-8")
+                    receipt = supply.attach_with_registry(task_id=task_id, allow_cache=False)
+                    self.assertTrue(receipt["consumption_recorded"])
+                    report = build_observability_report(http.store, config=supply.config,
+                                                        task_id=task_id)
+                finally:
+                    supply.doCleanups()
+                    http.doCleanups()
+                queries = report["reconciliation"]["queries"]
+                self.assertTrue(queries["ledger_available"], "the query really was recorded")
+                self.assertEqual(queries["outcome_counts"], {"unrecognized_outcome": 1})
+                self.assertEqual(queries["consumptions_bound"], 1, "the binding is still counted")
+                self.assertEqual(report["reconciliation"]["queries"]["unrecognized_outcomes"], 1)
+                rows = report["trace"]["queries"]
+                self.assertEqual(len(rows), 1, "the trace still links the query to the task")
+                self.assertEqual(rows[0]["outcome"], "unrecognized_outcome")
+                self.assertEqual(rows[0]["supply_status"], "unrecognized_supply_status")
+                self.assertNotIn(marker, json.dumps(report, ensure_ascii=False))
+                alert = next(c for c in report["alert_candidates"]["candidates"]
+                             if c["rule"] == "query_outcome_unknown")
+                self.assertEqual((alert["observed"], alert["evidence"], alert["candidate"]),
+                                 (0, "ledger", False), "an unrecognized outcome is not an unknown one")
+
+    def test_normal_outcomes_keep_their_counts_and_alert_basis(self):
+        from stock_agent.sources import kimi_adapter  # noqa: F401
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / "audit.jsonl").write_text("\n".join(json.dumps(r) for r in (
+                {"record_type": "query_intent", "request_id": "req-a", "task_id": "t-a"},
+                {"record_type": "query_result", "request_id": "req-a", "outcome": "ok"},
+                {"record_type": "query_result", "request_id": "req-b", "outcome": "outcome_unknown"},
+                {"record_type": "query_result", "request_id": "req-c", "outcome": "rate_limited"},
+                {"record_type": "query_result", "request_id": "req-d", "outcome": "suspended"},
+            )) + "\n", encoding="utf-8")
+            config = {"kimi_sources": {"ledger_path": "audit.jsonl",
+                                       "query_store_path": "intake.sqlite3"}}
+            with project_path_override(lambda value: base / value):
+                store = TaskStore(base / "t.sqlite3")
+                try:
+                    report = build_observability_report(store, config=config)
+                finally:
+                    store.close()
+        queries = report["reconciliation"]["queries"]
+        self.assertEqual(queries["outcome_counts"],
+                         {"ok": 1, "outcome_unknown": 1, "rate_limited": 1, "suspended": 1})
+        self.assertEqual(queries["unrecognized_outcomes"], 0)
+        alert = next(c for c in report["alert_candidates"]["candidates"]
+                     if c["rule"] == "query_outcome_unknown")
+        self.assertEqual((alert["observed"], alert["evidence"], alert["candidate"]), (1, "ledger", True))
+
+    def test_enum_helpers(self):
+        from stock_agent.observability import (
+            query_cost_status,
+            query_outcome,
+            query_supply_status,
+        )
+
+        for name in ("ok", "empty_result", "auth_rejected", "permission_denied", "rate_limited",
+                     "gateway_business_error", "credential_missing", "destination_denied",
+                     "response_too_large", "response_invalid", "outcome_unknown",
+                     "budget_exhausted", "not_configured", "transport_error", "suspended"):
+            self.assertEqual(query_outcome(name), name, name)
+        for raw in ("sha256:synthetic restricted prose", "token_syntheticfixture20261125",
+                    "SolFixtureOpaqueValue20261125", "", None):
+            self.assertEqual(query_outcome(raw), "unrecognized_outcome", repr(raw))
+        self.assertEqual(query_supply_status("data_delivered"), "data_delivered")
+        self.assertEqual(query_supply_status("token_syntheticfixture20261125"),
+                         "unrecognized_supply_status")
+        self.assertEqual(query_cost_status("none"), "none")
+        self.assertEqual(query_cost_status("free-of-charge-flag"), "unknown")
+
+    def test_generic_key_projection_does_not_trust_the_digest_prefix(self):
+        from stock_agent.observability import project_key
+
+        raw = "sha256:synthetic restricted prose"
+        self.assertEqual(project_key(raw), correlation(raw))
+        self.assertEqual(project_key("outcome_unknown"), "outcome_unknown")
+        self.assertEqual(project_key("", "by_provider"), "")
+        # the one map whose keys this module produced itself is not re-correlated
+        self.assertEqual(project_key(correlation("deepseek_primary"), "by_provider"),
+                         correlation("deepseek_primary"))
+        self.assertEqual(project_key("openai", "by_provider"), "openai")
+
+
 class ZeroSideEffectsTests(FrozenCaseTestCase):
     def test_repeated_reads_change_no_ledger(self):
         before = drill.ledger_counts(self.store)

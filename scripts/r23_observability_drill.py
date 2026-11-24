@@ -1086,6 +1086,52 @@ def boundary_checks(root: Path) -> dict:
           json.loads(lines[0])["fields"].get("worker_id") if lines else None)
     store.close()
 
+    # 14. (sol round 5) A governed query's outcome string is the PROVIDER's
+    #     answer: only a supported name is published.
+    def audit_case(name, outcome):
+        text = json.dumps({"record_type": "query_result", "request_id": "req-r23",
+                           "outcome": outcome}) + "\n"
+        directory = base / name
+        directory.mkdir()
+        (directory / "audit.jsonl").write_text(text, encoding="utf-8")
+        cfg = {"kimi_sources": {"ledger_path": "audit.jsonl", "query_store_path": "none.sqlite3"}}
+        s = TaskStore(directory / "t.sqlite3")
+        try:
+            t, _ = s.create_task(title="合成", input_payload={
+                "research_question": "合成", "data_classification": "public"}, execution_mode="replay")
+            (directory / "audit.jsonl").write_text(json.dumps({
+                "record_type": "query_intent", "request_id": "req-r23", "task_id": t["task_id"]}) + "\n"
+                + text, encoding="utf-8")
+            with project_path_override(lambda value: directory / value):
+                r = obs.build_observability_report(s, config=cfg, task_id=t["task_id"])
+        finally:
+            s.close()
+        q = r["reconciliation"]["queries"]
+        alert = next(c for c in r["alert_candidates"]["candidates"]
+                     if c["rule"] == "query_outcome_unknown")
+        return (q["outcome_counts"], [row["outcome"] for row in r["trace"]["queries"]],
+                alert["observed"], alert["evidence"])
+
+    for name, marker in (("digest_shaped", "sha256:" + BODY_AS_ID),
+                         ("credential_shaped", "token_zcodefixture20261125")):
+        counts, trace_outcomes, observed, evidence = audit_case("query_" + name, marker)
+        check("boundary.query." + name + ".not_in_counts", [], [k for k in counts if marker in k])
+        check("boundary.query." + name + ".not_in_trace", [],
+              [o for o in trace_outcomes if marker in o])
+        check("boundary.query." + name + ".controlled_state",
+              ({"unrecognized_outcome": 1}, ["unrecognized_outcome"], 0, "ledger"),
+              (counts, trace_outcomes, observed, evidence))
+    check("boundary.query.normal_outcomes", ({"ok": 1}, ["ok"], 0, "ledger"),
+          audit_case("query_ok", "ok"))
+    check("boundary.query.unknown_outcome_alerts", ({"outcome_unknown": 1}, ["outcome_unknown"], 1, "ledger"),
+          audit_case("query_unknown", "outcome_unknown"))
+    check("boundary.query.supply_status_controlled", "unrecognized_supply_status",
+          obs.query_supply_status("token_zcodefixture20261125"))
+    raw_key = "sha256:" + BODY_AS_ID
+    check("boundary.key.digest_prefix_not_trusted", obs.correlation(raw_key),
+          obs.project_key(raw_key))
+    check("boundary.key.internal_provider_map_kept", raw_key, obs.project_key(raw_key, "by_provider"))
+
     # 7. A read-only DIRECTORY (not root): the read still works and writes nothing.
     directory = base / "readonly"
     directory.mkdir()

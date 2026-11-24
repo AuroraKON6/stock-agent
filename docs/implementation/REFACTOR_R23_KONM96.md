@@ -4,7 +4,7 @@
 （[REFACTOR_R23_20261023.md](REFACTOR_R23_20261023.md)），基线 `dc8a4cffd51663c0b4f1c67b1f5c03d7f3422071`。
 全部输入为合成案件；真实供应商、真实外发、R18 真传输、生产告警接收均为 `NOT_RUN`。
 
-本文件描述第 5 轮（sol 第四轮校验返工后）的行为。前几轮缺陷及对应改动见 §6。
+本文件描述第 6 轮（sol 第五轮校验返工后）的行为。前几轮缺陷及对应改动见 §6。
 
 ## 1. 结论一览
 
@@ -27,7 +27,7 @@
 - `stock_agent/ops_view.py`：`recent_failures[].error` 由错误原文改为稳定错误码。
 - `stock_agent/cli.py`：只读子命令 `observability`（`read_only=True` 开库，库不存在时拒绝、不创建）。
 - `scripts/r23_observability_drill.py`、`deploy/testing/r23_observability.compose.yaml`：容器演练。
-- `tests/test_refactor_r23_trace.py`：59 项定向用例，与容器演练共用同一冻结合成案例。
+- `tests/test_refactor_r23_trace.py`：63 项定向用例，与容器演练共用同一冻结合成案例。
 - `tests/test_ops_view.py`：`recent_failures` 排序用例改为断言错误码（见 §6 第 2 项）。
 
 未改 TaskStore、预算、采纳或 worker 状态流。`aggregate_attempts` / `event_type_counts` 通过
@@ -74,6 +74,14 @@
   同一个值总是映射到同一个关联值，两次读取能对上同一运行或意图，不同运行仍可区分。
   调用方填入一个长得像关联值的字符串（`sha256:...`）不会被当成内部摘要：它在上述字段里过不了任何校验，
   会被再关联一次，内部摘要与同形状的原始输入不会混淆。明细与聚合同一标签，计数可对账。
+- **治理查询的结果字段按受控枚举投影。** 查询的 `outcome` 是供应方应答里的字符串（文件桩或网关返回，
+  供给表没有映射的值会原样落账），所以它也是外部文本。只有本代码库定义的 outcome 名称才原样发布（transport
+  的 `OUTCOME_*`、工作台 `outcome_label` 的键，外加 `ok`、`empty_result`、`suspended`、`outcome_unknown`），
+  其余一律记为受控状态 `unrecognized_outcome`：照常计数、照常关联，但不输出原值，也不计入
+  `query_outcome_unknown` 告警。`cost_status`、`supply_status` 同理（`unknown` / `unrecognized_supply_status`）。
+- **字典键不凭 `sha256:` 前缀放行。** 视图里作为键出现的数据（状态、事件类型、执行模式、outcome、provider
+  标签）只有受控词才保留，其余换成关联值。唯一的例外是本模块自己生成的 `by_provider`：它的键已经是发布用
+  标签（已激活 provider 的名称或这里算出的关联值），不再二次关联。区分的依据是这张表的来源，不是键的长相。
 - **采样路径用同一条规则。** 结构化日志的字符串值走同一个 `project_value`：系统标识和受控词原样，
   worker 标签这类外部文本换成关联值（仍可关联，不输出原文）。字段名仍受允许集合约束。
 - **`by_provider` 的口径。** 它按 attempt 行记录的 provider 标签归类计数，只说明「配置的提供商标签」，
@@ -174,3 +182,9 @@ $C down --volumes --remove-orphans
 | 11 | 运行时采样原样输出 worker 标识 | `project_log_fields` 改用 `project_value` | 演练 `boundary.log.worker_label_*`；`test_worker_label_on_the_real_sampling_path_is_correlated` |
 
 第 3 轮留下的取舍（run ID 与业务身份是否一律换关联值）由 sol 在本轮裁定为一律换。
+
+### 第 5 轮（sol 第五轮校验，`b2a11cb`）
+
+| # | 缺陷 | 改动 | 新证据 |
+| --- | --- | --- | --- |
+| 12 | 文件桩返回的 `outcome`（带 `sha256:` 前缀的正文、凭据形态的小写标记）原样进入 `outcome_counts` 的键和 trace 的 `outcome` | outcome / cost_status / supply_status 按受控枚举投影，无法识别的值用受控状态表示；通用键投影不再信任摘要前缀，只有本模块生成的 `by_provider` 例外 | 演练 `boundary.query.*`、`boundary.key.*`；`QueryProjectionTests`（含经 Dify 入口 + R11 文件桩的两种形态） |

@@ -364,16 +364,70 @@ def project_value(field: Any, value: Any, known: frozenset = frozenset()) -> Any
     return correlation(value)
 
 
-def project_key(key: Any) -> str:
-    """A dictionary key that names data (a status, an event type, an
-    execution mode, a provider label). Field names and controlled tokens are
-    kept; anything else is correlated — including an execution mode or other
-    key that came from outside."""
-    text = str(key)
-    if text == "" or _CONTROLLED.match(text):
+# Result fields of a governed query are written from the PROVIDER's answer
+# (the file fixture or the gateway returns the ``outcome`` string; a value the
+# supply table does not map is stored as itself). They are therefore external
+# text until checked against the vocabulary this code base defines.
+UNRECOGNIZED_OUTCOME = "unrecognized_outcome"
+UNRECOGNIZED_SUPPLY_STATUS = "unrecognized_supply_status"
+_QUERY_COST_STATUSES = frozenset({"none", "unknown", "free", "in_plan", "charged"})
+_QUERY_SUPPLY_STATUSES = frozenset({
+    "data_delivered", "no_data", "permission_denied", "auth_rejected", "suspended",
+    "gate_refused", "replay", "budget", "rate_limited", "destination",
+    "integration_disabled", "unknown",
+})
+
+
+def query_outcomes() -> frozenset:
+    """The outcome names the transport, the client and the board define."""
+    try:
+        from .integrations.kimi import transport
+        from .queries_view import _OUTCOME_LABELS
+
+        names = {value for name, value in vars(transport).items()
+                 if name.startswith("OUTCOME_") and isinstance(value, str)}
+        names.update(_OUTCOME_LABELS)
+    except Exception:  # noqa: BLE001 — the vocabulary could not be imported
+        names = set()
+    names.update({"ok", "empty_result", "suspended", "outcome_unknown"})
+    return frozenset(names)
+
+
+def query_outcome(value: Any) -> str:
+    """A supported outcome name as it is; anything else is reported as the
+    controlled state ``unrecognized_outcome`` (counted, never echoed)."""
+    text = str(value or "")
+    return text if text and text in query_outcomes() else UNRECOGNIZED_OUTCOME
+
+
+def query_cost_status(value: Any) -> str:
+    text = str(value or "")
+    return text if text in _QUERY_COST_STATUSES else "unknown"
+
+
+def query_supply_status(value: Any) -> str:
+    text = str(value or "")
+    if text in _QUERY_SUPPLY_STATUSES or text in query_outcomes():
         return text
-    if text.startswith(_LABEL_DIGEST_PREFIX):
-        # set by ``provider_counts`` from the raw label: already correlated
+    return UNRECOGNIZED_SUPPLY_STATUS if text else ""
+
+
+def project_key(key: Any, field: Any = None) -> str:
+    """A dictionary key that names data (a status, an event type, an
+    execution mode, an outcome, a provider label).
+
+    Field names are not keys here; every key is DATA read from a ledger, so a
+    key is kept only when it is a controlled token. The one exception is a
+    map this module built itself (``by_provider``): its keys are already the
+    published labels — an activated provider's name or a correlation value
+    computed here — and must not be correlated a second time. A key that
+    merely looks like a correlation value (``sha256:...``) is NOT trusted:
+    only the map's provenance is.
+    """
+    text = str(key)
+    if field == "by_provider":
+        return text
+    if text == "" or _CONTROLLED.match(text):
         return text
     return correlation(text)
 
@@ -383,7 +437,7 @@ def _safe_tree(value: Any, field: Any = None, known: frozenset = frozenset()) ->
     if isinstance(value, dict):
         return {str(key): (str(item) if key in PROSE_KEYS and isinstance(item, str)
                            else _safe_tree(item, key, known))
-                for key, item in ((project_key(k), v) for k, v in value.items())}
+                for key, item in ((project_key(k, field), v) for k, v in value.items())}
     if isinstance(value, list):
         return [_safe_tree(item, field, known) for item in value]
     return project_value(field, value, known)
@@ -801,9 +855,9 @@ def queries_for_task(task_id: str, read: Dict[str, Any]) -> List[Dict[str, Any]]
             "source_id": str(intake.get("source_id") or audit.get("source_id") or ""),
             "api_id": str(audit.get("api_id") or ""),
             "data_kind": str(audit.get("data_kind") or ""),
-            "supply_status": str(binding.get("supply_status") or ""),
-            "outcome": str(result.get("outcome") or intake.get("outcome") or "unknown"),
-            "cost_status": str(result.get("cost_status") or "unknown"),
+            "supply_status": query_supply_status(binding.get("supply_status")),
+            "outcome": query_outcome(result.get("outcome") or intake.get("outcome")),
+            "cost_status": query_cost_status(result.get("cost_status")),
             "created_at": str(intake.get("created_at") or audit.get("created_at") or ""),
             "consumed_at": str(binding.get("consumed_at") or ""),
         })
@@ -820,8 +874,8 @@ def queries_for_task(task_id: str, read: Dict[str, Any]) -> List[Dict[str, Any]]
             "api_id": str(audit.get("api_id") or ""),
             "data_kind": str(audit.get("data_kind") or ""),
             "supply_status": "",
-            "outcome": str(result.get("outcome") or "unknown") if result else "unknown",
-            "cost_status": str(result.get("cost_status") or "unknown") if result else "unknown",
+            "outcome": query_outcome(result.get("outcome")) if result else "unknown",
+            "cost_status": query_cost_status(result.get("cost_status")) if result else "unknown",
             "created_at": str(audit.get("created_at") or ""),
             "consumed_at": "",
         })
@@ -1019,7 +1073,9 @@ def _build_reconciliation(store: Any, config: Any, now, ledger, query_read) -> D
     query_results = [r for r in records if r.get("record_type") == "query_result"]
     query_outcomes: Dict[str, int] = {}
     for result in query_results:
-        outcome = str(result.get("outcome") or "unknown")
+        # The outcome string came from the provider's answer: only a supported
+        # name is published; anything else is counted under a controlled state.
+        outcome = query_outcome(result.get("outcome"))
         query_outcomes[outcome] = query_outcomes.get(outcome, 0) + 1
     result_keys = {str(r.get("request_id") or "") for r in query_results} | \
                   {str(r.get("intent_id") or "") for r in query_results}
@@ -1131,6 +1187,8 @@ def _build_reconciliation(store: Any, config: Any, now, ledger, query_read) -> D
             "intake_available": intake_available,
             "intake_detail": query_read.get("intake_detail") or "",
             "outcome_counts": query_outcomes if ledger_available else {},
+            "unrecognized_outcomes": query_outcomes.get(UNRECOGNIZED_OUTCOME, 0)
+            if ledger_available else "unknown",
             "intents_without_result": intents_without_result if ledger_available else "unknown",
             "consumptions_bound": len(consumptions) if intake_available else "unknown",
             "note": "ledger_available=false 表示账本未配置/缺失/不可读：计数为 0 不代表没有查询",
