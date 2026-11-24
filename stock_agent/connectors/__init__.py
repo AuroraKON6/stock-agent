@@ -10,27 +10,48 @@ interface the SDK can back later.
 
 Stop conditions honored by construction (taskbook R18):
 - tools not configured in the manifest are INVISIBLE and uncallable (A81);
-- caller tokens are never forwarded — each connector uses its own
-  policy-configured credential (A82);
-- exact-origin HTTPS with DNS pinning: private/loopback resolutions and any
-  redirect are refused before/outside the request (A83);
-- responses are size-capped and malformed bodies fail bounded (A84);
+- a revoked connector stops visible and callable on the SAME live instance
+  via ConnectorRegistry (A81);
+- caller credentials are refused at the header AND tool-argument boundary;
+  each connector authenticates only with its own trusted-config credential,
+  bound to one connector id, audience and destination (A82);
+- exact-origin HTTPS with DNS pinning: the request URL is rebuilt from the
+  parsed origin and a validated path, addresses are handed to the transport,
+  private/loopback resolutions and any redirect are refused (A83);
+- responses are size-capped, must satisfy the MCP content-item / HTTP
+  top-level object contract, and malformed bodies fail bounded (A84);
+- a possibly-delivered HTTP failure is reported as after_send or
+  delivery_unknown with a reconciliation hint, never as before_send, and is
+  never retried; MCP disconnects do the same (A83/A85);
 - tool-returned content is DATA — instruction-like text never expands the
   tool set or changes policy (A85).
 """
 from .policy import (
+    CALLER_CREDENTIAL_KEYS,
+    ConnectorCredential,
     ConnectorPolicy,
+    ConnectorRegistry,
     PolicyViolation,
+    bind_connector_credential,
     load_connector_registry,
     resolve_endpoint_addresses,
     support_matrix,
 )
 from .mcp_client import MCPClient, MCPToolError, MemoryMCPTransport
-from .http_client import HTTPConnector, HTTPConnectorError
+from .http_client import (
+    HTTPConnector,
+    HTTPConnectorError,
+    HTTPTransportError,
+    approved_request_url,
+)
 
 __all__ = [
+    "CALLER_CREDENTIAL_KEYS",
+    "ConnectorCredential",
     "ConnectorPolicy",
+    "ConnectorRegistry",
     "PolicyViolation",
+    "bind_connector_credential",
     "load_connector_registry",
     "resolve_endpoint_addresses",
     "support_matrix",
@@ -39,4 +60,6 @@ __all__ = [
     "MemoryMCPTransport",
     "HTTPConnector",
     "HTTPConnectorError",
+    "HTTPTransportError",
+    "approved_request_url",
 ]

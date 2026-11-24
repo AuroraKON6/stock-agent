@@ -11,10 +11,15 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from .policy import ConnectorPolicy, PolicyViolation
+from .policy import (
+    ConnectorPolicy,
+    PolicyViolation,
+    bind_connector_credential,
+)
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 CLIENT_INFO = {"name": "stock-agent-connector-gateway", "version": "1.0"}
+CONTENT_TYPES = {"text", "image", "resource"}
 
 
 class MCPToolError(RuntimeError):
@@ -36,13 +41,16 @@ class MemoryMCPTransport:
         self.fail_calls_with = fail_calls_with
         self.oversized_tool = oversized_tool
         self.calls: List[Dict[str, Any]] = []
+        self.auth_presentations: List[Dict[str, Any]] = []
         self.initialized = False
         self.sent_any_call = False             # for connection-lost semantics
 
     # -- server side of the wire -------------------------------------- #
 
-    def post(self, request: Dict[str, Any]) -> Dict[str, Any]:
+    def post(self, request: Dict[str, Any],
+             auth: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         method = str(request.get("method") or "")
+        self.auth_presentations.append(dict(auth or {}))
         if method == "initialize":
             self.initialized = True
             return {"jsonrpc": "2.0", "id": request.get("id"),
@@ -73,15 +81,31 @@ class MemoryMCPTransport:
 
 class MCPClient:
     """Policy-bound client: every reply is filtered/checked against the
-    manifest before it escapes this class."""
+    manifest before it escapes this class. ``policy`` may be a frozen
+    ConnectorPolicy or a live provider (``ConnectorRegistry.provider``) so a
+    reload/revocation reaches this same instance (A81). ``credential`` is the
+    connector's own trusted-config identity; without a bound credential the
+    constructor refuses before the first byte (A82)."""
 
-    def __init__(self, policy: ConnectorPolicy, transport: Any):
-        self.policy = policy
+    def __init__(self, policy: Any, transport: Any, *, credential: Any = None):
+        self._policy_source = (policy if callable(policy)
+                               else (lambda policy=policy: policy))
         self.transport = transport
+        self.credential = credential
         self._request_id = 0
         self._handshake()
 
+    @property
+    def policy(self) -> ConnectorPolicy:
+        return self._policy_source()
+
     # ------------------------------------------------------------------ #
+
+    def _presentation(self) -> Dict[str, Any]:
+        policy = self.policy
+        destination = "" if policy.transport == "mcp_stdio" else policy.endpoint
+        return bind_connector_credential(policy, self.credential,
+                                         destination=destination)
 
     def _rpc(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         self._request_id += 1
@@ -89,7 +113,7 @@ class MCPClient:
                                    "method": method}
         if params is not None:
             request["params"] = params
-        response = self.transport.post(request)
+        response = self.transport.post(request, auth=self._presentation())
         if not isinstance(response, dict) or "error" in response:
             message = str((response or {}).get("error", {}).get("message")
                           if isinstance(response, dict) else response)
@@ -110,7 +134,11 @@ class MCPClient:
 
     def list_tools(self) -> List[Dict[str, Any]]:
         """A81: only whitelisted tools are visible — a server advertising
-        extra tools (drift) yields them as INVISIBLE, never as new surface."""
+        extra tools (drift) yields them as INVISIBLE, never as new surface.
+        A live revocation short-circuits before any egress."""
+        policy = self.policy
+        if policy.revoked:
+            return []
         reply = self._rpc("tools/list")
         visible: List[Dict[str, Any]] = []
         for tool in (reply.get("result") or {}).get("tools") or []:
@@ -123,12 +151,17 @@ class MCPClient:
 
     def call_tool(self, tool: str, arguments: Optional[Dict[str, Any]] = None,
                   *, caller_headers: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        # A82: refuse caller credentials before anything is sent.
-        self.policy.forbid_caller_tokens(caller_headers or {})
-        self.policy.assert_callable(tool)
+        # A82: refuse caller credentials at BOTH boundaries before anything
+        # is sent — headers and (recursively) tool arguments.
+        policy = self.policy
+        policy.forbid_caller_tokens(caller_headers or {})
+        policy.forbid_caller_tokens_deep(arguments or {})
+        policy.assert_callable(tool)
         try:
             reply = self._rpc("tools/call", {"name": tool,
                                              "arguments": dict(arguments or {})})
+        except PolicyViolation:
+            raise
         except MCPToolError as exc:
             raise MCPToolError("rpc_error: {0}".format(exc)) from exc
         except Exception as exc:  # transport died mid-call
@@ -139,16 +172,35 @@ class MCPClient:
                         type(exc).__name__)) from exc
             raise MCPToolError("connection_lost_before_send: {0}".format(
                 type(exc).__name__)) from exc
+        policy = self.policy  # live policy: revocation/reload applies here too
         result = reply.get("result") or {}
+        if not isinstance(result, dict):
+            raise MCPToolError("result_malformed: result must be an object")
         encoded = json.dumps(result, ensure_ascii=False, default=str)
-        if len(encoded.encode("utf-8")) > self.policy.max_response_bytes:
+        if len(encoded.encode("utf-8")) > policy.max_response_bytes:
             # A84: bounded refusal — the payload is dropped, never parsed.
             raise MCPToolError(
                 "result_too_large: {0} > cap {1}".format(
-                    len(encoded.encode("utf-8")), self.policy.max_response_bytes))
+                    len(encoded.encode("utf-8")), policy.max_response_bytes))
         content = result.get("content")
         if not isinstance(content, list):
             raise MCPToolError("result_malformed: content must be a list")
+        # A84: validate every content entry before the result is usable.
+        for index, item in enumerate(content):
+            if not isinstance(item, dict):
+                raise MCPToolError(
+                    "result_malformed: content[{0}] must be an object".format(index))
+            ctype = item.get("type")
+            if not isinstance(ctype, str) or not ctype.strip():
+                raise MCPToolError(
+                    "result_malformed: content[{0}].type missing".format(index))
+            if ctype not in CONTENT_TYPES:
+                raise MCPToolError(
+                    "result_malformed: content[{0}].type {1!r} not allowed".format(
+                        index, ctype))
+            if ctype == "text" and not isinstance(item.get("text"), str):
+                raise MCPToolError(
+                    "result_malformed: content[{0}].text must be a string".format(index))
         return {"tool": tool, "content": content, "is_error": bool(result.get("isError")),
                 # A85 note: text items are returned verbatim as DATA — nothing
                 # here interprets instructions inside tool output.
