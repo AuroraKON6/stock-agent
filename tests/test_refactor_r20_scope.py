@@ -640,21 +640,17 @@ class ReportTimeSourceTests(ScopeTestCase):
         self.assertEqual(default["result_count"], 0)
 
     def test_old_record_without_source_field_needs_review_when_ledgers_disagree(self):
-        """Cross-version: a personal task written by the previous worker
-        (no ``evidence_namespaces``) while both vaults held the same bytes.
-        The shared original is then withdrawn and only the personal copy
-        survives. The record cannot say which copy the report used."""
+        """Both vaults hold the same bytes under the SAME title and nothing
+        on record says which copy the report used. The shared original is
+        then withdrawn and only the personal copy survives: the record
+        cannot tell the copies apart, so the entry needs review."""
         document_id, sha, content = self._personal_document(ALICE, "跨版本同字节原件。", "跨版本原件")
-        import_document(self.config, self.root, content=content, title="共享侧同字节")
-        task = self._personal(ALICE, "跨版本研究", document_ids=[document_id])
-        model_call = dict(task["model_call"])
-        model_call["context_delivery"] = {k: v for k, v in model_call["context_delivery"].items()
-                                          if k != "evidence_namespaces"}
-        self.store._conn.execute("UPDATE research_tasks SET model_call = ? WHERE task_id = ?",
-                                 (json.dumps(model_call, ensure_ascii=False), task["task_id"]))
-        self.store._conn.commit()
+        import_document(self.config, self.root, content=content, title="跨版本原件",
+                        signal_ids=[], seed_signals=False)
+        self._personal(ALICE, "跨版本研究", document_ids=[document_id])
         cached = build_library_index(self.store)
-        self.assertEqual(cached["entries"][0]["evidence_sources"], {sha: "unrecorded"})
+        entry = [e for e in cached["entries"] if e["question"] == "跨版本研究"][0]
+        self.assertEqual((entry["evidence_sources"], entry["delivered_titles"]), ({sha: "unrecorded"}, {}))
         self.assertEqual(query_library(cached, self.config, ALICE, query="跨版本")["result_count"], 1,
                          "both copies verified: the report is backed either way")
         self._withdraw(content)   # the shared original; the personal copy stays
@@ -667,10 +663,56 @@ class ReportTimeSourceTests(ScopeTestCase):
                          [("source_unverified", [sha])])
         # Had ONLY the personal namespace ever held the bytes, the source is
         # proven and the personal copy keeps the report live.
-        only, only_sha, only_content = self._personal_document(BOB, "仅个人金库持有。", "仅个人原件")
+        only, _, _ = self._personal_document(BOB, "仅个人金库持有。", "仅个人原件")
         self._personal(BOB, "仅个人研究", document_ids=[only])
-        index = build_library_index(self.store)
-        self.assertEqual(query_library(index, self.config, BOB, query="仅个人")["result_count"], 1)
+        self.assertEqual(query_library(build_library_index(self.store), self.config, BOB,
+                                       query="仅个人")["result_count"], 1)
+
+    def test_old_record_source_recovered_from_the_delivered_title(self):
+        """Both vaults hold the same bytes under different titles; the worker
+        delivered the shared copy. Read as a record WITHOUT the namespace
+        field (previous worker), the delivered title still names the copy."""
+        from stock_agent.evidence_vault import link_evidence_to_signal
+        from stock_agent.models import AnalyzedSignal, now_iso
+        from stock_agent.storage import SignalStore
+
+        signal_id = "sig-title-0001"
+        database = SignalStore(Path(self.config["storage"]["sqlite_path"]))
+        try:
+            database.upsert_many([AnalyzedSignal(
+                signal_id=signal_id, source="manual", source_type="filing", title="来源信号",
+                summary="Synthetic fixture only", url="https://www.cninfo.com.cn/disclosure/fixture",
+                published_at=now_iso(), collected_at=now_iso(), symbols=["600519"],
+                payload={"data_classification": "public"})])
+        finally:
+            database.close()
+        _, sha = import_document(self.config, self.root, content=self.CONTENT, title="共享库标题甲",
+                                 signal_ids=[signal_id])
+        document_id, _, _ = self._personal_document(ALICE, self.CONTENT, "个人库标题乙")
+        link_evidence_to_signal(personal_vault_view(self.config, ALICE), document_id=document_id,
+                                signal_id=signal_id, actor="test-evidence-collector",
+                                actor_role="information_analyst")
+        task = self._personal(ALICE, "旧记录来源研究", document_ids=[document_id])
+        model_call = dict(task["model_call"])
+        self.assertEqual(model_call["context_delivery"]["evidence_namespaces"],
+                         {"document:sha256:{0}".format(sha): "shared"})
+        model_call["context_delivery"] = {k: v for k, v in model_call["context_delivery"].items()
+                                          if k != "evidence_namespaces"}
+        self.store._conn.execute("UPDATE research_tasks SET model_call = ? WHERE task_id = ?",
+                                 (json.dumps(model_call, ensure_ascii=False), task["task_id"]))
+        self.store._conn.commit()
+        cached = build_library_index(self.store)
+        entry = cached["entries"][0]
+        self.assertEqual(entry["evidence_sources"], {sha: "unrecorded"})
+        self.assertEqual(entry["delivered_titles"], {sha: "共享库标题甲"})
+        self.assertEqual(query_library(cached, self.config, ALICE, query="旧记录来源")["result_count"], 1)
+        self._withdraw(self.CONTENT)   # shared original; the personal copy stays verified
+        self._roster([{"actor_id": ALICE, "principal_type": "human", "active": True,
+                       "roles": ["quality_reviewer"], "information_side": "public"}])
+        audit = query_library(cached, self.config, ALICE, query="旧记录来源", include_stale=True)
+        self.assertEqual([r["stale_reason"] for r in audit["results"]], ["evidence_revoked"],
+                         "the delivered title names the shared copy: its withdrawal decides")
+        self.assertEqual(query_library(cached, self.config, ALICE, query="旧记录来源")["result_count"], 0)
 
     def test_historical_record_without_source_fails_closed(self):
         sha = "c" * 64

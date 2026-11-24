@@ -44,8 +44,10 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+from .audit_log import load_hash_chained_jsonl
+from .config import project_path
 from .evidence_context import verified_evidence_documents
-from .evidence_vault import load_evidence_vault
+from .evidence_vault import evidence_vault_config, load_evidence_vault
 from .personal_evidence import PERSONAL_ORIGIN_VIA, personal_vault_view
 from .task_runtime.store import TERMINAL_STATUSES
 
@@ -151,6 +153,16 @@ def build_library_index(store: Any, config: Optional[Dict[str, Any]] = None) -> 
         for sha in sorted(set(evidence_shas)):
             source = recorded.get("document:sha256:{0}".format(sha))
             sources[sha] = source if source in ("shared", "personal") else "unrecorded"
+        # What the worker ACTUALLY delivered for each original — the vault
+        # title it took from the authorizing namespace. The older delivery
+        # record carries this but no namespace marker; when two namespaces
+        # hold the same bytes, the delivered title is the record's own
+        # evidence of which copy the report used.
+        delivered_titles = {}
+        for item in (((task.get("model_call") or {}).get("outbound_context") or {})
+                     .get("evidence_summaries") or {}).values():
+            if isinstance(item, dict) and item.get("sha256") and item.get("summary"):
+                delivered_titles[str(item["sha256"])] = str(item["summary"])
         entries.append({
             "task_id": str(task.get("task_id") or ""),
             "status": str(task.get("status")),
@@ -164,6 +176,7 @@ def build_library_index(store: Any, config: Optional[Dict[str, Any]] = None) -> 
             "research_occasion": str(origin.get("research_occasion") or ""),
             "evidence_shas": sorted(set(evidence_shas)),
             "evidence_sources": sources,
+            "delivered_titles": delivered_titles,
             "namespace": NAMESPACE_PERSONAL if owner else NAMESPACE_SHARED,
             "owner": owner or None,
             **report_identity(output, str(task.get("task_id") or ""), task.get("input_version")),
@@ -296,8 +309,11 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
     it from what the ledgers can prove. Exactly one namespace ever held the
     bytes: that one authorized them. Held nowhere: judged in the task's own
     namespace, which fails. Both the shared vault and the owner's namespace
-    hold them and disagree on whether they are still verified: no record can
-    say which copy the report used, so the entry is ``source_unverified`` —
+    hold them: the title the worker recorded as delivered names the copy
+    the report used when exactly one of the two ledgers ever recorded that
+    title. When both did (same title), or no delivered title is on record,
+    and the copies disagree on whether they are still verified, the entry is
+    ``source_unverified`` —
     excluded by default, kept for the audit view with ``unverified_sources``.
 
     An entry whose evidence fully left its authorizing projection is
@@ -309,18 +325,26 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
     state_cache: Dict[str, tuple] = {}
 
     def namespace_state(owner: str):
-        """(SHAs the namespace HOLDS in any status, SHAs it verifies now).
-        ``owner`` empty names the shared vault."""
+        """(SHAs the namespace HOLDS in any status, SHAs it verifies now, every
+        title its ledger EVER recorded per SHA). ``owner`` empty names the
+        shared vault."""
         if owner not in state_cache:
             try:
                 view = config if not owner else personal_vault_view(config, owner)
                 vault = load_evidence_vault(view or {})
-                held = {str(document["sha256"]) for document in (vault.get("documents") or {}).values()
-                        if isinstance(document, dict) and document.get("sha256")}
+                documents = [document for document in (vault.get("documents") or {}).values()
+                             if isinstance(document, dict) and document.get("sha256")]
+                held = {str(document["sha256"]) for document in documents}
+                titles: Dict[str, set] = {str(document["sha256"]): set() for document in documents}
+                for record in load_hash_chained_jsonl(
+                        project_path(evidence_vault_config(view or {})["events_path"]))["records"]:
+                    if record.get("event_type") in ("evidence_captured", "evidence_quarantined"):
+                        titles.setdefault(str((record.get("payload") or {}).get("sha256")), set()).add(
+                            str((record.get("payload") or {}).get("title") or ""))
                 live = set(verified_evidence_documents(view or {}).keys())
             except Exception:  # an unresolvable namespace holds and verifies nothing
-                held, live = set(), set()
-            state_cache[owner] = (held, live)
+                held, live, titles = set(), set(), {}  # type: ignore[assignment]
+            state_cache[owner] = (held, live, titles)
         return state_cache[owner]
 
     checked = []
@@ -330,29 +354,39 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
         owner = str(entry.get("owner") or "")
         sources = entry.get("evidence_sources") or {}
 
-        def judge(sha, _owner=owner, _sources=sources, _personal=personal):
+        titles = entry.get("delivered_titles") or {}
+
+        def judge(sha, _owner=owner, _sources=sources, _personal=personal,
+                  _titles=titles):
             source = _sources.get(sha)
             if source not in ("shared", "personal"):
-                # Historical record: recover the source from what the ledgers
-                # can prove. Exactly one namespace ever held these bytes ->
-                # that one authorized them. Both hold them and disagree on
-                # whether they are still verified -> the record cannot say
-                # which copy the report used: needs review, excluded by
-                # default. Held nowhere -> judged (and failing) in the task's
-                # own namespace.
+                # Historical record: recover the source from what the record
+                # and the ledgers can prove. Exactly one namespace ever held
+                # these bytes -> that one authorized them. Held nowhere ->
+                # judged (and failing) in the task's own namespace.
                 namespaces = [("shared", *namespace_state(""))] if not _personal else [
                     ("shared", *namespace_state("")), ("personal", *namespace_state(_owner))]
-                holders = [name for name, held, _ in namespaces if sha in held]
+                holders = [state for state in namespaces if sha in state[1]]
                 if len(holders) == 1:
-                    source = holders[0]
+                    source = holders[0][0]
                 elif not holders:
                     source = NAMESPACE_PERSONAL if _personal else NAMESPACE_SHARED
-                elif all(sha in live for _, _, live in namespaces):
-                    return True, False
-                elif not any(sha in live for _, _, live in namespaces):
-                    return False, False
                 else:
-                    return False, True
+                    # Both hold them: the title the worker delivered is the
+                    # record's own statement of which copy it used. It names
+                    # the copy when exactly one ledger ever recorded it.
+                    delivered = str(_titles.get(sha) or "")
+                    named = [state[0] for state in holders if delivered and delivered in state[3].get(sha, ())]
+                    if len(named) == 1:
+                        source = named[0]
+                    elif all(sha in state[2] for state in holders):
+                        return True, False   # either copy still backs the report
+                    elif not any(sha in state[2] for state in holders):
+                        return False, False  # withdrawn everywhere
+                    else:
+                        # The copies disagree and nothing on record tells
+                        # them apart: needs review, excluded by default.
+                        return False, True
             return sha in namespace_state(_owner if source == "personal" else "")[1], False
 
         live, unverified = [], []
