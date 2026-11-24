@@ -534,6 +534,127 @@ class AuthorizingVaultTests(ScopeTestCase):
         self.assertEqual(query_library(cached, self.config, BOB, query="个人原件")["result_count"], 0)
 
 
+class ReportTimeSourceTests(ScopeTestCase):
+    """The authorizing namespace is fixed when the report is made."""
+
+    CONTENT = "个人来源原件正文。"
+
+    def _count(self, index, actor, query):
+        return query_library(index, self.config, actor, query=query)["result_count"]
+
+    def test_personal_original_withdrawal_not_masked_by_later_shared_copy(self):
+        document_id, sha, content = self._personal_document(ALICE, self.CONTENT, "个人来源原件")
+        self._personal(ALICE, "个人来源研究", document_ids=[document_id])
+        shared_copy = import_document(self.config, self.root, content=content, title="后来的共享副本")
+        self.assertEqual(shared_copy[1], sha)
+        cached = build_library_index(self.store)
+        entry = cached["entries"][0]
+        self.assertEqual(entry["evidence_sources"], {sha: "unrecorded"},
+                         "no delivery record names the source: resolved from the task's namespace")
+        self.assertEqual(self._count(cached, ALICE, "个人来源"), 1)
+        self._withdraw(content, personal_vault_view(self.config, ALICE))
+        self.assertNotIn(sha, verified_evidence_documents(personal_vault_view(self.config, ALICE)),
+                         "the personal original left the owner's deliverable projection")
+        self.assertIn(sha, verified_evidence_documents(self.config), "the shared copy is still usable")
+        self.assertEqual(self._count(cached, ALICE, "个人来源"), 0,
+                         "the report cites the personal original; the later shared copy cannot stand in")
+        self.assertEqual(self._count(build_library_index(self.store), ALICE, "个人来源"), 0)
+
+    def test_recorded_source_decides_in_both_directions(self):
+        sha_live = "a" * 64
+        sha_gone = "b" * 64
+        index = {"schema_version": LIBRARY_SCHEMA, "entry_count": 2, "entries": [
+            {"task_id": "task-shared", "status": "succeeded", "question": "共享来源研究", "summary": "",
+             "key_findings": [], "symbols": [], "completed_at": "2026-11-24T10:00:00+08:00",
+             "namespace": "default", "owner": None, "evidence_shas": [sha_gone],
+             "evidence_sources": {sha_gone: "shared"}, "live_evidence_shas": [], "stale_reason": "x"},
+            {"task_id": "task-personal", "status": "succeeded", "question": "个人来源研究", "summary": "",
+             "key_findings": [], "symbols": [], "completed_at": "2026-11-24T10:00:01+08:00",
+             "namespace": "personal", "owner": BOB, "evidence_shas": [sha_live],
+             "evidence_sources": {sha_live: "personal"}, "live_evidence_shas": [], "stale_reason": "x"},
+        ]}
+        # Each vault holds a copy of the OTHER report's bytes but not of its
+        # own original (withdrawn). Judged by current holdings both reports
+        # would look live; the recorded source makes both stale.
+        self._roster([{"actor_id": BOB, "principal_type": "human", "active": True,
+                       "roles": ["quality_reviewer"], "information_side": "public"}])
+        from unittest.mock import patch as _patch
+
+        import stock_agent.research_library as library
+
+        def verified(view):
+            events_path = str((view.get("official_evidence_vault") or {}).get("events_path") or "")
+            return {sha_gone: {}} if events_path.startswith(str(self.root / "personal_evidence")) \
+                else {sha_live: {}}
+
+        with _patch.object(library, "verified_evidence_documents", verified):
+            result = query_library(index, self.config, BOB, include_stale=True)
+            default = query_library(index, self.config, BOB)
+        by_id = {r["task_id"]: r for r in result["results"]}
+        self.assertEqual(by_id["task-shared"]["stale_reason"], "evidence_revoked")
+        self.assertEqual(by_id["task-personal"]["stale_reason"], "evidence_revoked")
+        self.assertEqual([r["live_evidence_shas"] for r in result["results"]], [[], []])
+        self.assertEqual(default["result_count"], 0)
+
+    def test_historical_record_without_source_fails_closed(self):
+        sha = "c" * 64
+        index = {"schema_version": LIBRARY_SCHEMA, "entry_count": 1, "entries": [
+            {"task_id": "task-old", "status": "succeeded", "question": "旧记录研究", "summary": "",
+             "key_findings": [], "symbols": [], "completed_at": "2026-11-24T10:00:00+08:00",
+             "namespace": "default", "owner": None, "evidence_shas": [sha],
+             "evidence_sources": {sha: "unrecorded"}}]}
+        self.assertEqual(query_library(index, self.config, ALICE, query="旧记录")["result_count"], 0)
+        stale = query_library(index, self.config, ALICE, query="旧记录", include_stale=True)
+        self.assertEqual(stale["audit_granted"], False)
+        annotated = annotate_revocation(index, self.config)
+        self.assertEqual(annotated["entries"][0]["stale_reason"], "evidence_revoked")
+
+
+class OrderingTests(unittest.TestCase):
+    """Entries order by the real completion instant, not by the text."""
+
+    @staticmethod
+    def _store(rows):
+        class Store:
+            input_owner_binding = staticmethod(lambda task_id: None)
+
+            @staticmethod
+            def list_tasks():
+                return [{"task_id": task_id, "status": "succeeded", "updated_at": updated,
+                         "input_payload": {"research_question": task_id, "symbols": []}, "output": {}}
+                        for task_id, updated in rows]
+
+        return Store()
+
+    def test_instant_order_with_task_id_tiebreak(self):
+        early = build_library_index(self._store([("task-late", "2026-11-24T02:00:00+00:00"),
+                                                 ("task-early", "2026-11-24T15:00:00+14:00")]))
+        self.assertLess("2026-11-24T02:00:00+00:00", "2026-11-24T15:00:00+14:00")  # text says otherwise
+        self.assertEqual([e["task_id"] for e in early["entries"]], ["task-early", "task-late"])
+        same = build_library_index(self._store([("task-b", "2026-11-24T02:00:00Z"),
+                                                ("task-a", "2026-11-24T10:00:00+08:00"),
+                                                ("task-c", "2026-11-24T02:00:00+00:00")]))
+        self.assertEqual([e["task_id"] for e in same["entries"]], ["task-a", "task-b", "task-c"])
+        unparsable = build_library_index(self._store([("task-x", ""), ("task-y", "2026-11-24T02:00:00Z")]))
+        self.assertEqual([e["task_id"] for e in unparsable["entries"]], ["task-y", "task-x"])
+
+    def test_query_results_keep_index_order(self):
+        class Store:
+            input_owner_binding = staticmethod(lambda task_id: None)
+
+            @staticmethod
+            def list_tasks():
+                return [{"task_id": task_id, "status": "succeeded", "updated_at": updated,
+                         "input_payload": {"research_question": task_id, "symbols": []}, "output": {}}
+                        for task_id, updated in (("task-late", "2026-11-24T02:00:00+00:00"),
+                                                 ("task-early", "2026-11-24T15:00:00+14:00"))]
+
+        config = {"official_evidence_vault": {"enabled": False}, "storage": {}}
+        with project_path_override(lambda value: Path(value)):
+            result = query_library(build_library_index(Store()), config, "anyone")
+        self.assertEqual([r["task_id"] for r in result["results"]], ["task-early", "task-late"])
+
+
 class TimeWindowTests(ScopeTestCase):
     def setUp(self):
         super().setUp()
@@ -675,6 +796,15 @@ class StandardStartTests(ScopeTestCase):
             server, "GET", "/api/v1/library?since=2026-11-24T17:08:52", cookie=alice_cookie)[1]["error"],
             "invalid_time_window")
         self.assertEqual(self._call(server, "GET", "/api/v1/library?actor=" + BOB, cookie=alice_cookie)[0], 403)
+        # The response names the bounds that were actually applied.
+        day = shared["updated_at"][:10]
+        status, body, _ = self._call(
+            server, "GET",
+            "/api/v1/library?since={0}T00:00:00%2B08:00&until={0}".format(day), cookie=alice_cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual((body["filters"]["since"], body["filters"]["until"]),
+                         ("{0}T00:00:00+08:00".format(day), day))
+        self.assertEqual(body["result_count"], 3)  # shared, Alice's own, Alice's rerun
 
     def test_sessions_explicitly_disabled_fails_closed(self):
         server = self._serve(sessions_enabled=False)

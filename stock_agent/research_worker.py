@@ -223,12 +223,18 @@ def build_safe_research_context(payload: Dict[str, Any], config: Optional[Dict[s
     # personal retention for the same content.
     retained_documents: Dict[str, Dict[str, Any]] = {}
     view_by_document: Dict[str, Dict[str, Any]] = {}
-    for view in (evidence_views if evidence_views is not None else [config or {}]):
+    namespace_by_document: Dict[str, str] = {}
+    for position, view in enumerate(evidence_views if evidence_views is not None else [config or {}]):
         for sha, document in verified_evidence_documents(view).items():
             if sha in retained_documents:
                 continue
             retained_documents[sha] = document
-            view_by_document[str(document.get("document_id") or "")] = view
+            document_id = str(document.get("document_id") or "")
+            view_by_document[document_id] = view
+            # R20: the namespace that AUTHORIZED this document at delivery
+            # time is part of the report's record — a later copy of the same
+            # bytes in another vault never rewrites which one the report cites.
+            namespace_by_document[document_id] = "personal" if position else "shared"
     safe_quotes: Dict[str, Any] = {}
     dropped_quotes: list = []
     for symbol, snapshot in quotes.items():
@@ -327,6 +333,8 @@ def build_safe_research_context(payload: Dict[str, Any], config: Optional[Dict[s
         "delivered_quotes": sorted(safe_quotes.keys()),
         "dropped_quotes": sorted(dropped_quotes),
         "delivered_evidence": sorted(safe_evidence.keys()),
+        "evidence_namespaces": {ref: namespace_by_document.get(ref, "unrecorded")
+                                for ref in sorted(safe_evidence.keys())},
         "dropped_evidence": sorted(dropped_evidence),
         "outbound_sha256": hashlib.sha256(
             json.dumps(safe_context, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")

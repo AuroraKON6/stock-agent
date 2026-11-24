@@ -46,7 +46,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .evidence_context import verified_evidence_documents
 from .evidence_vault import load_evidence_vault
-from .personal_evidence import PERSONAL_ORIGIN_VIA, task_evidence_views
+from .personal_evidence import PERSONAL_ORIGIN_VIA, personal_vault_view
 from .task_runtime.store import TERMINAL_STATUSES
 
 LIBRARY_SCHEMA = "1.1"
@@ -142,6 +142,15 @@ def build_library_index(store: Any, config: Optional[Dict[str, Any]] = None) -> 
             if sha:
                 evidence_shas.append(sha)
         owner = _owner_binding(store, str(task.get("task_id") or ""))
+        # Where each bound original was AUTHORIZED when the report was made:
+        # the worker's delivery record names the namespace per document. A
+        # SHA the record does not name keeps ``unrecorded`` and is resolved
+        # at check time from the task's own namespace (see annotate_revocation).
+        recorded = ((task.get("model_call") or {}).get("context_delivery") or {}).get("evidence_namespaces") or {}
+        sources = {}
+        for sha in sorted(set(evidence_shas)):
+            source = recorded.get("document:sha256:{0}".format(sha))
+            sources[sha] = source if source in ("shared", "personal") else "unrecorded"
         entries.append({
             "task_id": str(task.get("task_id") or ""),
             "status": str(task.get("status")),
@@ -154,11 +163,12 @@ def build_library_index(store: Any, config: Optional[Dict[str, Any]] = None) -> 
             "prior_task_id": str(origin.get("prior_task_id") or "") or None,
             "research_occasion": str(origin.get("research_occasion") or ""),
             "evidence_shas": sorted(set(evidence_shas)),
+            "evidence_sources": sources,
             "namespace": NAMESPACE_PERSONAL if owner else NAMESPACE_SHARED,
             "owner": owner or None,
             **report_identity(output, str(task.get("task_id") or ""), task.get("input_version")),
         })
-    entries.sort(key=lambda e: (e["completed_at"], e["task_id"]))
+    entries.sort(key=_sort_key)
     return {"schema_version": LIBRARY_SCHEMA, "entry_count": len(entries),
             "entries": entries}
 
@@ -176,24 +186,18 @@ def verified_shas(views: Iterable[Dict[str, Any]]) -> set:
     return live
 
 
-def _source_state(views: List[Dict[str, Any]]) -> Dict[str, bool]:
-    """Per SHA: whether the vault that AUTHORIZES it still verifies it.
-
-    A document's authorizing vault is the FIRST view (trusted order: shared
-    vault, then the caller's personal namespace) that holds those bytes at
-    all, in any status — the same shadowing rule the worker applies when it
-    delivers evidence (admission outranks personal retention for identical
-    content). Revocation is judged there and only there: a copy of the same
-    bytes surviving in a later namespace cannot keep a report alive once its
-    authorizing vault withdrew the original, and the reverse holds too. A
-    SHA no view holds is not verified."""
-    authorizing: Dict[str, int] = {}
-    for position, view in enumerate(views):
-        for document in (load_evidence_vault(view or {}).get("documents") or {}).values():
-            if isinstance(document, dict) and document.get("sha256"):
-                authorizing.setdefault(str(document["sha256"]), position)
-    live_by_view = [set(verified_evidence_documents(view or {}).keys()) for view in views]
-    return {sha: sha in live_by_view[position] for sha, position in authorizing.items()}
+def _sort_key(entry: Dict[str, Any]):
+    """Order by the real completion instant; a completion without a parsable
+    offset-bearing timestamp sorts after those that have one, by its raw
+    text. ``task_id`` keeps same-moment entries in a stable order."""
+    raw = str(entry.get("completed_at") or "")
+    try:
+        completed = datetime.fromisoformat(raw)
+        if completed.utcoffset() is None:
+            raise ValueError
+        return (0, completed.timestamp(), str(entry.get("task_id") or ""))
+    except ValueError:
+        return (1, raw, str(entry.get("task_id") or ""))
 
 
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -253,27 +257,50 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
                         actor: str = "") -> Dict[str, Any]:
     """Re-check every entry's evidence against the CURRENT authorized views.
 
-    Without ``actor`` only the shared (base) vault is checked — the legacy
-    single-view behavior. With ``actor`` the caller's own personal namespace
-    is checked as well, so personal originals are judged live in the
-    namespace that owns them instead of being misreported as revoked.
+    Each original is judged in the namespace that authorized it WHEN THE
+    REPORT WAS MADE — ``evidence_sources`` from the worker's delivery record
+    — never by which vault holds the same bytes at query time:
+    ``shared`` is checked in the shared vault, ``personal`` in the report
+    OWNER's personal namespace. A later copy of the same bytes in another
+    vault therefore cannot keep a withdrawn original answering, in either
+    direction.
 
-    Each SHA is judged in the vault that authorizes it (first view holding
-    those bytes — shared before personal), so a surviving copy in another
-    namespace cannot mask a revocation. An entry whose evidence fully left
-    the projection is ``evidence_revoked``;
-    one that lost part of it is ``evidence_partially_revoked`` with the
-    surviving shas in ``live_evidence_shas``. BOTH are stale and excluded
-    by default: the summary may rest on the revoked original. An explicit
-    ``include_stale`` (audit) still shows them, labelled."""
-    # The authorizing vault is resolved per SHA over the caller's authorized
-    # views, so an entry is judged against the namespace its evidence came
-    # from even when the same bytes also sit in another one.
-    live_by_sha = _source_state(task_evidence_views(config, actor))
+    Historical records that do not name a source (``unrecorded``) are
+    resolved from the task's own namespace — a personal research in its
+    owner's namespace, anything else in the shared vault — and fail closed:
+    an original that namespace does not verify is treated as withdrawn.
+
+    An entry whose evidence fully left its authorizing projection is
+    ``evidence_revoked``; one that lost part of it is
+    ``evidence_partially_revoked`` with the surviving shas in
+    ``live_evidence_shas``. BOTH are stale and excluded by default: the
+    summary may rest on the revoked original. An explicit ``include_stale``
+    (audit) still shows them, labelled."""
+    live_cache: Dict[str, set] = {}
+
+    def live_in(owner: str) -> set:
+        if owner not in live_cache:
+            try:
+                view = config if not owner else personal_vault_view(config, owner)
+            except Exception:  # no resolvable namespace: nothing is verified there
+                view = None
+            live_cache[owner] = set(verified_evidence_documents(view or {}).keys())
+        return live_cache[owner]
+
     checked = []
     for entry in index.get("entries", []):
         shas = entry.get("evidence_shas") or []
-        live = [sha for sha in shas if live_by_sha.get(sha, False)]
+        fallback = NAMESPACE_PERSONAL if entry.get("namespace") == NAMESPACE_PERSONAL else NAMESPACE_SHARED
+        sources = entry.get("evidence_sources") or {}
+        owner = str(entry.get("owner") or "") if fallback == NAMESPACE_PERSONAL else ""
+
+        def verified(sha, _owner=owner, _fallback=fallback, _sources=sources):
+            source = _sources.get(sha)
+            if source not in ("shared", "personal"):
+                source = _fallback
+            return sha in live_in(_owner if source == "personal" else "")
+
+        live = [sha for sha in shas if verified(sha)]
         entry = dict(entry)
         entry["live_evidence_shas"] = live
         if shas and not live:
@@ -337,7 +364,7 @@ def query_library(index: Dict[str, Any], config: Dict[str, Any], actor: str, *,
     scoped = [entry for entry in checked["entries"] if _authorized(entry, actor)]
     audit = bool(include_stale) and can_audit(config, actor)
     result = search_library({**checked, "entries": scoped}, query,
-                            symbols=symbols, task_id=task_id,
+                            symbols=symbols, task_id=task_id, since=since, until=until,
                             since_at=since_at, until_at=until_at, status=status,
                             include_stale=audit)
     if timeline_of:
