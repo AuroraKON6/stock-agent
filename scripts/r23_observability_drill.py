@@ -1126,11 +1126,13 @@ def boundary_checks(root: Path) -> dict:
     check("boundary.query.unknown_outcome_alerts", ({"outcome_unknown": 1}, ["outcome_unknown"], 1, "ledger"),
           audit_case("query_unknown", "outcome_unknown"))
     check("boundary.query.supply_status_controlled", "unrecognized_supply_status",
-          obs.query_supply_status("token_zcodefixture20261125"))
+          obs.query_supply_status("token_" + KEY_LIKE_LABEL[3:].lower()))
     raw_key = "sha256:" + BODY_AS_ID
     check("boundary.key.digest_prefix_not_trusted", obs.correlation(raw_key),
           obs.project_key(raw_key))
-    check("boundary.key.internal_provider_map_kept", raw_key, obs.project_key(raw_key, "by_provider"))
+    # Compared as a boolean: the evidence output must not echo the fixture.
+    check("boundary.key.internal_provider_map_kept", True,
+          obs.project_key(raw_key, "by_provider") == raw_key)
 
     # 7. A read-only DIRECTORY (not root): the read still works and writes nothing.
     directory = base / "readonly"
