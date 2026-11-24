@@ -1020,6 +1020,11 @@ def main() -> None:
     ops_view_parser = subparsers.add_parser(
         "ops-view", help="运行视图（引擎/预算/近期失败/来源登记/投影新鲜度，只读离线）")
     ops_view_parser.add_argument("--config", default="config/watchlist.local.json")
+    observability_parser = subparsers.add_parser(
+        "observability",
+        help="R23 分层观测（技术/业务、账本对账、metrics、告警候选、单任务 trace；只读开库，零副作用）")
+    observability_parser.add_argument("--config", default="config/watchlist.local.json")
+    observability_parser.add_argument("--task-id", default="", help="附带给定任务的 trace 关联链")
 
     summary_parser = subparsers.add_parser("task-summary", help="Local version-bound summary review; never publication approval")
     summary_parser.add_argument("--config", default="config/watchlist.local.json")
@@ -1513,6 +1518,8 @@ def main() -> None:
         _todo_view(args.config)
     elif args.command == "ops-view":
         _ops_view(args.config)
+    elif args.command == "observability":
+        _observability_report(args.config, args.task_id)
     elif args.command == "task-list":
         _task_list(args.config, args.status, args.json)
     elif args.command == "task-run-next":
@@ -1873,6 +1880,25 @@ def _ops_view(config_path: str) -> None:
     finally:
         if store is not None:
             store.close()
+    print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
+
+
+def _observability_report(config_path: str, task_id: str) -> None:
+    """R23: opens the task store READ-ONLY (no schema migration, no file
+    creation) and prints the layered report; alert candidates are never sent."""
+    from .observability import build_observability_report
+    from .task_runtime import TaskStore
+
+    config = load_config(config_path)
+    db_path = project_path(str((config.get("task_runtime") or {}).get("db_path")
+                               or "data/task_runtime/tasks.sqlite3"))
+    if not db_path.is_file():
+        raise SystemExit("任务库不存在：{0}（观测入口不创建库）".format(db_path))
+    store = TaskStore(db_path, read_only=True)
+    try:
+        payload = build_observability_report(store, config=config, task_id=str(task_id or ""))
+    finally:
+        store.close()
     print(json.dumps(payload, ensure_ascii=False, default=str, indent=2))
 
 

@@ -1,0 +1,43 @@
+# R23 observability drill (KONM-96) — temporary, isolated Compose project. NOT
+# a deployment: one frozen SYNTHETIC case on a temp volume, the network is
+# internal (no egress path at all), no host port is published, and no real
+# supplier / outbound connector / production alert receiver is reachable.
+#
+# The image supplies the locked dependencies only; the CANDIDATE application
+# code under test is bind-mounted read-only from the checkout, so the drill
+# always exercises the exact commit being verified (build it first with
+# scripts/build_image.sh and point R23_IMAGE at it when the dependencies change).
+name: r23-observability-konm96
+
+x-drill-base: &drill-base
+  image: ${R23_IMAGE:-r25-precheck-74f4813:latest}
+  user: root
+  working_dir: /app
+  environment: &drill-env
+    PYTHONDONTWRITEBYTECODE: "1"
+    PYTHONUNBUFFERED: "1"
+    APP_CONFIG_ROOT: /app/data/config
+    APP_STATE_ROOT: /app/data
+    APP_EVIDENCE_ROOT: /app/data/evidence_vault
+    APP_REPORT_ROOT: /app/data/reports
+    APP_TEMP_ROOT: /tmp/stock-agent
+  volumes: &drill-volumes
+    - r23-data:/app/data
+    - ../../stock_agent:/app/stock_agent:ro
+    - ../../scripts/r23_observability_drill.py:/drills/r23_observability_drill.py:ro
+
+services:
+  drill:
+    <<: *drill-base
+    command: python -B /drills/r23_observability_drill.py seed
+
+  serve:
+    <<: *drill-base
+    command: python -B /drills/r23_observability_drill.py serve
+
+networks:
+  default:
+    internal: true  # structural no-egress guarantee: no provider can be reached
+
+volumes:
+  r23-data:

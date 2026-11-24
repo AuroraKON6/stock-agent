@@ -28,6 +28,12 @@ _PROJECTION_PATHS = (
 )
 
 
+def _redact_error(value: Any) -> str:
+    from .observability import redact
+
+    return redact(value)
+
+
 def _age_minutes(stamp: str, now: Optional[datetime] = None) -> Optional[int]:
     try:
         parsed = datetime.fromisoformat(str(stamp or ""))
@@ -109,7 +115,8 @@ def build_ops_view(config: Dict[str, Any], *, store: Optional[Any] = None,
                 "task_id": str(task.get("task_id") or ""),
                 "title": str(task.get("title") or ""),
                 "status": str(task.get("status") or ""),
-                "error": str(task.get("last_error") or "")[:200],
+                # R23: error text can echo a rejected header or key; mask it.
+                "error": _redact_error(task.get("last_error")),
                 "updated_at": str(task.get("updated_at") or ""),
             }
             for task in terminal[:MAX_RECENT_FAILURES]
