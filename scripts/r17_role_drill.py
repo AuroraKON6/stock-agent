@@ -792,6 +792,107 @@ def exercise(directory: Path, config, redactor, report, runs):
                  http_nodes=sum(len(run["calls"]) for run in runs),
                  sse_http_nodes=sum(len(run["sse_calls"]) for run in runs))
 
+    # ---- R22: personal review, rule candidates, bounded graph (live store) --
+    identity = {"credential_id": "r22-review", "actor_id": "r22-reviewer",
+                "scopes": ["read_research"], "case_scope": list(CASES) + ["r22-graph"]}
+    review_payload = drill(directory, "review", {
+        "identity": identity, "task_ids": [root["task_id"]],
+        "denied": [
+            {"name": "foreign_case", "task_ids": [root["task_id"]],
+             "identity": {**identity, "case_scope": ["r22-nowhere"]}},
+            {"name": "no_read_scope", "task_ids": [root["task_id"]],
+             "identity": {**identity, "scopes": ["create_research"]}},
+        ]})
+    save_run("r22-review", review_payload)
+    projection = review_payload["projection"]
+    reviewed = {row["task_id"]: row for row in projection["tasks"]}
+    root_row = reviewed.get(root["task_id"]) or {}
+    step_rows = [reviewed.get(task["task_id"]) or {} for task in steps]
+    report.check("R22 review projects the live three-role run: relations, versions, rule digest, citations, metering",
+                 len(projection["tasks"]) == 4
+                 and sorted(root_row.get("relations", {}).get("children") or [])
+                 == sorted(steps_by_role[role]["task_id"] for role in ROLES)
+                 and root_row.get("input", {}).get("rule", {}).get("flow_sha256") == config["flow_sha256"]
+                 and [item["input_version"] for item in root_row.get("input", {}).get("snapshots") or []]
+                 == [1, 2]
+                 and all(row.get("input", {}).get("step_prompt_sha256")
+                         == registered[row["role_id"]]["sha256"] for row in step_rows)
+                 and all(row.get("sources", {}).get("citations_outside_allowlist") == []
+                         for row in projection["tasks"])
+                 and all(row.get("metering", {}).get("attempts") == 1 for row in step_rows),
+                 root={key: root_row.get(key) for key in ("input", "metering", "relations")},
+                 steps=[{key: row.get(key) for key in ("role_id", "status", "metering")} for row in step_rows])
+    report.check("R22 attribution keeps model roles, evidence and human sign-off apart",
+                 len(projection["attribution"]["model_roles"]) == 3
+                 and projection["attribution"]["human_signoffs"] == []
+                 and projection["attribution"]["independent_evidence_count"]
+                 == len({ref for row in projection["tasks"]
+                         for ref in row["sources"]["citations"]})
+                 and projection["attribution"]["rules"]["model_roles_are_not_human"] is True,
+                 attribution=projection["attribution"])
+    report.check("R22 review refuses a foreign case and a credential without read scope",
+                 [item["reason"] for item in review_payload["denied"]]
+                 == ["case_out_of_scope", "scope_not_granted"], denied=review_payload["denied"])
+    report.check("R22 the review projection wrote nothing to the live store",
+                 review_payload["read_only"]["tasks_before"] == review_payload["read_only"]["tasks_after"]
+                 and review_payload["read_only"]["events_before"] == review_payload["read_only"]["events_after"],
+                 read_only=review_payload["read_only"])
+
+    rule = drill(directory, "r22-rule", {})
+    save_run("r22-rule", rule)
+    report.check("R22 a rule change is only a pending candidate and never alters the approved version",
+                 rule["candidate"]["status"] == "pending_review"
+                 and rule["candidate"]["applies_to_approved"] is False
+                 and rule["approved_version_unchanged"] == rule["approved_digest"]
+                 and rule["candidate"]["digest"] != rule["approved_digest"]
+                 and rule["candidate_not_registered"] == "flow_not_registered"
+                 and rule["approved_still_valid"] is True, rule=rule)
+    report.check("R22 only a human approves a rule candidate (model role refused)",
+                 rule["model_reviewer"] == "reviewer_not_human"
+                 and rule["human_approval"]["status"] == "approved"
+                 and rule["human_approval"]["approved_by"] == "r22-human-reviewer",
+                 rule=rule)
+
+    graph = drill(directory, "r22-graph", {})
+    save_run("r22-graph", graph)
+    refusals = {"scope_widened": "scope_widened", "cross_case": "cross_case",
+                "unknown_role": "role_not_allowed", "self_dependency": "dependency_invalid",
+                "dependency_cycle": "dependency_invalid",
+                "unknown_dependency": "dependency_invalid",
+                "fanout_exceeded": "fanout_exceeded", "depth_exceeded": "depth_exceeded",
+                "budget_exceeded": "budget_exceeded"}
+    report.check("R22 self/cycle/scope/case/depth/fan-out/dependency refusals create zero tasks",
+                 all(graph.get(name, {}).get("status") == "refused"
+                     and graph.get(name, {}).get("tasks_added") == 0
+                     and graph.get(name, {}).get("reason") == reason
+                     for name, reason in refusals.items()),
+                 refusals={name: graph.get(name) for name in refusals})
+    report.check("R22 a legal proposal is created through the reviewed entry with dependency edges",
+                 graph["legal_with_dependency"]["created"] == 3
+                 and all(len(edge["depends_on"]) == (2 if edge["role"] == "synthesis_drafter" else 0)
+                         for edge in graph["legal_with_dependency"]["edges"]),
+                 legal=graph["legal_with_dependency"])
+    report.check("R22 a duplicate batch after the parent budget is spent adds and meters nothing",
+                 graph["duplicate_batch"]["created"] == 0
+                 and graph["duplicate_batch"]["duplicates"] == 3
+                 and graph["duplicate_batch"]["tasks_added"] == 0
+                 and graph["budget_ok"]["created"] == 1
+                 and graph["budget_exceeded"]["tasks_added"] == 0,
+                 duplicate=graph["duplicate_batch"], budget_exceeded=graph["budget_exceeded"])
+    report.check("R22 parent cancel reaches every non-terminal descendant with its own event",
+                 graph["cancel"]["count"] == 4
+                 and set(graph["cancel"]["statuses"].values()) == {"cancelled"}
+                 and list(graph["cancel"]["cancel_events"].values()) == [1, 1, 1, 1],
+                 cancel=graph["cancel"])
+    report.check("R22 personal review is owner-only and case/scope bound on the live store",
+                 graph["personal_access"]["owner"] == "allowed"
+                 and graph["personal_access"]["foreign_actor"] == "personal_owner_mismatch"
+                 and graph["personal_access"]["anonymous"] == "personal_owner_required"
+                 and graph["personal_access"]["wrong_case"] == "case_out_of_scope"
+                 and graph["personal_access"]["no_read_scope"] == "scope_not_granted"
+                 and graph["read_only"]["tasks_before_review"] == graph["read_only"]["tasks_after_review"],
+                 personal=graph["personal_access"], read_only=graph["read_only"])
+
 
 def run(directory: Path) -> int:
     config = json.loads((directory / "private/console.json").read_text())

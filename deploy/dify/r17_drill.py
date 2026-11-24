@@ -201,7 +201,219 @@ def chain(stdin):
         store.close()
 
 
-COMMANDS = {"http": http, "snapshot": snapshot, "probe-a76": probe_a76, "chain": chain}
+def _r22_payload(question, *, budget_limit=0):
+    payload = {
+        "research_question": question, "data_classification": "public",
+        "symbols": ["600519"], "public_context": {"evidence_summaries": {}},
+        "bound_signal_ids": [], "signal_lookback_hours": 48,
+        "replay_response": {
+            "schema_version": "1.0", "task_id": "placeholder", "summary": "R22 synthetic",
+            "key_findings": [], "unknowns": [], "evidence_refs": [],
+            "human_questions": [], "model_self_assessed_confidence": 0.3},
+    }
+    if budget_limit:
+        payload["budget_limit"] = int(budget_limit)
+    return payload
+
+
+def review(stdin):
+    """Read-only personal review over the LIVE store, plus access denials."""
+    from stock_agent.personal_review import ReviewAccessError, project_review
+
+    store = TaskStore(ROOT / "data" / "tasks.sqlite3", read_only=True)
+    denied = []
+    try:
+        tasks_before = len(store.list_tasks())
+        events_before = len(store.events(limit=10000))
+        projection = project_review(store, identity=stdin["identity"],
+                                    task_ids=stdin.get("task_ids"))
+        for case in stdin.get("denied") or []:
+            try:
+                project_review(store, identity=case["identity"],
+                               task_ids=case["task_ids"])
+                denied.append({"name": case["name"], "reason": "ALLOWED_UNEXPECTEDLY"})
+            except ReviewAccessError as exc:
+                denied.append({"name": case["name"], "reason": exc.reason})
+        return {"projection": projection, "denied": denied,
+                "read_only": {"tasks_before": tasks_before,
+                              "tasks_after": len(store.list_tasks()),
+                              "events_before": events_before,
+                              "events_after": len(store.events(limit=10000))}}
+    finally:
+        store.close()
+
+
+def r22_rule(_stdin):
+    """A rule change is a PENDING candidate; only a human can approve it."""
+    from stock_agent.role_execution import ArtifactFlowRegistry, RoleFlowError
+    from stock_agent.rule_candidates import RuleCandidateBook, RuleCandidateError
+
+    registry = ArtifactFlowRegistry.from_directory("/srv/r17/flows")
+    approved = []
+    for flow in registry.all_flows():
+        try:
+            registry.validate(flow)
+        except RoleFlowError:
+            continue
+        approved.append(flow)
+    if not approved:
+        probe_error = {"probe_error": "RuntimeError", "detail": "no approved flow artifact"}
+        return probe_error
+    base = approved[0]
+    role = sorted(base["prompts"])[-1]
+    book = RuleCandidateBook()
+    candidate = book.propose(
+        base, changes={"prompts": {role: {
+            "version": int(base["prompts"][role]["version"]) + 1,
+            "text": str(base["prompts"][role]["text"]) + "\n# R22 待审候选"}},
+            "note": "R22 drill"}, actor="r22-drill")
+    result = {"flow_id": base["flow_id"], "approved_digest": base["flow_sha256"],
+              "candidate": {"id": candidate["candidate_id"], "status": candidate["status"],
+                            "digest": candidate["candidate"]["flow_sha256"],
+                            "applies_to_approved": candidate["applies_to_approved"]},
+              "approved_version_unchanged": candidate["approved_version_unchanged"]}
+    try:
+        registry.validate(book.candidate_flow(candidate["candidate_id"]))
+        result["candidate_not_registered"] = "ALLOWED_UNEXPECTEDLY"
+    except RoleFlowError as exc:
+        result["candidate_not_registered"] = str(exc).split(":")[0]
+    registry.validate(base)
+    result["approved_still_valid"] = True
+    try:
+        book.approve(candidate["candidate_id"], registry=registry, reviewer="event_analyst")
+        result["model_reviewer"] = "ALLOWED_UNEXPECTEDLY"
+    except RuleCandidateError as exc:
+        result["model_reviewer"] = str(exc).split(":")[0]
+    approved_candidate = book.approve(candidate["candidate_id"], registry=registry,
+                                      reviewer="r22-human-reviewer")
+    registry.validate(book.candidate_flow(candidate["candidate_id"]))
+    registry.validate(base)
+    result["human_approval"] = {"status": approved_candidate["status"],
+                                "approved_by": approved_candidate["approved_by"],
+                                "approved_still_valid": True}
+    return result
+
+
+def r22_graph(_stdin):
+    """R22 graph scenarios on the live store (own case only), zero-creation checks."""
+    from stock_agent.personal_review import ReviewAccessError, project_review
+    from stock_agent.subtask_graph import SubtaskGraphError, cancel_subtree, propose_subtasks
+
+    store = TaskStore(ROOT / "data" / "tasks.sqlite3")
+    outcome = {}
+    try:
+        parent, _ = store.create_task(
+            title="R22 graph parent", input_payload=_r22_payload("R22 合成事件：回购与终止在建项目"),
+            case_id="r22-graph", execution_mode="replay", actor="r22-drill")
+        parent = store.get_task(parent["task_id"])
+
+        def attempt(name, proposals, node=None, **kwargs):
+            node = node or parent
+            before = len(store.list_tasks())
+            try:
+                batch = propose_subtasks(store, parent_task_id=node["task_id"],
+                                         proposals=proposals, **kwargs)
+                outcome[name] = {
+                    "status": "accepted", "created": len(batch["created"]),
+                    "duplicates": len(batch["duplicates"]),
+                    "edges": [{"role": item["role_id"], "depends_on": item["depends_on"]}
+                              for item in batch["created"]],
+                    "tasks_added": len(store.list_tasks()) - before}
+                return batch
+            except SubtaskGraphError as exc:
+                outcome[name] = {"status": "refused", "reason": str(exc).split(":")[0],
+                                 "detail": str(exc)[:200],
+                                 "tasks_added": len(store.list_tasks()) - before}
+                return None
+
+        attempt("scope_widened", [{"role_id": "event_analyst", "question": "放宽",
+                                   "symbols": ["000001"]}])
+        attempt("cross_case", [{"role_id": "event_analyst", "question": "越案件",
+                                "case_id": "another-case"}])
+        attempt("unknown_role", [{"role_id": "rookie_writer", "question": "x"}])
+        attempt("self_dependency", [{"role_id": "event_analyst", "question": "x",
+                                     "depends_on": ["event_analyst"]}])
+        attempt("dependency_cycle", [
+            {"role_id": "event_analyst", "question": "a", "depends_on": ["counter_evidence"]},
+            {"role_id": "counter_evidence", "question": "b", "depends_on": ["event_analyst"]}])
+        attempt("unknown_dependency", [{"role_id": "event_analyst", "question": "a",
+                                        "depends_on": ["quality_check"]}])
+        legal = attempt("legal_with_dependency", [
+            {"role_id": "synthesis_drafter", "question": "综合",
+             "depends_on": ["event_analyst", "counter_evidence"]},
+            {"role_id": "event_analyst", "question": "分析"},
+            {"role_id": "counter_evidence", "question": "反证"}])
+        attempt("fanout_exceeded", [{"role_id": "quality_check", "question": "查"}])
+        deepest = store.get_task(sorted(legal["created"], key=lambda item: len(item["depends_on"]))[-1]["task_id"]) \
+            if legal else parent
+        attempt("depth_exceeded", [{"role_id": "counter_evidence", "question": "更深"}],
+                node=deepest)
+        attempt("duplicate_batch", [
+            {"role_id": "synthesis_drafter", "question": "综合！",
+             "depends_on": ["event_analyst", "counter_evidence"]},
+            {"role_id": "event_analyst", "question": "分析"},
+            {"role_id": "counter_evidence", "question": "反证"}])
+
+        budget_parent, _ = store.create_task(
+            title="R22 budget parent",
+            input_payload=_r22_payload("R22 预算事件", budget_limit=1),
+            case_id="r22-graph", execution_mode="replay", actor="r22-drill")
+        budget_parent = store.get_task(budget_parent["task_id"])
+        attempt("budget_ok", [{"role_id": "event_analyst", "question": "占用",
+                               "budget_reserve": 1}],
+                node=budget_parent, budget_limit=1)
+        attempt("budget_exceeded", [{"role_id": "counter_evidence", "question": "再要",
+                                     "budget_reserve": 1}],
+                node=budget_parent, budget_limit=1)
+
+        report = cancel_subtree(store, parent["task_id"], actor="r22-drill",
+                                reason="R22 drill cancel")
+        events = {}
+        for entry in report["cancelled"]:
+            events[entry["task_id"]] = [event["event_type"]
+                                        for event in store.events(entry["task_id"])]
+        outcome["cancel"] = {"count": report["count"],
+                             "statuses": {entry["task_id"]: entry["status"]
+                                          for entry in report["cancelled"]},
+                             "cancel_events": {task_id: types.count("task_cancelled")
+                                               for task_id, types in events.items()}}
+
+        owned, _ = store.create_task(
+            title="R22 personal task", input_payload=_r22_payload("个人复盘输入"),
+            case_id="r22-graph", execution_mode="replay", actor="r22-human",
+            input_owner_binding={"owner": "r22-human", "via": "r22_drill"})
+        owner_identity = {"credential_id": "r22-owner", "actor_id": "r22-human",
+                          "scopes": ["read_research"], "case_scope": ["r22-graph"]}
+        project_review(store, identity=owner_identity, task_ids=[owned["task_id"]])
+        outcome["personal_access"] = {"owner": "allowed"}
+        for name, identity in (
+            ("foreign_actor", {"credential_id": "r22-other", "actor_id": "r22-other",
+                               "scopes": ["read_research"], "case_scope": ["r22-graph"]}),
+            ("anonymous", {"credential_id": "r22-anon",
+                           "scopes": ["read_research"], "case_scope": ["r22-graph"]}),
+            ("wrong_case", {"credential_id": "r22-case", "actor_id": "r22-human",
+                            "scopes": ["read_research"], "case_scope": ["r22-elsewhere"]}),
+            ("no_read_scope", {"credential_id": "r22-scope", "actor_id": "r22-human",
+                               "scopes": ["create_research"], "case_scope": ["r22-graph"]}),
+        ):
+            try:
+                project_review(store, identity=identity, task_ids=[owned["task_id"]])
+                outcome["personal_access"][name] = "ALLOWED_UNEXPECTEDLY"
+            except ReviewAccessError as exc:
+                outcome["personal_access"][name] = exc.reason
+
+        tasks_after = len(store.list_tasks())
+        project_review(store, identity=owner_identity, task_ids=[parent["task_id"]])
+        outcome["read_only"] = {"tasks_before_review": tasks_after,
+                                "tasks_after_review": len(store.list_tasks())}
+        outcome["case_tasks"] = tasks_after - 1
+        return outcome
+    finally:
+        store.close()
+
+
+COMMANDS = {"http": http, "snapshot": snapshot, "probe-a76": probe_a76, "chain": chain,
+            "review": review, "r22-rule": r22_rule, "r22-graph": r22_graph}
 
 
 def main():

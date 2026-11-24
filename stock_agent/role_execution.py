@@ -377,14 +377,17 @@ def execute_role_step(store: TaskStore, root_task_id: str, *, role_id: str,
                       flow: Dict[str, Any], registry: FlowRegistry,
                       worker_id: str = "role-orchestrator",
                       config: Optional[Dict[str, Any]] = None,
-                      step_overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                      step_overrides: Optional[Dict[str, Any]] = None,
+                      budget_limit: Optional[int] = None) -> Dict[str, Any]:
     """Run ONE role step of a bound flow — the API Dify calls per step.
 
-    Creates the step as a bounded subtask (R22 caps apply), injects the
-    frozen prompt, executes it through the standard worker boundary, then
-    re-verifies the prompt digest from the persisted payload. Bounded by
-    construction: succeeded steps refuse to re-run, terminally failed steps
-    refuse without a decision, out-of-group roles wait their turn."""
+    Creates the step as a bounded subtask (R22 caps apply: scope, depth,
+    fan-out, budget — each step reserves one attempt against the root's
+    shared ``budget_limit`` when one is set), injects the frozen prompt,
+    executes it through the standard worker boundary, then re-verifies the
+    prompt digest from the persisted payload. Bounded by construction:
+    succeeded steps refuse to re-run, terminally failed steps refuse without
+    a decision, out-of-group roles wait their turn."""
     try:
         root = store.get_task(str(root_task_id))
     except TaskRuntimeError:
@@ -444,8 +447,19 @@ def execute_role_step(store: TaskStore, root_task_id: str, *, role_id: str,
     if requeued:
         subtask_id = str(requeued[0]["task_id"])
     else:
-        proposal = propose_subtasks(store, parent_task_id=str(root_task_id),
-                                    proposals=[{"role_id": role, "question": question}])
+        shared_budget = budget_limit
+        if shared_budget is None:
+            shared_budget = int((root.get("input_payload") or {}).get("budget_limit") or 0)
+        try:
+            proposal = propose_subtasks(
+                store, parent_task_id=str(root_task_id),
+                proposals=[{"role_id": role, "question": question,
+                            "budget_reserve": 1}],
+                budget_limit=int(shared_budget or 0))
+        except SubtaskGraphError as exc:
+            # R22: a step is enqueued ONLY through the reviewed graph. Any
+            # refused proposal leaves zero children and zero metering.
+            raise RoleFlowError("step_rejected: {0}".format(exc)) from exc
         if not proposal.get("created"):
             raise RoleFlowError(
                 "step_failed_needs_decision: step proposal rejected ({0})".format(
