@@ -64,6 +64,12 @@ REPORT_BODY_FIELDS = ("schema_version", "task_id", "summary", "key_findings",
                       "unknowns", "evidence_refs", "human_questions",
                       "model_self_assessed_confidence")
 REPORT_IDENTITY_SCHEME = "rv1"
+# The worker delivers a document title cut to this many characters
+# (research_worker: ``vault_summary[:1000]``). A historical record is
+# matched against ledger titles AFTER the same cut: a copy whose title is
+# the cut prefix of another copy's longer title delivers identically, so
+# both remain candidates.
+DELIVERED_TITLE_LIMIT = 1000
 
 
 class LibraryError(ValueError):
@@ -386,9 +392,10 @@ def annotate_revocation(index: Dict[str, Any], config: Dict[str, Any], *,
                 else:
                     # Both apply, or a ledger cannot be consulted. The title
                     # the worker delivered names the copy only when exactly
-                    # one COMPLETE ledger ever recorded it.
+                    # one COMPLETE ledger could have delivered it.
                     delivered = str(_titles.get(sha) or "")
-                    named = [state for state in holders if delivered and delivered in state["titles"].get(sha, ())]
+                    named = [state for state in holders if delivered and delivered in {
+                        title[:DELIVERED_TITLE_LIMIT] for title in state["titles"].get(sha, ())}]
                     if not unprovable and len(named) == 1:
                         return sha in named[0]["live"], False
                     if not unprovable and len(holders) == len(provable) and not any(

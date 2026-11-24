@@ -534,7 +534,11 @@ class AuthorizingVaultTests(ScopeTestCase):
         self.assertEqual(query_library(cached, self.config, BOB, query="个人原件")["result_count"], 0)
 
 
-class ReportTimeSourceTests(ScopeTestCase):
+class SourceFixtures:
+    """Synthetic reports with a known evidence source (no test cases)."""
+
+    CONTENT = "个人来源原件正文。"
+
     def _delivered_personal_source(self):
         """A personal report whose ORIGINAL the worker actually delivered:
         the shared copy is withdrawn first, the personal copy is linked to
@@ -578,9 +582,47 @@ class ReportTimeSourceTests(ScopeTestCase):
         self._withdraw(self.CONTENT, personal_vault_view(self.config, ALICE))
         self.assertEqual(query_library(cached, self.config, ALICE, query="真实交付")["result_count"], 0)
 
-    """The authorizing namespace is fixed when the report is made."""
+    def _proven_shared_record(self, shared_title="共享库标题甲", personal_title="个人库标题乙"):
+        """Both vaults hold the same bytes under the given titles; the worker
+        delivers the shared copy. Read as a record WITHOUT the namespace
+        field (previous worker)."""
+        from stock_agent.evidence_vault import link_evidence_to_signal
+        from stock_agent.models import AnalyzedSignal, now_iso
+        from stock_agent.storage import SignalStore
 
-    CONTENT = "个人来源原件正文。"
+        signal_id = "sig-title-0001"
+        database = SignalStore(Path(self.config["storage"]["sqlite_path"]))
+        try:
+            database.upsert_many([AnalyzedSignal(
+                signal_id=signal_id, source="manual", source_type="filing", title="来源信号",
+                summary="Synthetic fixture only", url="https://www.cninfo.com.cn/disclosure/fixture",
+                published_at=now_iso(), collected_at=now_iso(), symbols=["600519"],
+                payload={"data_classification": "public"})])
+        finally:
+            database.close()
+        _, sha = import_document(self.config, self.root, content=self.CONTENT, title=shared_title,
+                                 signal_ids=[signal_id])
+        document_id, _, _ = self._personal_document(ALICE, self.CONTENT, personal_title)
+        link_evidence_to_signal(personal_vault_view(self.config, ALICE), document_id=document_id,
+                                signal_id=signal_id, actor="test-evidence-collector",
+                                actor_role="information_analyst")
+        task = self._personal(ALICE, "旧记录来源研究", document_ids=[document_id])
+        self.SHARED_SHA = sha
+        self.PROVEN_TASK_ID = task["task_id"]
+        model_call = dict(task["model_call"])
+        self.assertEqual(model_call["context_delivery"]["evidence_namespaces"],
+                         {"document:sha256:{0}".format(sha): "shared"})
+        model_call["context_delivery"] = {k: v for k, v in model_call["context_delivery"].items()
+                                          if k != "evidence_namespaces"}
+        self.store._conn.execute("UPDATE research_tasks SET model_call = ? WHERE task_id = ?",
+                                 (json.dumps(model_call, ensure_ascii=False), task["task_id"]))
+        self.store._conn.commit()
+        return task["task_id"]
+
+
+
+class ReportTimeSourceTests(ScopeTestCase, SourceFixtures):
+    """The authorizing namespace is fixed when the report is made."""
 
     def _count(self, index, actor, query):
         return query_library(index, self.config, actor, query=query)["result_count"]
@@ -679,42 +721,6 @@ class ReportTimeSourceTests(ScopeTestCase):
         self.assertEqual(query_library(build_library_index(self.store), self.config, BOB,
                                        query="仅个人")["result_count"], 1)
 
-    def _proven_shared_record(self):
-        """Both vaults hold the same bytes under different titles; the worker
-        delivers the shared copy. Read as a record WITHOUT the namespace
-        field (previous worker): the delivered title still names the copy."""
-        from stock_agent.evidence_vault import link_evidence_to_signal
-        from stock_agent.models import AnalyzedSignal, now_iso
-        from stock_agent.storage import SignalStore
-
-        signal_id = "sig-title-0001"
-        database = SignalStore(Path(self.config["storage"]["sqlite_path"]))
-        try:
-            database.upsert_many([AnalyzedSignal(
-                signal_id=signal_id, source="manual", source_type="filing", title="来源信号",
-                summary="Synthetic fixture only", url="https://www.cninfo.com.cn/disclosure/fixture",
-                published_at=now_iso(), collected_at=now_iso(), symbols=["600519"],
-                payload={"data_classification": "public"})])
-        finally:
-            database.close()
-        _, sha = import_document(self.config, self.root, content=self.CONTENT, title="共享库标题甲",
-                                 signal_ids=[signal_id])
-        document_id, _, _ = self._personal_document(ALICE, self.CONTENT, "个人库标题乙")
-        link_evidence_to_signal(personal_vault_view(self.config, ALICE), document_id=document_id,
-                                signal_id=signal_id, actor="test-evidence-collector",
-                                actor_role="information_analyst")
-        task = self._personal(ALICE, "旧记录来源研究", document_ids=[document_id])
-        self.SHARED_SHA = sha
-        model_call = dict(task["model_call"])
-        self.assertEqual(model_call["context_delivery"]["evidence_namespaces"],
-                         {"document:sha256:{0}".format(sha): "shared"})
-        model_call["context_delivery"] = {k: v for k, v in model_call["context_delivery"].items()
-                                          if k != "evidence_namespaces"}
-        self.store._conn.execute("UPDATE research_tasks SET model_call = ? WHERE task_id = ?",
-                                 (json.dumps(model_call, ensure_ascii=False), task["task_id"]))
-        self.store._conn.commit()
-        return task["task_id"]
-
     def test_old_record_source_recovered_from_the_delivered_title(self):
         self._proven_shared_record()
         sha = self.SHARED_SHA
@@ -730,6 +736,28 @@ class ReportTimeSourceTests(ScopeTestCase):
         self.assertEqual([r["stale_reason"] for r in audit["results"]], ["evidence_revoked"],
                          "the delivered title names the shared copy: its withdrawal decides")
         self.assertEqual(query_library(cached, self.config, ALICE, query="旧记录来源")["result_count"], 0)
+
+    def test_truncated_delivered_title_does_not_name_a_copy(self):
+        """The shared original's title is 1001 characters and the personal
+        copy's title is its first 1000. The worker delivers titles cut to
+        1000 characters, so the delivered title fits both copies."""
+        limit = 1000
+        self._proven_shared_record(shared_title="甲" * (limit + 1), personal_title="甲" * limit)
+        task = self.store.get_task(self.PROVEN_TASK_ID)
+        delivered = task["model_call"]["outbound_context"]["evidence_summaries"]
+        self.assertEqual(len(next(iter(delivered.values()))["summary"]), limit)
+        cached = build_library_index(self.store)
+        entry = [e for e in cached["entries"] if e["question"] == "旧记录来源研究"][0]
+        self.assertEqual(entry["evidence_sources"], {self.SHARED_SHA: "unrecorded"})
+        self._roster([{"actor_id": ALICE, "principal_type": "human", "active": True,
+                       "roles": ["quality_reviewer"], "information_side": "public"}])
+        for step in ("both verify", "shared withdrawn"):
+            if step == "shared withdrawn":
+                self._withdraw(self.CONTENT)
+            result = query_library(cached, self.config, ALICE, query="旧记录来源")
+            audit = query_library(cached, self.config, ALICE, query="旧记录来源", include_stale=True)
+            self.assertEqual(result["result_count"], 0, step)
+            self.assertEqual([r["stale_reason"] for r in audit["results"]], ["source_unverified"], step)
 
     def test_unreadable_ledger_cannot_be_vouched_for_by_another_copy(self):
         """The delivered title proves the shared copy. The shared ledger then
@@ -925,6 +953,100 @@ class TimeWindowTests(ScopeTestCase):
         for name, ((since, until), expected) in mixed_ok.items():
             with self.subTest(window=name):
                 self.assertEqual(self._count(since=since, until=until), expected)
+
+
+class LedgerIntegrityHttpTests(ScopeTestCase, SourceFixtures):
+    """The delivered title proves the shared copy of an old record; the
+    shared ledger then fails integrity while the personal copy verifies."""
+
+    def setUp(self):
+        super().setUp()
+        from stock_agent.identity_providers import PersonalSessionStore
+
+        def authenticator(config, actor, symbols):
+            if actor not in (ALICE, AUDITOR):
+                raise ValueError("unknown principal")
+            return {"actor": actor, "provider": "windows_local", "subject": "S-1-{0}".format(actor),
+                    "policy_sha256": "a" * 64}
+
+        self.server = create_task_board_server(
+            self.store, host="127.0.0.1", port=0, config=self.config,
+            session_store=PersonalSessionStore(ttl_seconds=1800), login_authenticator=authenticator)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+
+    def _login(self, actor):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("POST", "/api/v1/personal/login",
+                         json.dumps({"actor": actor, "symbols": ["600519"]}),
+                         {"Content-Type": "application/json"})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200, response.read())
+            return (response.getheader("Set-Cookie") or "").split(";")[0]
+        finally:
+            conn.close()
+
+    def test_mixed_windows_at_the_offset_edges_over_http(self):
+        first = self._shared("东十四区完成研究")
+        second = self._shared("西十四区完成研究")
+        for task, completed in ((first, "2026-10-01T00:30:00+14:00"), (second, "2026-10-01T23:30:00-14:00")):
+            self.store._conn.execute("UPDATE research_tasks SET updated_at = ? WHERE task_id = ?",
+                                     (completed, task["task_id"]))
+        self.store._conn.commit()
+        cookie = self._login(ALICE)
+        for since, until, wanted in (("2026-10-01", "2026-09-30T11:00:00Z", "东十四区完成研究"),
+                                     ("2026-10-02T13:00:00Z", "2026-10-01", "西十四区完成研究")):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            try:
+                conn.request("GET", "/api/v1/library?since={0}&until={1}".format(since, quote(until)),
+                             None, {"Cookie": cookie})
+                response = conn.getresponse()
+                body = json.loads(response.read().decode("utf-8"))
+            finally:
+                conn.close()
+            self.assertEqual((response.status, body["result_count"],
+                              [r["question"] for r in body["results"]],
+                              (body["filters"]["since"], body["filters"]["until"])),
+                             (200, 1, [wanted], (since, until)))
+
+    def test_default_and_audit_over_http_when_the_shared_ledger_fails(self):
+        self._proven_shared_record()
+        # The report is Alice's own personal research: the audit view lifts
+        # the staleness exclusion for her, but never widens anyone's scope.
+        self._roster([{"actor_id": ALICE, "principal_type": "human", "active": True,
+                       "roles": ["quality_reviewer"], "information_side": "public"}])
+        path = "/api/v1/library?query=" + quote("旧记录来源")
+        alice, outsider = self._login(ALICE), self._login(AUDITOR)   # AUDITOR holds no roster role
+
+        def get(cookie, suffix=""):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            try:
+                conn.request("GET", path + suffix, None, {"Cookie": cookie})
+                response = conn.getresponse()
+                return response.status, json.loads(response.read().decode("utf-8"))
+            finally:
+                conn.close()
+
+        self._withdraw(self.CONTENT)
+        self.assertEqual(get(alice)[1]["result_count"], 0)
+        status, body = get(alice, "&include_stale=1")
+        self.assertEqual((status, body.get("audit_granted"), body.get("error"),
+                          [r["stale_reason"] for r in body.get("results", [])]),
+                         (200, True, None, ["evidence_revoked"]))
+        ledger = Path(self.config["official_evidence_vault"]["events_path"])
+        ledger.write_text(ledger.read_text(encoding="utf-8")
+                          + '{"schema_version":"1.0","event_type":"evidence_captured"}\n', encoding="utf-8")
+        status, body = get(alice)
+        self.assertEqual((status, body["result_count"]), (200, 0))
+        status, body = get(alice, "&include_stale=1")
+        self.assertEqual((status, body["audit_granted"]), (200, True))
+        self.assertEqual([(r["stale_reason"], r.get("unverified_sources")) for r in body["results"]],
+                         [("source_unverified", [self.SHARED_SHA])])
+        status, body = get(outsider, "&include_stale=1")
+        self.assertEqual((status, body["result_count"], body["audit_granted"]), (200, 0, False))
 
 
 class StandardStartTests(ScopeTestCase):
