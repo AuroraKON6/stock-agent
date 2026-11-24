@@ -10,7 +10,7 @@ KONM-78 从 `da26f2889e99f7dfc410b065df67b37d4e4d8137` 续做 R17。交付对象
 python3.12 -B scripts/r17_role_drill.py all ../r17-replay-01 --port 18179
 ```
 
-脚本从目录名计算专用 Compose 项目，用生成的凭据、限定案件范围、临时卷和固定镜像运行。在启动前执行 `config --quiet`、`config --images` 和 `pull --policy missing`，再执行 `up -d --pull never --wait --wait-timeout 300`，等待 Celery 就绪。执行时使用服务 API 调用明确的 Dify 发布版本 ID。收尾执行 `down --volumes --timeout 5`，逐项核对项目标签、回环端口和证据目录。需要保留运行环境进行诊断时，可以在同一个证据目录依次执行 `prepare --port 18179`、`up`、`run`、`down`。
+脚本从目录名计算专用 Compose 项目，用生成的凭据、限定案件范围、临时卷和固定镜像运行。在启动前执行 `config --quiet`、`config --images` 和 `pull --policy missing`，再执行 `up -d --pull never --wait --wait-timeout 300`，等待 Celery 就绪。执行时使用服务 API 调用明确的 Dify 发布版本 ID，并用该 run 的持久化节点记录核对 SSE 和 Squid 计数。收尾执行 `down --volumes --timeout 5`，逐项核对项目标签、回环端口和证据目录。需要保留运行环境进行诊断时，可以在同一个证据目录依次执行 `prepare --port 18179`、`up`、`run`、`down`。
 
 在安装仓库锁定的 PyYAML 依赖后运行定向测试。
 

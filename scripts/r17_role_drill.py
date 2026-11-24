@@ -228,13 +228,32 @@ def import_flow(directory: Path, config):
                               "workflow_version": config["workflow_version"]}
 
 
-def run_flow(console, app_key, published_id, case_id, intent):
-    """One real Dify run of the role canvas. Returns what the SSE stream showed."""
+def http_node(data):
+    outputs = data.get("outputs") or {}
+    headers = {str(key).lower(): value for key, value in (outputs.get("headers") or {}).items()}
+    try:
+        body = json.loads(outputs.get("body") or "{}")
+    except ValueError:
+        body = {}
+    record = (body.get("data") or {}) if body.get("ok") else {}
+    return {
+        "node": data.get("node_id"), "route": ROUTES.get(data.get("node_id")),
+        "status_code": outputs.get("status_code"), "node_status": data.get("status"),
+        "node_error": data.get("error"), "error": body.get("error"),
+        "headers": {key: value for key, value in headers.items() if key.startswith("r1")},
+        "executed": record.get("executed"), "step_status": record.get("step_status"),
+        "outcome": record.get("outcome"), "bind_result": record.get("bind_result"),
+        "already_complete": record.get("already_complete"),
+    }
+
+
+def run_flow(console, app_key, publication, case_id, intent):
+    """Run the pinned Dify workflow and correlate SSE with its stored node executions."""
     inputs = {"title": TITLE, "case_id": case_id, "research_question": QUESTION, "input_version": 1,
               "business_intent_id": intent}
-    calls, nodes, terminal = [], Counter(), {}
+    sse_calls, nodes, terminal = [], Counter(), {}
     started = time.monotonic()
-    request = Request(console.origin + "/v1/workflows/{0}/run".format(published_id), json.dumps(
+    request = Request(console.origin + "/v1/workflows/{0}/run".format(publication["published_id"]), json.dumps(
         {"inputs": inputs, "response_mode": "streaming", "user": "r17-role-drill"}).encode(),
         {"Authorization": "Bearer " + app_key, "Content-Type": "application/json", "Accept": "text/event-stream"})
     with console.opener.open(request, timeout=400) as response:
@@ -250,29 +269,25 @@ def run_flow(console, app_key, published_id, case_id, intent):
             if event.get("event") == "node_finished":
                 nodes[data.get("node_type")] += 1
                 if data.get("node_type") == "http-request":
-                    outputs = data.get("outputs") or {}
-                    headers = {str(k).lower(): v for k, v in (outputs.get("headers") or {}).items()}
-                    try:
-                        body = json.loads(outputs.get("body") or "{}")
-                    except ValueError:
-                        body = {}
-                    record = (body.get("data") or {}) if body.get("ok") else {}
-                    calls.append({"node": data.get("node_id"), "route": ROUTES.get(data.get("node_id")),
-                                  "status_code": outputs.get("status_code"), "node_status": data.get("status"), "node_error": data.get("error"),
-                                  "error": body.get("error"), "headers": {k: v for k, v in headers.items()
-                                                                          if k.startswith("r1")},
-                                  "executed": record.get("executed"), "step_status": record.get("step_status"),
-                                  "outcome": record.get("outcome"), "bind_result": record.get("bind_result"),
-                                  "already_complete": record.get("already_complete")})
+                    sse_calls.append(http_node(data))
             if event.get("event") == "workflow_finished":
                 terminal = data
                 break
+    if not terminal.get("id"):
+        raise RuntimeError("Dify SSE finished without a workflow result")
+    path = "/apps/{0}/workflow-runs/{1}/node-executions".format(publication["app_id"], terminal["id"])
+    entries = sorted(console.read(path)["data"], key=lambda item: item["index"])
+    calls = [http_node(entry) for entry in entries if entry["node_type"] == "http-request"]
+    stored = {call["node"]: call for call in calls}
+    for observed in sse_calls:
+        entry = stored.get(observed["node"])
+        if entry is None or any(observed[key] != entry[key] for key in ("status_code", "executed", "step_status")):
+            raise RuntimeError("Dify SSE disagrees with the stored result for node " + observed["node"])
     outputs = terminal.get("outputs") or {}
-    time.sleep(0.5)  # let the gateway append its ledger lines before the next snapshot
     return {"case_id": case_id, "workflow_status": terminal.get("status"),
-            "workflow_run_id": terminal.get("id"), "published_id": terminal.get("workflow_id"),
-            "error": terminal.get("error"),
-            "nodes": dict(nodes), "calls": calls,
+            "workflow_run_id": terminal["id"], "published_id": terminal.get("workflow_id"),
+            "error": terminal.get("error"), "nodes": dict(nodes), "sse_calls": sse_calls, "calls": calls,
+            "node_execution_count": len(entries),
             "outputs": {key: outputs.get(key) for key in ("status", "task_id", "case_id", "case_path")},
             "elapsed_seconds": round(time.monotonic() - started, 2)}
 
@@ -449,7 +464,7 @@ def exercise(directory: Path, config, redactor, report, runs):
         return snapshot
 
     def flow_run(label, case_id):
-        result = run_flow(console, app_key, publication["published_id"], case_id, "intent-" + case_id)
+        result = run_flow(console, app_key, publication, case_id, "intent-" + case_id)
         result["label"] = label
         runs.append(result)
         save_run("run-" + label, result)
@@ -774,7 +789,8 @@ def exercise(directory: Path, config, redactor, report, runs):
     (directory / "logs-squid-access.txt").write_text(redactor.clean(access.stdout), encoding="utf-8")
     report.check("A76 every canvas call crossed the restricted proxy (one Squid POST per HTTP node executed)",
                  squid_posts == sum(len(run["calls"]) for run in runs), squid_posts=squid_posts,
-                 http_nodes=sum(len(run["calls"]) for run in runs))
+                 http_nodes=sum(len(run["calls"]) for run in runs),
+                 sse_http_nodes=sum(len(run["sse_calls"]) for run in runs))
 
 
 def run(directory: Path) -> int:
