@@ -1,0 +1,509 @@
+"""R20 rework (KONM-75): per-query revocation re-check, caller-scoped
+retrieval and the report version contract.
+
+Three defects came out of the independent verification:
+
+- a saved index kept answering after its evidence was revoked, because the
+  only re-check was an annotation the caller had to remember to redo;
+- nothing bound a query to a principal: one projection covered every task;
+- entries carried no report version, so a case and its continuation could
+  only be told apart by task id.
+
+The normal entry is ``query_library`` (library level) and
+``GET /api/v1/library`` / ``GET /api/v1/library/timeline`` (board, session
+mode). Synthetic data only; every report is a replay; no model call.
+"""
+import http.client
+import json
+import os
+import sys
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import quote
+
+from stock_agent.config import project_path_override
+from stock_agent.identity_providers import PersonalSessionStore
+from stock_agent.personal_evidence import (
+    PERSONAL_ORIGIN_VIA,
+    import_personal_document,
+    personal_vault_view,
+)
+from stock_agent.research_library import (
+    AUDIT_ROLES,
+    LIBRARY_SCHEMA,
+    LibraryError,
+    annotate_revocation,
+    build_library_index,
+    query_library,
+    report_identity,
+    search_library,
+)
+from stock_agent.research_worker import run_research_task
+from stock_agent.task_board import create_task_board_server
+from stock_agent.task_detail import task_detail
+from stock_agent.task_supply import build_task_spec
+from stock_agent.task_runtime import TaskStore
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _vault_fixture import import_document, vault_config
+
+ALICE, BOB, CAROL = "scope-alice", "scope-bob", "scope-carol"
+AUDITOR = "scope-quality-reviewer"
+
+
+def _replay(summary, findings=(), questions=False):
+    return {
+        "schema_version": "1.0", "task_id": "placeholder",
+        "summary": summary, "key_findings": list(findings),
+        "unknowns": [], "evidence_refs": [],
+        "human_questions": ([{"question": "确认？", "why_needed": "w", "options": []}]
+                            if questions else []),
+        "model_self_assessed_confidence": 0.4}
+
+
+class ScopeTestCase(unittest.TestCase):
+    def setUp(self):
+        real = Path(os.path.realpath(tempfile.mkdtemp(prefix="r20-scope.")))
+        self.addCleanup(lambda: __import__("shutil").rmtree(real, ignore_errors=True))
+        self.root = real
+        self.enterContext(project_path_override(lambda value: self.root / value))
+        import stock_agent.config as config_module
+
+        self.enterContext(patch.object(config_module, "PROJECT_ROOT", self.root))
+        self.config = vault_config(self.root, {})
+        self.config["personal_evidence"] = {"root": str(self.root / "personal_evidence")}
+        mdg = self.config.setdefault("market_data_governance", {})
+        mdg["approved_internal_research_providers"] = ["eastmoney"]
+        mdg["use_production_pilot_provider_registry"] = False
+        mdg["require_consensus_for_llm"] = False
+        mdg["allow_degraded_offhours_llm"] = True
+        self.store = TaskStore(self.root / "tasks.sqlite3")
+        self.addCleanup(self.store.close)
+        self.counter = [0]
+
+    # ---- drivers (production entry points only) ------------------------
+
+    def _finish(self, task_id, actor):
+        from stock_agent import personal_workspace as pw
+
+        self.assertEqual(self.store.claim_next("w")["task_id"], task_id)
+        run_research_task(self.store, task_id, worker_id="w", config=self.config)
+        task = self.store.get_task(task_id)
+        if task["status"] == "awaiting_human":
+            self.counter[0] += 1
+            self.store.record_human_response(
+                task_id, actor=actor, decision="acknowledge", expected_version=task["version"],
+                command_id="scope-fin-{0}".format(self.counter[0]))
+            task = self.store.get_task(task_id)
+        return task
+
+    def _shared(self, question, summary="共享研究结论。", evidence=None):
+        """Shared (institutional/pipeline) research with a controlled report."""
+        spec = build_task_spec(research_question=question, symbols=["600519"],
+                               execution_mode="replay", config=self.config)
+        spec["bound_signal_ids"] = []
+        spec["public_context"]["evidence_summaries"] = dict(evidence or {})
+        spec["replay_response"] = _replay(summary)
+        task, _ = self.store.create_task(title="S{0}".format(len(self.store.list_tasks())),
+                                         input_payload=spec, execution_mode="replay")
+        self.store.claim_next("w")
+        run_research_task(self.store, task["task_id"], worker_id="w", config=self.config)
+        return self.store.get_task(task["task_id"])
+
+    def _personal(self, actor, question, document_ids=None, rerun_of=None, note=None):
+        from stock_agent import personal_workspace as pw
+
+        if rerun_of:
+            created = pw.rerun_completed_research(self.store, actor=actor, task_id=rerun_of,
+                                                  config=self.config)
+        elif note:
+            created = pw.follow_up_completed_research(self.store, actor=actor, task_id=note[0],
+                                                      note=note[1], config=self.config)
+        else:
+            created = pw.create_personal_research(
+                self.store, actor=actor, question=question, symbols=["600519"],
+                execution_mode="replay", config=self.config, document_ids=document_ids)
+        self.assertIn(created["status"], {"RECORDED", "DUPLICATE"})
+        if created["status"] == "DUPLICATE":
+            return created["task"]
+        return self._finish(created["task"]["task_id"], actor)
+
+    def _personal_document(self, owner, content, title):
+        source = self.root / "incoming-{0}.txt".format(abs(hash(title)) % 100000)
+        source.write_text(content, encoding="utf-8")
+        result = import_personal_document(
+            self.config, owner, str(source), title=title,
+            source_url="https://www.cninfo.com.cn/new/disclosure/detail?plate=sse&orgId=gssh0000001",
+            published_at="2026-09-20T18:00:00+08:00")
+        return (str(result["document"]["document_id"]),
+                str(result["document"]["sha256"]), content)
+
+    def _withdraw(self, content, config=None):
+        """Real withdrawal: the same bytes re-ingested under a policy that no
+        longer approves their content type land in quarantine (the production
+        ingest entry appends ``evidence_quarantined``; nothing is deleted)."""
+        from stock_agent.evidence_vault import ingest_official_document_bytes
+
+        strict = json.loads(json.dumps(config or self.config))
+        strict["official_evidence_vault"]["allowed_content_types"] = ["application/pdf"]
+        result = ingest_official_document_bytes(
+            strict, content.encode("utf-8"),
+            source_url="https://www.cninfo.com.cn/new/disclosure/detail?plate=szse&orgId=gssz0000001",
+            title="withdrawn", published_at="2026-09-20T18:00:00+08:00",
+            actor="test-evidence-collector", actor_role="information_analyst")
+        self.assertEqual(result["document"]["status"], "quarantined")
+
+    def _roster(self, principals):
+        Path(self.config["research_operations"]["roster_path"]).write_text(
+            json.dumps({"principals": principals}), encoding="utf-8")
+
+    def _questions(self, **kwargs):
+        return sorted(r["question"] for r in query_library(
+            build_library_index(self.store), self.config, kwargs.pop("actor"), **kwargs)["results"])
+
+
+class RevocationRecheckTests(ScopeTestCase):
+    def _bound(self, question, evidence):
+        task = self._shared(question, evidence=evidence)
+        return task, build_library_index(self.store)
+
+    def test_cached_index_stops_answering_after_full_withdrawal(self):
+        from _vault_fixture import import_document
+
+        _, sha = import_document(self.config, self.root, content="全撤销原件正文。", title="全撤销原件")
+        task, cached = self._bound("全撤销研究", {"ev-1": {"summary": "s", "sha256": sha}})
+        self.assertEqual(query_library(cached, self.config, ALICE, query="全撤销")["result_count"], 1)
+        self._withdraw("全撤销原件正文。")
+        # The SAME index object, saved before the withdrawal, is not rebuilt.
+        result = query_library(cached, self.config, ALICE, query="全撤销")
+        self.assertEqual(result["result_count"], 0, "a cached index must stop answering")
+        self.assertTrue(result["revocation_checked"])
+        self.assertFalse(result["audit_granted"])
+        audit = query_library(cached, self.config, ALICE, query="全撤销", include_stale=True)
+        self.assertEqual(audit["result_count"], 0, "a non-auditor cannot read the stale row")
+        self.assertFalse(audit["audit_granted"])
+        self._roster([{"actor_id": AUDITOR, "principal_type": "human", "active": True,
+                       "roles": sorted(AUDIT_ROLES), "information_side": "public"}])
+        audit = query_library(cached, self.config, AUDITOR, query="全撤销", include_stale=True)
+        self.assertTrue(audit["audit_granted"])
+        self.assertEqual([(r["stale_reason"], r["live_evidence_shas"]) for r in audit["results"]],
+                         [("evidence_revoked", [])])
+
+    def test_partial_withdrawal_hides_entry_and_reports_survivor(self):
+        from _vault_fixture import import_document
+
+        sha_a = import_document(self.config, self.root, content="存活原件正文。", title="存活原件")[1]
+        sha_b = import_document(self.config, self.root, content="部分撤销原件正文。", title="部分撤销原件")[1]
+        task, cached = self._bound("部分撤销研究", {"a": {"summary": "s", "sha256": sha_a},
+                                                "b": {"summary": "s", "sha256": sha_b}})
+        self.assertEqual(query_library(cached, self.config, ALICE, query="部分撤销")["result_count"], 1)
+        self._withdraw("部分撤销原件正文。")
+        result = query_library(cached, self.config, ALICE, query="部分撤销")
+        self.assertEqual(result["result_count"], 0, "a partly stale report is withheld by default")
+        self._roster([{"actor_id": AUDITOR, "principal_type": "human", "active": True,
+                       "roles": ["quality_reviewer"], "information_side": "public"}])
+        audit = query_library(cached, self.config, AUDITOR, query="部分撤销", include_stale=True)
+        self.assertEqual([(r["stale_reason"], r["live_evidence_shas"]) for r in audit["results"]],
+                         [("evidence_partially_revoked", [sha_a])])
+
+    def test_recheck_follows_the_vault_on_every_query(self):
+        from _vault_fixture import import_document
+
+        sha = import_document(self.config, self.root, content="逐次复核原件正文。", title="逐次复核原件")[1]
+        _, cached = self._bound("逐次复核研究", {"ev-1": {"summary": "s", "sha256": sha}})
+
+        def ask():
+            return query_library(cached, self.config, ALICE, query="逐次复核")["result_count"]
+
+        seen = [ask()]
+        self._withdraw("逐次复核原件正文。")
+        seen += [ask(), ask()]
+        self.assertEqual(seen, [1, 0, 0], "the same index object follows the vault on every query")
+
+    def test_filter_step_refuses_unchecked_and_outdated_indexes(self):
+        raw = build_library_index(self.store)
+        with self.assertRaises(LibraryError):
+            search_library(raw)
+        outdated = {**raw, "schema_version": "1.0", "revocation_checked": True}
+        with self.assertRaises(LibraryError):
+            search_library(outdated)
+        self.assertEqual(LIBRARY_SCHEMA, "1.1")
+
+    def test_query_requires_a_principal(self):
+        with self.assertRaises(LibraryError):
+            query_library(build_library_index(self.store), self.config, " ")
+        self.assertEqual(self.config["personal_evidence"]["root"], str(self.root / "personal_evidence"))
+
+
+class ScopeTests(ScopeTestCase):
+    def test_each_session_sees_own_and_shared_never_foreign(self):
+        shared = self._shared("共享流水线研究")
+        alice_free = self._personal(ALICE, "Alice自有研究甲")
+        bob_free = self._personal(BOB, "Bob自有研究乙")
+        _, sha_b, _ = self._personal_document(BOB, "Bob的个人公告正文。", "Bob公告")
+        bob_doc = self._personal(BOB, "Bob带附件研究", document_ids=[self._doc_id(BOB, sha_b)])
+        for actor, own in ((ALICE, alice_free), (BOB, bob_free)):
+            seen = query_library(build_library_index(self.store), self.config, actor)
+            questions = [r["question"] for r in seen["results"]]
+            self.assertIn("共享流水线研究", questions, "shared research is authorized for every session")
+            self.assertIn(own["input_payload"]["research_question"], questions)
+            foreign = [q for q in questions if q.startswith(("Alice" if actor == BOB else "Bob"))]
+            self.assertEqual(foreign, [], "{0} must not receive the other session's research".format(actor))
+            self.assertTrue(seen["scope"]["out_of_scope_hidden"])
+        # The audit view lifts ONLY the stale exclusion, never the scope.
+        self._roster([{"actor_id": AUDITOR, "principal_type": "human", "active": True,
+                       "roles": ["compliance_officer"], "information_side": "public"}])
+        audit = query_library(build_library_index(self.store), self.config, AUDITOR, include_stale=True)
+        self.assertEqual(sorted(r["question"] for r in audit["results"]), ["共享流水线研究"])
+        self.assertTrue(audit["audit_granted"])
+
+    def _doc_id(self, owner, sha):
+        return "document:sha256:{0}".format(sha)
+
+    def test_namespace_and_owner_come_from_the_trusted_binding(self):
+        plain = self._shared("流水线任务", summary="流水线。")
+        personal = self._personal(CAROL, "Carol个人研究")
+        rerun = self._personal(CAROL, "", rerun_of=personal["task_id"])
+        index = build_library_index(self.store)
+        by_id = {e["task_id"]: e for e in index["entries"]}
+        self.assertEqual((by_id[plain["task_id"]]["namespace"], by_id[plain["task_id"]]["owner"]),
+                         ("default", None))
+        self.assertEqual((by_id[personal["task_id"]]["namespace"], by_id[personal["task_id"]]["owner"]),
+                         ("personal", CAROL))
+        self.assertEqual(by_id[rerun["task_id"]]["namespace"], "personal")
+        self.assertEqual(by_id[rerun["task_id"]]["research_occasion"], "explicit_new_research")
+        # A payload cannot claim ownership: a raw task with a personal-looking
+        # origin but no server-side binding stays shared.
+        spec = build_task_spec(research_question="伪造个人任务", symbols=["600519"],
+                               execution_mode="replay", config=self.config)
+        spec["bound_signal_ids"] = []
+        spec["replay_response"] = _replay("伪造。")
+        spec["origin"] = {"kind": "question", "research_occasion": "user_followup",
+                          "created_via": PERSONAL_ORIGIN_VIA}
+        forged, _ = self.store.create_task(title="forged", input_payload=spec, execution_mode="replay")
+        self.store.claim_next("w")
+        run_research_task(self.store, forged["task_id"], worker_id="w", config=self.config)
+        entry = [e for e in build_library_index(self.store)["entries"] if e["task_id"] == forged["task_id"]][0]
+        self.assertEqual((entry["namespace"], entry["owner"]), ("default", None))
+
+    def test_personal_originals_are_live_in_their_own_namespace(self):
+        document_id, sha_a, _ = self._personal_document(ALICE, "Alice的个人公告正文。", "Alice公告")
+        self._personal(ALICE, "Alice带附件研究", document_ids=[document_id])
+        raw = build_library_index(self.store)
+        self.assertEqual(query_library(raw, self.config, ALICE, query="Alice带附件")["result_count"], 1)
+        self.assertIsNone(annotate_revocation(raw, self.config, actor=ALICE)["entries"][0].get("stale_reason"))
+
+    def test_every_session_gets_a_result_built_for_its_actor(self):
+        self._shared("共享流水线研究")
+        self._personal(ALICE, "Alice自有研究甲")
+        self._personal(BOB, "Bob自有研究乙")
+        seen = {actor: self._questions(actor=actor) for actor in (ALICE, BOB)}
+        self.assertEqual(seen[ALICE], sorted(["共享流水线研究", "Alice自有研究甲"]))
+        self.assertEqual(seen[BOB], sorted(["共享流水线研究", "Bob自有研究乙"]))
+
+    def test_withdrawn_shared_evidence_is_withheld_for_every_caller(self):
+        _, sha = import_document(self.config, self.root, content="共享原件正文。", title="共享原件")
+        self._shared("共享证据研究", evidence={"ev-1": {"summary": "s", "sha256": sha}})
+        raw = build_library_index(self.store)
+        self.assertEqual(query_library(raw, self.config, BOB, query="共享证据")["result_count"], 1)
+        self._withdraw("共享原件正文。")
+        self.assertEqual(query_library(raw, self.config, BOB, query="共享证据")["result_count"], 0)
+
+
+class ReportVersionTests(ScopeTestCase):
+    def test_original_kept_continuation_distinguishable_prior_linked(self):
+        document_id, _, _ = self._personal_document(ALICE, "时间线原件正文。", "时间线原件")
+        first = self._personal(ALICE, "公司甲时间线研究", document_ids=[document_id])
+        original = task_detail(self.store, first["task_id"], config=self.config)
+        original_report = dict(original["output"])
+        rerun = self._personal(ALICE, "", rerun_of=first["task_id"])
+        followup = self._personal(ALICE, "", note=(first["task_id"], "公司甲续研追问"))
+        index = build_library_index(self.store)
+        by_id = {e["task_id"]: e for e in index["entries"]}
+        original_entry, rerun_entry, follow_entry = (by_id[first["task_id"]],
+                                                     by_id[rerun["task_id"]],
+                                                     by_id[followup["task_id"]])
+        # The digest is reproducible from the preserved report alone.
+        for entry in (original_entry, rerun_entry, follow_entry):
+            source = self.store.get_task(entry["task_id"])
+            identity = report_identity(source["output"], source["task_id"], source["input_version"])
+            self.assertEqual(identity["report_version"], entry["report_version"])
+            self.assertEqual(identity["report_sha256"], entry["report_sha256"])
+        after = task_detail(self.store, first["task_id"], config=self.config)
+        timeline = query_library(index, self.config, ALICE, timeline_of=first["task_id"])
+        versions = {original_entry["report_version"], rerun_entry["report_version"],
+                    follow_entry["report_version"]}
+        self.assertEqual(len(versions), 3, "each report has its own version")
+        self.assertEqual(original_entry["input_version"], 1)
+        self.assertEqual(rerun_entry["input_version"], 1, "a continuation starts its own input chain")
+        self.assertEqual(follow_entry["input_version"], 1)
+        self.assertEqual(rerun_entry["prior_task_id"], first["task_id"])
+        self.assertEqual(follow_entry["prior_task_id"], first["task_id"])
+        self.assertEqual(rerun_entry["research_occasion"], "explicit_new_research")
+        self.assertEqual(follow_entry["research_occasion"], "user_followup")
+        # The original keeps its report, version and identity after both
+        # continuations were created from it.
+        self.assertEqual(self.store.get_task(first["task_id"])["output"], original_report)
+        self.assertEqual(after["report_version"], original["report_version"])
+        self.assertEqual(after["input_version"], original["input_version"])
+        self.assertEqual(original["report_version"]["report_schema_version"], "1.0")
+        self.assertTrue(original["report_version"]["report_version"].startswith(
+            "rv1:1.0:{0}:1:".format(first["task_id"])))
+        self.assertEqual(sorted(r["task_id"] for r in timeline["results"]),
+                         sorted([first["task_id"], rerun["task_id"], followup["task_id"]]))
+        self.assertEqual(query_library(index, self.config, BOB, timeline_of=first["task_id"])["result_count"],
+                         0, "another session's case has no visible timeline")
+
+    def test_signoff_changes_the_row_not_the_report(self):
+        from stock_agent import personal_workspace as pw
+
+        created = pw.create_personal_research(self.store, actor=CAROL, question="签收后版本不变研究",
+                                              symbols=["600519"], execution_mode="replay",
+                                              config=self.config)
+        task_id = created["task"]["task_id"]
+        self.assertEqual(self.store.claim_next("w")["task_id"], task_id)
+        run_research_task(self.store, task_id, worker_id="w", config=self.config)
+        awaiting = task_detail(self.store, task_id, config=self.config)
+        self.assertEqual(awaiting["status"], "awaiting_human")
+        self.assertIsNone(awaiting["personal_acknowledgement"])
+        self.store.record_human_response(task_id, actor=CAROL, decision="acknowledge",
+                                         expected_version=awaiting["row_version"],
+                                         command_id="scope-signoff")
+        after = task_detail(self.store, task_id, config=self.config)
+        self.assertEqual(after["status"], "succeeded")
+        self.assertIsNotNone(after["personal_acknowledgement"])
+        self.assertEqual(after["report_version"], awaiting["report_version"], "the report is unchanged")
+        self.assertEqual(after["input_version"], awaiting["input_version"], "no new input was supplied")
+        self.assertGreater(after["row_version"], awaiting["row_version"], "the row moved on")
+
+    def test_report_without_body_has_no_version(self):
+        self.assertEqual(report_identity({}), {"report_schema_version": "", "report_sha256": "",
+                                          "input_version": 1, "report_version": ""})
+        self.assertEqual(report_identity(None)["report_version"], "")
+
+
+class LibraryHttpTests(ScopeTestCase):
+    def setUp(self):
+        super().setUp()
+        self.authenticated = []
+
+        def authenticator(config, actor, symbols):
+            if actor not in (ALICE, BOB, AUDITOR):
+                raise ValueError("unknown principal")
+            self.authenticated.append(actor)
+            return {"actor": actor, "provider": "windows_local",
+                    "subject": "S-1-{0}".format(actor), "policy_sha256": "a" * 64}
+
+        self.server = create_task_board_server(
+            self.store, host="127.0.0.1", port=0, config=self.config,
+            session_store=PersonalSessionStore(ttl_seconds=1800),
+            login_authenticator=authenticator)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+
+    def _request(self, path, cookie=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("GET", path, None, {"Cookie": cookie} if cookie else {})
+            response = conn.getresponse()
+            return response.status, json.loads(response.read().decode("utf-8"))
+        finally:
+            conn.close()
+
+    def _login(self, actor):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("POST", "/api/v1/personal/login",
+                         json.dumps({"actor": actor, "symbols": ["600519"]}),
+                         {"Content-Type": "application/json"})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200, response.read())
+            return (response.getheader("Set-Cookie") or "").split(";")[0]
+        finally:
+            conn.close()
+
+    def test_two_sessions_each_get_their_authorized_results(self):
+        shared = self._shared("共享流水线研究")
+        alice = self._personal(ALICE, "Alice自有研究甲")
+        bob = self._personal(BOB, "Bob自有研究乙")
+        status, body = self._request("/api/v1/library")
+        self.assertEqual((status, body["error"]), (403, "session_required"))
+        self._roster([{"actor_id": AUDITOR, "principal_type": "human", "active": True,
+                       "roles": ["quality_reviewer"], "information_side": "public"}])
+        for actor, own, cookie in ((ALICE, alice, self._login(ALICE)), (BOB, bob, self._login(BOB))):
+            status, body = self._request("/api/v1/library", cookie)
+            self.assertEqual(status, 200)
+            self.assertEqual(body["actor"], actor)
+            questions = [r["question"] for r in body["results"]]
+            self.assertEqual(sorted(questions), sorted(["共享流水线研究", own["input_payload"]["research_question"]]))
+            self.assertIn("result_count", body)
+            self.assertFalse(body["audit_granted"])
+            self.assertEqual(self._request("/api/v1/library?actor=" + BOB, cookie)[0], 403)
+        self.assertEqual(self._request("/api/v1/library?query=Bob", self._login(BOB))[1]["result_count"], 1)
+        status, audit = self._request("/api/v1/library?include_stale=1", self._login(AUDITOR))
+        self.assertEqual((status, audit["audit_granted"]), (200, True))
+        # A session cannot read another session's case through the timeline.
+        status, body = self._request("/api/v1/library/timeline?task_id=" + alice["task_id"], self._login(BOB))
+        self.assertEqual((status, body["result_count"]), (200, 0))
+        status, body = self._request("/api/v1/library/timeline", self._login(ALICE))
+        self.assertEqual(status, 400)
+
+    def test_route_answers_withdrawal_on_the_next_request(self):
+        document_id, _, content = self._personal_document(ALICE, "逐次复核原件正文。", "逐次复核原件")
+        self._personal(ALICE, "Alice带附件研究", document_ids=[document_id])
+        cookie = self._login(ALICE)
+        path = "/api/v1/library?query=" + quote("Alice带附件")
+        self.assertEqual(self._request(path, cookie)[1]["result_count"], 1)
+        self._withdraw(content, personal_vault_view(self.config, ALICE))
+        status, body = self._request(path, cookie)
+        self.assertEqual((status, body["result_count"]), (200, 0))
+        self._roster([{"actor_id": ALICE, "principal_type": "human", "active": True,
+                       "roles": ["quality_reviewer"], "information_side": "public"}])
+        status, body = self._request(path + "&include_stale=1", cookie)
+        self.assertEqual((status, body["result_count"], body["audit_granted"]), (200, 1, True))
+
+    def test_timeline_route_lists_case_and_continuations_with_report_versions(self):
+        first = self._personal(ALICE, "公司乙时间线研究")
+        rerun = self._personal(ALICE, "", rerun_of=first["task_id"])
+        follow = self._personal(ALICE, "", note=(first["task_id"], "公司乙续研追问"))
+        cookie = self._login(ALICE)
+        status, body = self._request("/api/v1/library/timeline?task_id=" + first["task_id"], cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(sorted(r["task_id"] for r in body["results"]),
+                         sorted([first["task_id"], rerun["task_id"], follow["task_id"]]))
+        self.assertEqual(len({r["report_version"] for r in body["results"]}), 3,
+                         "one report version per case and input version")
+        self.assertEqual([r["prior_task_id"] for r in sorted(body["results"], key=lambda r: r["task_id"])
+                          if r["task_id"] != first["task_id"]].count(first["task_id"]), 2)
+        self.assertTrue(all(r["prior_task_id"] is None for r in body["results"]
+                            if r["task_id"] == first["task_id"]))
+        # Every timeline row's version reads back identically from the case
+        # detail route, and its digest recomputes from the preserved report.
+        identity_fields = ("report_version", "report_sha256", "report_schema_version")
+        for row in body["results"]:
+            status, detail = self._request("/api/v1/tasks/" + row["task_id"])
+            self.assertEqual(status, 200)
+            self.assertEqual({k: detail["report_version"][k] for k in identity_fields},
+                             {k: row[k] for k in identity_fields})
+            recomputed = report_identity(detail["output"], row["task_id"], detail["input_version"])
+            self.assertEqual({k: recomputed[k] for k in identity_fields},
+                             {k: row[k] for k in identity_fields})
+        self.assertTrue(all(r["input_version"] == 1 for r in body["results"]))
+        self.assertEqual(self._request("/api/v1/timeline?task_id=" + first["task_id"], cookie)[0], 404)
+
+
+class EmbeddingFreeTests(ScopeTestCase):
+    def test_library_stays_embedding_free(self):
+        import stock_agent.research_library as library
+
+        self.assertEqual([m for m in sys.modules if m in {"numpy", "faiss", "sentence_transformers", "torch"}], [])
+        self.assertNotIn("import numpy", Path(library.__file__).read_text(encoding="utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()

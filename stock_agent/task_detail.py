@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from .models import now_iso
+from .research_library import report_identity
 
 DETAIL_SCHEMA_VERSION = "1.0"
 SCOPE_NOTE = "personal_research_only_not_institutional"
@@ -119,6 +120,12 @@ def task_detail(store: Any, task_id: str, *, config: Optional[Dict[str, Any]] = 
         "is_replay": str(task.get("execution_mode") or "live") == "replay",
         "input_version": int(task.get("input_version") or 1),
         "row_version": int(task.get("version") or 1),
+        # R20: the report's own version — the case, the input version that
+        # produced it (input_version above), the payload schema it conforms
+        # to, and a digest of the report body. Later additions to the output
+        # (quality verdict, personal sign-off) and row bumps leave it
+        # unchanged.
+        "report_version": report_identity(output, task["task_id"], task.get("input_version")),
         "attempt_count": int(task.get("attempt_count") or 0),
         "max_attempts": int(task.get("max_attempts") or 0),
         "cancel_requested": bool(task.get("cancel_requested")),

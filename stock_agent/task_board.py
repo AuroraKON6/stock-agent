@@ -1173,6 +1173,59 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                               "namespace": view.get("namespace"),
                               "documents": documents})
 
+    def _handle_library(self, timeline: bool = False) -> None:
+        """R20 retrieval: shared research plus the session's OWN personal
+        research, revocation-checked against the current authorized vaults
+        on every request. The principal comes from the session; the caller
+        cannot name an actor or widen the scope. Stale rows are returned
+        only to an authorized auditor (``include_stale=1``), never on the
+        strength of the request alone. ``timeline`` narrows one case to its
+        original report and the continuations linked to it."""
+        from urllib.parse import parse_qs as _parse_qs
+
+        from .personal_evidence import PersonalEvidenceError
+        from .research_library import LibraryError, build_library_index, query_library
+
+        if getattr(self.server, "session_store", None) is None:
+            self._send_json(503, {"error": "workspace_requires_sessions"})
+            return
+        session = self._resolve_session()
+        if session is None:
+            self._send_json(403, {"error": "session_required"})
+            return
+        params = _parse_qs(urlparse(self.path).query, keep_blank_values=True)
+
+        def first(name, limit=500):
+            return str((params.get(name) or [""])[0])[:limit]
+
+        if "actor" in params or "owner" in params:
+            self._send_json(403, {"error": "actor_from_session_only"})
+            return
+        task_id = first("task_id", 120)
+        if timeline and not task_id:
+            self._send_json(400, {"error": "timeline requires task_id"})
+            return
+        symbols = [item.strip() for item in first("symbols", 400).split(",") if item.strip()]
+        store: TaskStore = self.server.task_store
+        with self.server.board_lock:
+            try:
+                result = query_library(
+                    build_library_index(store), self.server.board_config, session.actor,
+                    query=first("query"), symbols=symbols or None,
+                    # A timeline is keyed by its case, not narrowed to it.
+                    task_id="" if timeline else task_id,
+                    since=first("since", 40), until=first("until", 40),
+                    status=first("status", 40),
+                    include_stale=first("include_stale", 8) in {"1", "true"},
+                    timeline_of=task_id if timeline else "")
+            except (LibraryError, PersonalEvidenceError) as exc:
+                self._send_json(400, {"error": "library query failed", "detail": str(exc)})
+                return
+            except Exception as exc:  # the vault projection failed: no partial answer
+                self._send_json(503, {"error": "library unavailable: {0}".format(type(exc).__name__)})
+                return
+        self._send_json(200, result)
+
     def _handle_personal_import(self) -> None:
         """A93 page wiring: import one file into the owner's personal
         namespace through the R12a service (never the institutional vault).
@@ -1456,6 +1509,13 @@ class _TaskBoardHandler(BaseHTTPRequestHandler):
                     self._send_json(503, {"error": "queries view unavailable: {0}".format(type(exc).__name__)})
                     return
             self._send_json(200, payload)
+            return
+        # ---- R20 research library (session mode only) ----
+        if parsed.path == "/api/v1/library":
+            self._handle_library()
+            return
+        if parsed.path == "/api/v1/library/timeline":
+            self._handle_library(timeline=True)
             return
         if parsed.path.startswith("/api/v1/tasks/"):
             task_id = parsed.path[len("/api/v1/tasks/"):]
