@@ -190,6 +190,8 @@ def budget_projection(rows: dict, config: dict) -> tuple[list, list]:
     reservations = {row["event_id"]: row for row in outbox
                     if row["event_type"] == "research_attempt_started"}
     limit = config["task_runtime"]["budget"]["daily_model_call_limit"]
+    dates = {event_id: business_date(datetime.fromisoformat(event["created_at"]))
+             for event_id, event in reservations.items()}
     if (len(attempts) != len(STATES) or {row["state"] for row in attempts} != STATES.keys()
             or len(reservations) != len(STATES)
             or {row["budget_event_id"] for row in attempts} != reservations.keys() or limit != LIMIT):
@@ -242,15 +244,20 @@ def budget_projection(rows: dict, config: dict) -> tuple[list, list]:
 
         rounds = json.loads(task["model_call"]).get("rounds", [])
         usage = rounds[0].get("usage") if rounds else None
-        if state == "succeeded" and (usage != USAGE or rounds[0]["attempt_id"] != attempt_id):
-            errors.append(f"{label}: persisted successful consumption disagrees")
+        calls_at_reservation = sum(
+            dates[other_id] == dates[event_id] and other["sequence"] <= reservation["sequence"]
+            for other_id, other in reservations.items())
+        if state == "succeeded" and (usage != USAGE or rounds[0].get("attempt_id") != attempt_id
+                or rounds[0].get("budget_reservation") != {"calls_today": calls_at_reservation, "limit": limit}):
+            errors.append(f"{label}: persisted successful consumption or reservation count disagrees")
         projection.append({
             "task_id": task_id, "attempt_id": attempt_id, "budget_event_id": event_id,
-            "business_date_asia_shanghai": str(business_date(datetime.fromisoformat(reservation["created_at"]))),
+            "business_date_asia_shanghai": str(dates[event_id]), "calls_at_reservation": calls_at_reservation,
             "reservation_sequence": reservation["sequence"], "reserved_calls": 1, "daily_call_limit": limit,
             "state": state, "sent": row["sent"], "task_status": task["status"],
             "usage_tokens": usage, "reconciliation": row["reconciliation"] or None,
-            "amount": receipt["amount"] if receipt else None, "currency": receipt["currency"] if receipt else None,
+            "amount": receipt.get("amount") if receipt else None,
+            "currency": receipt.get("currency") if receipt else None,
             "invocation_sequences": [event["sequence"] for event in invocation_events],
         })
     return projection, errors

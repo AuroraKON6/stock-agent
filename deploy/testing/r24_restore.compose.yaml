@@ -1,6 +1,8 @@
 # Overlay for r25_precheck.compose.yaml. Use only the one-shot drill service.
 services:
   drill:
+    environment:
+      APP_CONFIG_ROOT: /app/config
     volumes:
       - r24-archive:/app/drill-archive
       - r24-negatives:/app/drill-negatives

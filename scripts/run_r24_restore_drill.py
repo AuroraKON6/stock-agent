@@ -45,15 +45,16 @@ class Drill:
     def run(self, name: str, command: list[str], *, expected: int = 0, cwd: Path = ROOT) -> str:
         started = utc()
         print(f"{name} $ {shlex.join(command)}", flush=True)
-        result = subprocess.run(command, cwd=cwd, env=self.env, text=True, capture_output=True)
-        (self.output / f"{name}.stdout").write_text(result.stdout, encoding="utf-8")
-        (self.output / f"{name}.stderr").write_text(result.stderr, encoding="utf-8")
+        stdout = self.output / f"{name}.stdout"
+        stderr = self.output / f"{name}.stderr"
+        with stdout.open("w", encoding="utf-8") as out, stderr.open("w", encoding="utf-8") as err:
+            result = subprocess.run(command, cwd=cwd, env=self.env, stdout=out, stderr=err)
         self.records.append({"step": name, "command": command, "exit": result.returncode,
                              "expected": expected, "start_utc": started, "end_utc": utc()})
         (self.output / "commands.json").write_text(json.dumps(self.records, indent=2) + "\n")
         require(result.returncode == expected,
                 f"{name} exit {result.returncode}, expected {expected}; see {self.output}")
-        return result.stdout
+        return stdout.read_text(encoding="utf-8", errors="replace")
 
     def service(self, name: str, *command: str, expected: int = 0) -> str:
         return self.run(name, self.compose + ["run", "--rm", "--no-deps", "--pull", "never",
@@ -119,6 +120,9 @@ class Drill:
         evidence, = self.fixture("manifest-and-restore", "collect")
         bundle, restored = evidence["bundle"], evidence["restored"]
         backup, manifest, restore = (evidence[key] for key in ("backup", "manifest", "drill"))
+        for filename in ("manifest.json", "manifest.sha256"):
+            self.service(filename, "cat", f"{bundle}/{filename}")
+            (self.output / f"{filename}.stdout").rename(self.output / filename)
         require(backup["status"] == restore["status"] == "PASS"
                 and backup["manifest_id"] == manifest["manifest_id"] == restore["manifest_id"]
                 and restore["task_runtime_integrity"]["unknown_attempts_restored"] == 1
