@@ -246,8 +246,8 @@ def error_code(text: Any) -> str:
 # accepted a sentence as a run id, and a provider label can look like a key.
 # Such a value is published only as a validated identifier or as a stable
 # irreversible digest — never as itself.
-LABEL_NOTE = ("外部来源的关联值一律以 sha256 稳定关联值呈现；系统标识与受控词保留原样；"
-              "明细与聚合同一标签，计数可对账")
+LABEL_NOTE = ("外部来源的关联值（run ID、provider、worker、案件与业务意图 ID）一律以 sha256 稳定关联值呈现，"
+              "仅注册表能核实的名称保留；系统标识与受控词保留原样；明细与聚合同一标签，计数可对账")
 _LABEL = re.compile(r"^[A-Za-z0-9_.:+\-/]{1,80}$")
 _LABEL_DIGEST_PREFIX = "sha256:"
 # Fields whose value is this module's own prose (Chinese notes / details),
@@ -256,48 +256,22 @@ PROSE_KEYS = frozenset({"note", "reason", "scope_note", "projection_note", "deta
                         "ledger_detail", "intake_detail", "label_note"})
 # Values that came from OUTSIDE the system: typed or configured by a person
 # or another platform (a Dify run id, a provider or model name, a worker or
-# actor name). The entry points accept any string for most of them, so a view
-# publishes one only when it has the shape of a STRUCTURED identifier — a
-# UUID, a plain number, or lowercase segments joined by ``. _ : -`` — and
-# carries no credential marker. A bare alphanumeric blob (the shape of an
-# opaque token, with or without a recognised prefix) does not qualify and is
-# published as a correlation value instead.
+# actor name, a case or business-intent id). No entry point constrains their
+# format, and their FORMAT cannot tell a label from an opaque token — with
+# or without separators, with or without a recognised prefix. So a view
+# never publishes one as it is. It is published only as a stable correlation
+# value (see ``correlation``), or — where a registry can actually VERIFY the
+# name — by that name: a provider the provider registry has activated, a
+# platform the task store keys runs by.
 EXTERNAL_FIELDS = frozenset({
     "run_id", "workflow_version", "actor", "platform", "provider", "request_model",
-    "worker_id", "source_id", "api_id", "data_kind", "role_id", "parent_task_id",
-    "upstream", "quota_group", "title", "purpose",
+    "worker_id", "source_id", "api_id", "data_kind", "case_id", "business_intent_id",
+    "role_id", "parent_task_id", "upstream", "quota_group", "title", "purpose",
 })
-# Business identity: the case id and the business intent id are what people
-# join a trace on, so they stay readable — but only under the identifier
-# constraint the role entry already enforces for case ids. Anything outside
-# it (a sentence, a credential-shaped string) becomes a correlation value.
-_BUSINESS_IDENTITY_FIELDS = frozenset({"case_id", "business_intent_id"})
-_BUSINESS_IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
-_STRUCTURED_ID = re.compile(r"^(?:[0-9]+|[a-z0-9]+(?:[._:-][a-z0-9]+)+)$")
-
-
-_BARE_WORD = re.compile(r"^[a-z0-9]+$")
 # The orchestration platforms the task store keys runs by (Dify, n8n).
 KNOWN_PLATFORMS = frozenset({"dify", "n8n"})
-
-
-def _is_structured_id(value: str, field: Any = None, known: frozenset = frozenset()) -> bool:
-    """Structured = UUID / number / separated lowercase segments. A BARE word
-    (``openai``, ``dify`` — but also a lowercase token) has no structure to
-    check, so it counts only when a known set for its field verifies it."""
-    if contains_secret_marker(value):
-        return False
-    if _UUID.match(value) or _STRUCTURED_ID.match(value):
-        return True
-    if not _BARE_WORD.match(value):
-        return False
-    name = str(field or "")
-    if name == "provider":
-        return value in known
-    return name == "platform" and value in KNOWN_PLATFORMS
-
-
+_STAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?([+-]\d{2}:\d{2}|Z)?$")
 # References the system generates itself: ``qi_<16 hex>`` intake intents,
 # ``kq_<32 hex>`` Kimi requests. Ledger records written before those shapes
 # were fixed may carry another identifier-shaped reference; it is kept when it
@@ -310,6 +284,8 @@ _ROW_ID = re.compile(r"^(task|att|evt)_[0-9a-f]{16}$")
 # Controlled vocabulary written by this code base: states, outcomes, event
 # types, gates, rules, evidence classes (lowercase snake_case).
 _CONTROLLED = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
+# The few controlled tokens this code base writes in upper case (``NOT_RUN``).
+_CONTROLLED_UPPER = re.compile(r"^(NOT_RUN|OK|BLOCKED|PASS|FAIL)$")
 
 
 def safe_label(value: Any) -> str:
@@ -350,30 +326,32 @@ def registered_providers(config: Any) -> frozenset:
 def project_value(field: Any, value: Any, known: frozenset = frozenset()) -> Any:
     """Publish ``value`` of ``field`` according to where the value came from.
 
-    external        -> kept only as a structured identifier without a
-                       credential marker (a bare word only when a known set
-                       verifies it: an activated provider, a known platform),
-                       otherwise a correlation value
-    business identity -> kept under the entry's identifier constraint,
-                       otherwise a correlation value
+    external        -> the verified name when a known set verifies it (an
+                       activated provider, a known platform), else a
+                       correlation value — never the raw text
     system reference -> kept when it has the shape of one, else correlation
     task-store row id -> kept only in the fixed row-id shape, else correlation
-    anything else   -> kept when it is an identifier-shaped or controlled
-                       token without a credential marker, else a safe label
-    Non-strings are returned untouched.
+    anything else   -> this code base's own controlled tokens (states, event
+                       types, outcomes) and timestamps; anything else is
+                       correlated
+
+    Projection is applied exactly ONCE to a value read from a ledger. A value
+    that merely LOOKS like a correlation value (``sha256:...`` typed by a
+    caller) is not trusted as one: in the fields above it fails every check
+    and is correlated again, so an internal digest and same-shaped input
+    never collide. Non-strings are returned untouched.
     """
     if not isinstance(value, str):
         return value
-    if value == "" or value.startswith(_LABEL_DIGEST_PREFIX):
-        return value
+    if value == "":
+        return ""
     name = str(field or "")
     if name in EXTERNAL_FIELDS:
         if name == "provider" and value in known:
             return value  # verified against the activated-provider registry
-        return value if _is_structured_id(value, name, known) else correlation(value)
-    if name in _BUSINESS_IDENTITY_FIELDS:
-        return value if _BUSINESS_IDENTITY.match(value) \
-            and not contains_secret_marker(value) else correlation(value)
+        if name == "platform" and value in KNOWN_PLATFORMS:
+            return value  # verified against the platforms the store keys by
+        return correlation(value)
     if name in ("task_id", "attempt_id", "event_id"):
         return value if _ROW_ID.match(value) else correlation(value)
     if name in _REFERENCE_FIELDS:
@@ -381,17 +359,23 @@ def project_value(field: Any, value: Any, known: frozenset = frozenset()) -> Any
             return value
         return value if _REFERENCE.match(value) and not contains_secret_marker(value) \
             else correlation(value)
-    return safe_label(value)
+    if _CONTROLLED.match(value) or _CONTROLLED_UPPER.match(value) or _STAMP.match(value):
+        return value
+    return correlation(value)
 
 
 def project_key(key: Any) -> str:
-    """A dictionary key that names data (a status, an event type, a
-    provider). Keys that name FIELDS or already are correlation values are
-    returned as they are, so projection stays idempotent."""
+    """A dictionary key that names data (a status, an event type, an
+    execution mode, a provider label). Field names and controlled tokens are
+    kept; anything else is correlated — including an execution mode or other
+    key that came from outside."""
     text = str(key)
-    if text.startswith(_LABEL_DIGEST_PREFIX) or _CONTROLLED.match(text):
+    if text == "" or _CONTROLLED.match(text):
         return text
-    return safe_label(text)
+    if text.startswith(_LABEL_DIGEST_PREFIX):
+        # set by ``provider_counts`` from the raw label: already correlated
+        return text
+    return correlation(text)
 
 
 def _safe_tree(value: Any, field: Any = None, known: frozenset = frozenset()) -> Any:
@@ -1260,8 +1244,14 @@ def build_alert_candidates(status: Dict[str, Any], reconciliation: Optional[Dict
 # -------- structured log -------- #
 
 def project_log_fields(fields: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], int]:
-    """Keep only allow-listed fields whose value is a number or an
-    identifier-shaped string; everything else is dropped and only COUNTED."""
+    """Apply the view's publication rule to the sampling path.
+
+    Only allow-listed names are considered; other names are dropped and only
+    COUNTED. A number is kept. A string is published the way a view would
+    publish it (``project_value``): a system id or controlled token as it
+    is, anything else — a worker label, a free-text status, a body — as its
+    stable correlation value, which is still joinable and never the text.
+    """
     kept: Dict[str, Any] = {}
     dropped = 0
     for name, value in (fields or {}).items():
@@ -1273,13 +1263,15 @@ def project_log_fields(fields: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any]
         if name not in LOG_FIELDS:
             dropped += 1
             continue
-        if isinstance(value, bool) or isinstance(value, int):
+        if isinstance(value, bool) or isinstance(value, (int, float)):
             kept[name] = value
-        elif isinstance(value, float):
-            kept[name] = value
-        elif isinstance(value, str) and _LOG_IDENTIFIER.match(value) \
-                and not contains_secret_marker(value):
-            kept[name] = value
+            continue
+        if not isinstance(value, str):
+            dropped += 1
+            continue
+        projected = project_value(name, value)
+        if projected:
+            kept[name] = projected
         else:
             dropped += 1
     return kept, dropped
@@ -1334,4 +1326,9 @@ def build_observability_report(store: Any, *, config: Any = None,
         "side_effects": "none",
         "label_note": LABEL_NOTE,
     }
-    return _safe_tree(report, known=registered_providers(config))
+    # Each part projects ITS OWN values exactly once (reconciliation and
+    # trace above, alert candidates here); metrics and settings are composed
+    # from numbers, field names and controlled tokens only. A second pass over
+    # the assembled report would correlate already-correlated values.
+    report["alert_candidates"] = _safe_tree(report["alert_candidates"])
+    return report

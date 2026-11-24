@@ -499,6 +499,7 @@ def verify_report(store, config: dict, task_id: str, root: Path) -> dict:
     from stock_agent.observability import (
         build_observability_report,
         build_trace,
+        correlation,
         emit_observability_log,
         observability_settings,
         project_log_fields,
@@ -518,12 +519,19 @@ def verify_report(store, config: dict, task_id: str, root: Path) -> dict:
     trace = report["trace"]
 
     # --- trace: case / intent -> task -> platform runs -> query -> attempts
-    check("trace.case", CASE_ID, trace["business_identity"]["case_id"])
-    check("trace.intent", INTENT_ID, trace["business_identity"]["business_intent_id"])
-    check("trace.platform_runs", [DIFY_RUN_1, DIFY_RUN_2],
+    corr = correlation
+    # Case id, business intent and platform run ids are external text: they
+    # are published only as stable correlation values.
+    check("trace.case", corr(CASE_ID), trace["business_identity"]["case_id"])
+    check("trace.intent", corr(INTENT_ID), trace["business_identity"]["business_intent_id"])
+    check("trace.platform_runs", [corr(DIFY_RUN_1), corr(DIFY_RUN_2)],
           [r["run_id"] for r in trace["platform_runs"]])
     check("trace.intent_not_a_platform_id", True,
-          all(r["run_id"] != INTENT_ID for r in trace["platform_runs"]))
+          all(r["run_id"] != corr(INTENT_ID) for r in trace["platform_runs"]))
+    check("trace.two_reads_agree", True,
+          build_trace(store, task_id, config=config)["platform_runs"] == trace["platform_runs"])
+    check("trace.raw_not_visible", [],
+          [raw for raw in (CASE_ID, INTENT_ID, DIFY_RUN_1, DIFY_RUN_2) if raw in json.dumps(trace)])
     # Each worker run is its own claim, so both attempts are round 1.
     check("trace.attempt_rounds", [1, 1], [a["round_index"] for a in trace["attempts"]])
     check("trace.attempt_states", ["failed_known", "reconciled"],
@@ -627,8 +635,9 @@ def verify_report(store, config: dict, task_id: str, root: Path) -> dict:
     check("log.dropped_count", 4, (record or {}).get("dropped_fields"))
     # A body under an allow-listed NAME is still dropped: values must be
     # identifier-shaped and credential-free.
-    check("log.body_under_allowed_name", ({}, 1),
-          project_log_fields({"task_id": "x " + SECRETS["body"] + " y"}))
+    body_text = "x " + SECRETS["body"] + " y"
+    check("log.body_under_allowed_name", ({"task_id": correlation(body_text)}, 0),
+          project_log_fields({"task_id": body_text}))
     off_sink = io.StringIO()
     check("log.off_silent", None, emit_observability_log(
         "r23_drill", {"task_id": task_id}, config=drill_config(sampling=False), sink=off_sink))
@@ -1031,8 +1040,50 @@ def boundary_checks(root: Path) -> dict:
     check("boundary.label.opaque_token_not_echoed", False, opaque in json.dumps(report))
     check("boundary.label.opaque_token_stable", obs.correlation(opaque),
           report["trace"]["platform_runs"][-1]["run_id"])
-    check("boundary.label.structured_run_id_kept", "sol-r23-first-run",
+    check("boundary.label.structured_run_id_correlated", obs.correlation("sol-r23-first-run"),
           obs.project_value("run_id", "sol-r23-first-run"))
+
+    # 12. A digest-shaped value typed by a caller is not trusted as ours.
+    store, task_id = new_store("digest_shaped")
+    raw = "sha256:" + BODY_AS_ID
+    store.attach_platform_run(task_id, run={"platform": "dify", "run_id": raw,
+                                            "workflow_version": "wf-demo-1", "actor": "a"})
+    first = obs.build_observability_report(store, task_id=task_id)["trace"]
+    second = obs.build_observability_report(store, task_id=task_id)["trace"]
+    check("boundary.label.digest_shaped_input_not_trusted", False,
+          raw in json.dumps(first))
+    check("boundary.label.digest_shaped_input_correlated", obs.correlation(raw),
+          first["platform_runs"][0]["run_id"])
+    check("boundary.label.digest_shaped_input_stable", first["platform_runs"],
+          second["platform_runs"])
+    store.close()
+
+    # 13. The real sampling path: an operator-supplied worker label.
+    sample = base / "sample.sqlite3"
+    sampler = TaskStore(sample)
+    try:
+        row, _ = sampler.create_task(
+            title="合成采样任务", input_payload={"research_question": "合成",
+                                             "data_classification": "public"},
+            execution_mode="replay")
+        marker = "ZcodeFixtureWorkerValue20261125"
+        from unittest.mock import patch
+
+        from stock_agent.research_worker import run_research_task
+        sampler.claim_task(row["task_id"], marker, ttl_seconds=120)
+        stub = _ModelStub("synthetic before-send failure", stage="preflight", sent_hint="no")
+        sink = io.StringIO()
+        with patch("stock_agent.pi_runtime.call_pi_agent", side_effect=stub.fail), \
+                contextlib.redirect_stderr(sink):
+            run_research_task(sampler, row["task_id"], worker_id=marker,
+                              config={"observability": {"sampling": {"enabled": True}}})
+    finally:
+        sampler.close()
+    lines = sink.getvalue().splitlines()
+    check("boundary.log.worker_label_one_record", 1, len(lines))
+    check("boundary.log.worker_label_not_echoed", False, marker in sink.getvalue())
+    check("boundary.log.worker_label_correlated", obs.correlation(marker),
+          json.loads(lines[0])["fields"].get("worker_id") if lines else None)
     store.close()
 
     # 7. A read-only DIRECTORY (not root): the read still works and writes nothing.

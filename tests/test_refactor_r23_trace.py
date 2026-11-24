@@ -77,11 +77,18 @@ class FrozenCaseTestCase(unittest.TestCase):
 class TraceTests(FrozenCaseTestCase):
     def test_one_chain_case_intent_platform_query_attempt(self):
         trace = build_trace(self.store, self.task_id, config=self.config)
-        self.assertEqual(trace["business_identity"]["case_id"], drill.CASE_ID)
-        self.assertEqual(trace["business_identity"]["business_intent_id"], drill.INTENT_ID)
-        self.assertEqual([r["run_id"] for r in trace["platform_runs"]], self.seeded["platform_runs"])
+        # Business identity and platform run ids are external text: published
+        # only as stable correlation values.
+        identity = trace["business_identity"]
+        self.assertEqual(identity["case_id"], correlation(drill.CASE_ID))
+        self.assertEqual(identity["business_intent_id"], correlation(drill.INTENT_ID))
+        self.assertEqual([r["run_id"] for r in trace["platform_runs"]],
+                         [correlation(r) for r in self.seeded["platform_runs"]])
         # The business intent is never reported as, or replaced by, a platform run id.
-        self.assertNotIn(drill.INTENT_ID, [r["run_id"] for r in trace["platform_runs"]])
+        self.assertNotIn(identity["business_intent_id"], [r["run_id"] for r in trace["platform_runs"]])
+        blob = json.dumps(trace, ensure_ascii=False)
+        for raw in (drill.CASE_ID, drill.INTENT_ID, *self.seeded["platform_runs"]):
+            self.assertNotIn(raw, blob)
 
     def test_query_link_comes_from_the_intake_consumption_binding(self):
         read = read_query_ledgers(self.config)
@@ -174,13 +181,39 @@ class StructuredLogTests(FrozenCaseTestCase):
         payload = sink.getvalue()
         self.assertNotIn(SECRET["body"], payload)
         self.assertNotIn(SECRET["token"], payload)
-        self.assertEqual(record["fields"], {"task_id": "task-ok"})
+        # "task-ok" is not a task-store row id, so it is correlated, not echoed
+        self.assertEqual(record["fields"], {"task_id": correlation("task-ok")})
         self.assertEqual(record["dropped_fields"], 2)
         self.assertEqual(json.loads(payload)["event"], "worker")
 
-    def test_body_under_an_allowed_name_is_still_dropped(self):
-        kept, dropped = project_log_fields({"task_id": "x " + SECRET["body"] + " y"})
-        self.assertEqual((kept, dropped), ({}, 1))
+    def test_body_under_an_allowed_name_is_correlated_not_dropped(self):
+        text = "x " + SECRET["body"] + " y"
+        kept, dropped = project_log_fields({"task_id": text})
+        self.assertEqual((kept, dropped), ({"task_id": correlation(text)}, 0))
+        self.assertNotIn(SECRET["body"], json.dumps(kept))
+
+    def test_worker_label_on_the_real_sampling_path_is_correlated(self):
+        from unittest.mock import patch
+
+        from stock_agent.research_worker import run_research_task
+
+        marker = "ZcodeFixtureWorkerValue20261125"
+        payload = dict(self.store.get_task(self.task_id)["input_payload"])
+        task, _ = self.store.create_task(title="worker 标签", input_payload=payload,
+                                         case_id=drill.CASE_ID, execution_mode="live")
+        task_id = task["task_id"]
+        self.assertEqual(self.store.claim_task(task_id, marker, ttl_seconds=120)["task_id"], task_id)
+        stub = drill._ModelStub("synthetic before-send failure", stage="preflight", sent_hint="no")
+        sink = io.StringIO()
+        with patch("stock_agent.pi_runtime.call_pi_agent", side_effect=stub.fail), \
+                contextlib.redirect_stderr(sink):
+            run_research_task(self.store, task_id, worker_id=marker, config=self.config)
+        lines = sink.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertNotIn(marker, sink.getvalue())
+        record = json.loads(lines[0])
+        self.assertEqual(record["fields"]["worker_id"], correlation(marker))
+        self.assertEqual(record["fields"]["task_id"], task_id)
 
     def test_real_worker_emits_when_sampling_on(self):
         from unittest.mock import patch
@@ -772,30 +805,45 @@ class ProjectionRuleTests(unittest.TestCase):
         for lower in (token.lower(), token.replace("Sol", "sol", 1)):
             self.assertEqual(project_value("run_id", lower), correlation(lower), lower)
 
-    def test_structured_platform_ids_stay_readable_and_joinable(self):
-        for value in ("sol-r23-first-run", "dify-run-synthetic-001",
+    def test_external_ids_are_always_correlated_yet_stable(self):
+        for value in ("sol-r23-first-run", "dify-run-synthetic-001", "sol-fixture-value-20261125",
                       "3f2a1c9e-5b7d-4e6f-8a9b-0c1d2e3f4a5b", "20261125001", "run_42"):
-            self.assertEqual(project_value("run_id", value), value, value)
-        self.assertEqual(project_value("run_id", correlation("x")), correlation("x"),
-                         "projection is idempotent")
+            self.assertEqual(project_value("run_id", value), correlation(value), value)
+        self.assertEqual(project_value("run_id", "sol-r23-first-run"),
+                         project_value("run_id", "sol-r23-first-run"))
+        self.assertNotEqual(project_value("run_id", "sol-r23-first-run"),
+                            project_value("run_id", "sol-r23-replay-run"),
+                            "two runs of one intent stay distinguishable")
+        self.assertEqual(project_value("worker_id", "worker-4242"), correlation("worker-4242"))
+        self.assertEqual(project_value("workflow_version", "wf-demo-1"), correlation("wf-demo-1"))
 
-    def test_bare_word_external_values_need_a_known_set(self):
+    def test_a_digest_shaped_input_is_not_mistaken_for_our_correlation_value(self):
+        raw = "sha256:synthetic restricted prose fixture"
+        projected = project_value("run_id", raw)
+        self.assertNotEqual(projected, raw)
+        self.assertEqual(projected, correlation(raw))
+        self.assertNotIn("synthetic", projected)
+        # a caller cannot pre-empt the correlation of some other value either
+        self.assertNotEqual(project_value("run_id", correlation("x")), correlation("x"))
+        self.assertEqual(project_value("run_id", correlation("x")), correlation(correlation("x")))
+
+    def test_only_verified_names_are_published_by_name(self):
         self.assertEqual(project_value("platform", "dify"), "dify")
-        self.assertNotEqual(project_value("platform", "difyy"), "difyy")
+        self.assertEqual(project_value("platform", "difyy"), correlation("difyy"))
         self.assertEqual(project_value("provider", "openai", frozenset({"openai"})), "openai")
         self.assertEqual(project_value("provider", "openai"), correlation("openai"))
-        self.assertEqual(project_value("worker_id", "worker-4242"), "worker-4242")
-        self.assertNotEqual(project_value("worker_id", "SolFixtureOpaqueValue20261125"),
-                            "SolFixtureOpaqueValue20261125")
+        self.assertEqual(project_value("provider", "deepseek_primary"), correlation("deepseek_primary"),
+                         "a plausible-looking provider name is still external text")
+        self.assertNotEqual(project_value("worker_id", "SolFixtureWorkerValue20261125"),
+                            "SolFixtureWorkerValue20261125")
 
-    def test_business_identity_kept_under_the_entry_constraint(self):
-        self.assertEqual(project_value("case_id", "case-alpha"), "case-alpha")
+    def test_business_identity_is_correlated_and_stable(self):
+        for field in ("case_id", "business_intent_id"):
+            self.assertEqual(project_value(field, "case-alpha"), correlation("case-alpha"))
         self.assertEqual(project_value("business_intent_id", "sol-r23-business-intent"),
-                         "sol-r23-business-intent")
-        sentence = "Synthetic restricted prose fixture for R23"
-        self.assertEqual(project_value("case_id", sentence), correlation(sentence))
-        self.assertEqual(project_value("business_intent_id", "sk-R23SyntheticProviderFixture0001"),
-                         correlation("sk-R23SyntheticProviderFixture0001"))
+                         project_value("business_intent_id", "sol-r23-business-intent"))
+        self.assertNotEqual(project_value("business_intent_id", "SolFixtureBusinessValue20261125"),
+                            "SolFixtureBusinessValue20261125")
 
     def test_system_references_and_row_ids(self):
         self.assertEqual(project_value("request_id", "kq_" + "a" * 32), "kq_" + "a" * 32)
@@ -1028,7 +1076,7 @@ class RuntimeEdgeTests(unittest.TestCase):
         run = report["trace"]["platform_runs"][0]
         self.assertEqual(run["run_id"], correlation(self.OPAQUE))
         self.assertEqual(report["trace"]["business_identity"]["business_intent_id"],
-                         "r23-runtime-edges")
+                         correlation("r23-runtime-edges"))
 
 
 class ZeroSideEffectsTests(FrozenCaseTestCase):

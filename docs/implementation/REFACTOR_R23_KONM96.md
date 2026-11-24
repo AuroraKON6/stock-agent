@@ -4,7 +4,7 @@
 （[REFACTOR_R23_20261023.md](REFACTOR_R23_20261023.md)），基线 `dc8a4cffd51663c0b4f1c67b1f5c03d7f3422071`。
 全部输入为合成案件；真实供应商、真实外发、R18 真传输、生产告警接收均为 `NOT_RUN`。
 
-本文件描述第 4 轮（sol 第三轮校验返工后）的行为。前三轮缺陷及对应改动见 §6。
+本文件描述第 5 轮（sol 第四轮校验返工后）的行为。前几轮缺陷及对应改动见 §6。
 
 ## 1. 结论一览
 
@@ -27,7 +27,7 @@
 - `stock_agent/ops_view.py`：`recent_failures[].error` 由错误原文改为稳定错误码。
 - `stock_agent/cli.py`：只读子命令 `observability`（`read_only=True` 开库，库不存在时拒绝、不创建）。
 - `scripts/r23_observability_drill.py`、`deploy/testing/r23_observability.compose.yaml`：容器演练。
-- `tests/test_refactor_r23_trace.py`：57 项定向用例，与容器演练共用同一冻结合成案例。
+- `tests/test_refactor_r23_trace.py`：59 项定向用例，与容器演练共用同一冻结合成案例。
 - `tests/test_ops_view.py`：`recent_failures` 排序用例改为断言错误码（见 §6 第 2 项）。
 
 未改 TaskStore、预算、采纳或 worker 状态流。`aggregate_attempts` / `event_type_counts` 通过
@@ -61,21 +61,21 @@
   `request_id`）、`consumed`（要有 `artifact_id`）；语法有效但不是这三种的对象（`{}`、数组、未知类型）不算
   证据。两者都算不可用：告警观测值为 `unknown`、结果计数为空、`data_query_ledger` 进 `unknown_items`。
   只有真正零行的文件才是 `readable_empty`。
-- **按字段来源投影关联值。** 视图里每个字符串按所在字段决定能否原样输出：
-  - 系统生成的行标识（`task_` / `att_` / `evt_` + 16 位十六进制）和引用（`qi_` + 16 位、`kq_` + 32 位）
-    符合格式才原样保留，否则换成关联值；
-  - 业务身份（`case_id`、`business_intent_id`）在角色入口对 case id 使用的标识符约束内保留，超出约束
-    （句子、凭据形态）换成关联值；
-  - 外部来源的标签（平台 run ID、provider / 模型名、worker、来源等）只在具有结构化标识符形态时保留：
-    UUID、纯数字、或以 `. _ : -` 分隔的小写段。单个词没有结构可校验，只有已知集合能核实它时才保留
-    （provider 注册表已激活的 provider、任务库已知的平台名）；其余换成 `sha256:` 加 16 位十六进制的稳定关联值；
-  - 其余字段（状态、时间戳等）走标识符形态校验。
+- **按字段来源投影关联值。** 视图里每个字符串按所在字段决定能否原样输出，且每个从账本读出的值只投影一次：
+  - 系统生成的行标识（`task_` / `att_` / `evt_` + 16 位十六进制）和引用（`qi_` + 16 位、`kq_` + 32 位；
+  旧账本里的标识符形态引用）符合格式才原样保留，否则换成关联值；
+  - 业务身份（`case_id`、`business_intent_id`）和外部来源的标签（平台 run ID、workflow 版本、actor、
+    provider / 模型名、worker、来源、角色等）一律换成 `sha256:` 加 16 位十六进制的稳定关联值。入口对这些
+    字段的格式没有任何约束，格式也分辨不出标签和令牌（有没有分隔符、有没有可识别前缀都一样）；
+  - 唯一的例外是能被注册表核实的名称：provider 注册表已激活的 provider，任务库已知的平台名（`dify`、`n8n`）；
+  - 其余字段（状态、结果、事件类型、证据类别、时间戳）是本代码库自己写的受控词和时间戳，原样保留；
+    不符合的换成关联值。
 
-  同一个值总是映射到同一个关联值，同一运行的两次读取仍能关联。明细与聚合同一标签，计数可对账。
-- **这份约束的边界。** 格式校验分辨不出本身就长得像合法标识符的令牌。带分隔符的小写令牌
-  （例如 `sol-opaque-value-20261125`）填进 run ID 仍会原样显示；`case_id` / `business_intent_id` 里任何符合
-  标识符约束的令牌也会显示，因为业务身份必须保持可读才能关联。要让这两类也彻底不外显，只能一律换成关联值，
-  代价是业务身份不可读。
+  同一个值总是映射到同一个关联值，两次读取能对上同一运行或意图，不同运行仍可区分。
+  调用方填入一个长得像关联值的字符串（`sha256:...`）不会被当成内部摘要：它在上述字段里过不了任何校验，
+  会被再关联一次，内部摘要与同形状的原始输入不会混淆。明细与聚合同一标签，计数可对账。
+- **采样路径用同一条规则。** 结构化日志的字符串值走同一个 `project_value`：系统标识和受控词原样，
+  worker 标签这类外部文本换成关联值（仍可关联，不输出原文）。字段名仍受允许集合约束。
 - **`by_provider` 的口径。** 它按 attempt 行记录的 provider 标签归类计数，只说明「配置的提供商标签」，
   不是供应商被访问的证据。演练用内存桩调用，这一项照样有数。真实供应商用量在 `usage.real_supplier`，
   保持 `unknown`。
@@ -163,5 +163,14 @@ $C down --volumes --remove-orphans
 | 5 | 经符号链接读活跃 WAL 漏掉已提交绑定 | sidecar 判定与打开用同一真实路径；读后复查 WAL | 演练 `boundary.intake.symlink_live_wal`；`test_symlink_to_a_live_intake_sees_the_committed_binding` |
 | 6 | 意图与消费可能来自不同快照 | 读连接上同一读事务 | 演练 `boundary.intake.*`；`test_intents_and_consumptions_come_from_one_snapshot` |
 | 7 | `{}` 这样的非账本记录被当成有效的零 | 校验记录类型和必要字段 | 演练 `boundary.ledger.non_record.*`；`test_object_that_is_not_a_ledger_record_is_not_evidence` |
-| 8 | 不带前缀的令牌经 run ID 出现在报告 | 按字段来源与可验证约束投影（见 §3） | 演练 `boundary.label.opaque_token_*`；`ProjectionRuleTests`、`test_opaque_token_as_run_id_through_the_dify_http_entry` |
+| 8 | 不带前缀的令牌经 run ID 出现在报告 | 按字段来源投影（第 3 轮版规则，已被第 10 项取代） | 演练 `boundary.label.opaque_token_*`；`ProjectionRuleTests`、`test_opaque_token_as_run_id_through_the_dify_http_entry` |
 | 9 | 嵌套读快照吞掉真实错误 | 快照上下文只 `yield` 一次，只回滚自己开启的事务 | 演练 `boundary.snapshot.*`；`test_missing_task_keeps_the_original_error_through_the_nested_snapshot` |
+
+### 第 4 轮（sol 第四轮校验，`7517ef9`）
+
+| # | 缺陷 | 改动 | 新证据 |
+| --- | --- | --- | --- |
+| 10 | 带分隔符的 run ID、业务意图 ID、`sha256:` 前缀的原始输入被原样输出 | 第 3 轮的「结构化标识符保留」规则作废：外部字段与业务身份一律换成关联值，只有注册表能核实的名称保留；投影只做一次，同前缀的原始输入不被信任 | 演练 `trace.raw_not_visible`、`trace.two_reads_agree`、`boundary.label.digest_shaped_input_*`；`ProjectionRuleTests` |
+| 11 | 运行时采样原样输出 worker 标识 | `project_log_fields` 改用 `project_value` | 演练 `boundary.log.worker_label_*`；`test_worker_label_on_the_real_sampling_path_is_correlated` |
+
+第 3 轮留下的取舍（run ID 与业务身份是否一律换关联值）由 sol 在本轮裁定为一律换。
