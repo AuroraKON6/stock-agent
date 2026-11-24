@@ -679,37 +679,91 @@ Personal acknowledgement is a personal research acknowledgement, not institution
   });
   // ---- workbench overview bar (read-only projection of /api/v1/overview) ----
   var overviewBar = document.getElementById('overview');
+  // Last readable successful snapshot of /api/v1/overview. It is kept across
+  // failed refreshes so the region can tell empty / failed / stale apart.
+  var overviewSnapshot = null;  // {o, generatedAt, receivedAt}
+  var overviewSeq = 0;
+  function overviewIsEmpty(o) {
+    var counts = (o.tasks || {}).status_counts || {};
+    var total = Object.keys(counts).reduce(function(sum, key) { return sum + (Number(counts[key]) || 0); }, 0);
+    return !Object.keys((o.market || {}).quotes || {}).length &&
+      !((o.events || {}).eligible_count || 0) && !total && !((o.tasks || {}).awaiting_human || []).length;
+  }
+  function overviewClock(d) {
+    function two(n) { return (n < 10 ? '0' : '') + n; }
+    return two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
+  }
   function showOverview(o) {
     if (!o || typeof o !== 'object') return;
-    var engine = (o.engine || {}).event_intake_mode || '?';
-    var market = o.market || {};
-    var quotes = market.quotes || {};
-    var missing = market.quotes_missing || [];
-    var events = o.events || {};
-    var tasks = o.tasks || {};
-    var counts = tasks.status_counts || {};
-    var awaiting = tasks.awaiting_human || [];
-    var budget = o.budget || {};
-    function chip(html) { return '<span class="chip">' + html + '</span>'; }
+    overviewSnapshot = {
+      o: o,
+      generatedAt: typeof o.generated_at === 'string' ? o.generated_at : '',
+      receivedAt: new Date(),
+    };
+    renderOverview(overviewIsEmpty(o) ? 'empty' : 'fresh');
+  }
+  // region states: loading | fresh | empty | stale | failed
+  function renderOverview(state, detail) {
+    var snap = overviewSnapshot;
     var html = '';
-    html += chip('engine <b>' + esc(engine) + '</b>');
-    html += chip('quotes <b class="' + (missing.length && !Object.keys(quotes).length ? 'bad' : 'ok') + '">'
-      + Object.keys(quotes).length + '</b>' + (missing.length
-        ? ' / missing <b class="bad">' + esc(missing.length) + '</b>' : ''));
-    html += chip('events 24h <b>' + esc(events.eligible_count || 0) + '</b>');
-    html += chip('queued <b>' + esc(counts.queued || 0) + '</b>');
-    html += chip('awaiting human <b class="' + (awaiting.length ? 'bad' : 'ok') + '">'
-      + esc(awaiting.length) + '</b>');
-    html += chip('model calls today <b>' + esc(budget.calls_today || 0) + '</b>'
-      + (budget.enabled ? ' / limit ' + esc(budget.limit) : ' <span class="ok">(budget off)</span>'));
+    function chip(html) { return '<span class="chip">' + html + '</span>'; }
+    if (snap) {
+      var o = snap.o;
+      var engine = (o.engine || {}).event_intake_mode || '?';
+      var market = o.market || {};
+      var quotes = market.quotes || {};
+      var missing = market.quotes_missing || [];
+      var events = o.events || {};
+      var counts = (o.tasks || {}).status_counts || {};
+      var awaiting = (o.tasks || {}).awaiting_human || [];
+      var budget = o.budget || {};
+      var data = '';
+      data += chip('engine <b>' + esc(engine) + '</b>');
+      data += chip('quotes <b class="' + (missing.length && !Object.keys(quotes).length ? 'bad' : 'ok') + '">'
+        + Object.keys(quotes).length + '</b>' + (missing.length
+          ? ' / missing <b class="bad">' + esc(missing.length) + '</b>' : ''));
+      data += chip('events 24h <b>' + esc(events.eligible_count || 0) + '</b>');
+      data += chip('queued <b>' + esc(counts.queued || 0) + '</b>');
+      data += chip('awaiting human <b class="' + (awaiting.length ? 'bad' : 'ok') + '">'
+        + esc(awaiting.length) + '</b>');
+      data += chip('model calls today <b>' + esc(budget.calls_today || 0) + '</b>'
+        + (budget.enabled ? ' / limit ' + esc(budget.limit) : ' <span class="ok">(budget off)</span>'));
+      html += '<span data-ov-data>' + data + '</span>';
+    }
+    // The snapshot time is the server's own generated_at, shown verbatim.
+    var stamp = snap && snap.generatedAt
+      ? ' <time datetime="' + esc(snap.generatedAt) + '">' + esc(snap.generatedAt) + '</time>' : '';
+    var received = snap ? '（本页 ' + esc(overviewClock(snap.receivedAt)) + ' 收到）' : '';
+    var status = '';
+    var tone = '';
+    if (state === 'loading') status = '概览加载中…';
+    else if (state === 'fresh') status = '已加载' + stamp;
+    else if (state === 'empty') status = '已加载 · 暂无数据' + stamp;
+    else if (state === 'stale') { status = '已过期 · 刷新失败（' + esc(detail || '请求失败') + '）· 以下为旧数据，截至' + stamp + received; tone = 'bad'; }
+    else { status = '概览加载失败（' + esc(detail || '请求失败') + '）'; tone = 'bad'; }
+    html += chip('<span data-ov-status class="' + tone + '">' + status + '</span>');
     overviewBar.innerHTML = html;
+    overviewBar.setAttribute('data-state', state);
     overviewBar.hidden = false;
   }
   function fetchOverview() {
-    fetch('/api/v1/overview')
-      .then(function(r) { if (!r.ok) throw new Error('overview request failed'); return r.json(); })
-      .then(showOverview)
-      .catch(function() { /* overview stays hidden; the board itself still works */ });
+    // Only the newest request may settle the region.
+    var seq = ++overviewSeq;
+    if (!overviewSnapshot) renderOverview('loading');
+    return fetch('/api/v1/overview')
+      .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function(o) {
+        if (!o || typeof o !== 'object') throw new Error('bad payload');
+        if (seq === overviewSeq) showOverview(o);
+      })
+      .catch(function(err) {
+        // a failed refresh keeps the last readable snapshot, marked stale
+        if (seq !== overviewSeq) return;
+        var message = err && err.message;
+        var reason = message === 'bad payload' ? '响应无效'
+          : message && message.indexOf('HTTP ') === 0 ? message : '网络错误';
+        renderOverview(overviewSnapshot ? 'stale' : 'failed', reason);
+      });
   }
 
   // ---- todo section (what needs a human, from /api/v1/todo) ----
