@@ -20,6 +20,7 @@ from stock_agent.research_library import (
     build_library_index,
     search_library,
 )
+from stock_agent.personal_evidence import PERSONAL_ORIGIN_VIA
 from stock_agent.task_runtime import TaskStore
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -194,7 +195,10 @@ class RerunLinkageTests(R20TestCase):
 
         second = ensure_question_task(
             self.store, research_question="迭代研究", symbols=["600519"],
-            config=self.config, execution_mode="replay", new_research=True)
+            config=self.config, execution_mode="replay", new_research=True,
+            # namespace is read from the trusted ownership record: bind the
+            # personal entry's owner the way personal_workspace does.
+            input_owner_binding={"owner": "lead", "via": PERSONAL_ORIGIN_VIA})
         claimed = self.store.claim_next("w")
         run_research_task(self.store, second["task"]["task_id"], worker_id="w",
                           config=self.config)
@@ -206,6 +210,7 @@ class RerunLinkageTests(R20TestCase):
         by_prior = [e for e in index["entries"] if e.get("prior_task_id") == first_id]
         self.assertEqual(len(by_prior), 1, "the company timeline links versions")
         self.assertEqual(by_prior[0]["namespace"], "personal")
+        self.assertEqual(by_prior[0]["owner"], "lead")
 
 
 if __name__ == "__main__":

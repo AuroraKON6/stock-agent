@@ -7,7 +7,21 @@ const net = require('net');
 const assert = require('assert/strict');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const root = path.resolve(__dirname, '..');
-const python = path.join(root, '.venv312', 'Scripts', 'python.exe');
+// Locked Python 3.12: the project venv (Windows or POSIX layout) when
+// present, else an explicit STOCK_AGENT_PYTHON, else python3.12 on PATH.
+const python = (() => {
+  const candidates = [
+    path.join(root, '.venv312', 'Scripts', 'python.exe'),
+    path.join(root, '.venv312', 'bin', 'python'),
+    process.env.STOCK_AGENT_PYTHON,
+    'python3.12',
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (!candidate.includes(path.sep)) return candidate; // bare name: PATH resolves it
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  throw new Error('no locked Python 3.12 interpreter found');
+})();
 const bootstrap = "import sys,runpy; from pathlib import Path; sys.path.insert(0,sys.argv.pop(1)); from scripts.run_isolated_tests import install_guard; import stock_agent.config as c; install_guard(c.PROJECT_ROOT); c.PROJECT_ROOT=Path(sys.argv.pop(1)); runpy.run_module('stock_agent',run_name='__main__')";
 
 async function interruptibleProxy(port) {

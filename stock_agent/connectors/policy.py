@@ -5,7 +5,9 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import urlsplit
@@ -18,17 +20,116 @@ MANIFEST_FIELDS = {
     "token_audience", "revoked", "expires_at",
 }
 _AUDIENCE_RE = re.compile(r"^[a-z0-9][a-z0-9._:/-]{3,128}$")
+# A82: these keys are caller credentials wherever they appear — headers or
+# (recursively) tool arguments. A connector authenticates as ITSELF; a caller
+# credential must never ride the connector.
+CALLER_CREDENTIAL_KEYS = frozenset({
+    "authorization", "x-api-key", "cookie", "proxy-authorization",
+    "api-key", "x-auth-token",
+})
 
 
 class PolicyViolation(ValueError):
     """reasons: malformed_manifest, unknown_connector, tool_not_configured,
     connector_revoked, caller_token_forbidden, unsafe_destination,
-    redirect_refused, endpoint_not_pinned"""
+    unsafe_path, redirect_refused, endpoint_not_pinned,
+    credential_not_bound, credential_audience_mismatch, credential_expired,
+    credential_destination_mismatch"""
 
 
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise PolicyViolation("malformed_manifest: {0}".format(message))
+
+
+def _origin(url: str) -> str:
+    parts = urlsplit(str(url or ""))
+    return "{0}://{1}".format(parts.scheme, parts.netloc)
+
+
+def _parse_expiry(value: str) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PolicyViolation(
+            "credential_not_bound: unparseable expires_at {0!r}".format(text)) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+@dataclass(frozen=True)
+class ConnectorCredential:
+    """A82: the connector's OWN credential, bound by trusted config to one
+    connector id, one audience and one approved destination origin. Never
+    caller-supplied. ``token`` is redacted from repr so it cannot leak into
+    logs. ``destination`` is an independent binding from the policy document:
+    swapping the policy endpoint cannot make an old credential usable."""
+
+    connector_id: str
+    audience: str
+    token: str = field(repr=False)
+    destination: str = ""
+    expires_at: str = ""
+
+    def __repr__(self) -> str:
+        return ("ConnectorCredential(connector_id={0!r}, audience={1!r}, "
+                "token=<redacted>, destination={2!r}, expires_at={3!r})").format(
+                    self.connector_id, self.audience, self.destination,
+                    self.expires_at)
+
+
+def bind_connector_credential(policy: "ConnectorPolicy",
+                              credential: Any,
+                              destination: str = "") -> Dict[str, str]:
+    """A82: adjudicate the connector identity BEFORE any bytes move. The
+    credential must be the trusted-config credential for THIS connector and
+    THIS audience, unexpired, and bound to the approved destination given for
+    this request. Returns the presentation handed to the transport adapter."""
+    if not isinstance(credential, ConnectorCredential):
+        raise PolicyViolation(
+            "credential_not_bound: connector identity missing or not a "
+            "trusted-config ConnectorCredential")
+    if not str(credential.token or "").strip():
+        raise PolicyViolation("credential_not_bound: empty connector token")
+    if str(credential.connector_id or "") != policy.connector_id:
+        raise PolicyViolation(
+            "credential_not_bound: credential is for {0!r}, connector is {1!r}".format(
+                credential.connector_id, policy.connector_id))
+    if str(credential.audience or "") != str(policy.token_audience or ""):
+        raise PolicyViolation(
+            "credential_audience_mismatch: credential audience {0!r} != policy "
+            "token_audience {1!r}".format(credential.audience, policy.token_audience))
+    expiry = _parse_expiry(credential.expires_at)
+    if expiry is not None and expiry <= datetime.now(timezone.utc):
+        raise PolicyViolation(
+            "credential_expired: connector credential expired at {0}".format(
+                credential.expires_at))
+    if destination:
+        approved = str(credential.destination or "").strip()
+        if not approved:
+            raise PolicyViolation(
+                "credential_destination_mismatch: credential has no approved "
+                "destination binding")
+        if _origin(approved) != _origin(destination):
+            raise PolicyViolation(
+                "credential_destination_mismatch: credential approved for {0}, "
+                "request goes to {1}".format(_origin(approved), _origin(destination)))
+        if _origin(destination) != _origin(policy.endpoint):
+            raise PolicyViolation(
+                "credential_destination_mismatch: request destination {0} is not "
+                "the policy endpoint {1}".format(
+                    _origin(destination), _origin(policy.endpoint)))
+    return {
+        "connector_id": policy.connector_id,
+        "audience": str(policy.token_audience or ""),
+        "destination": _origin(destination) if destination else "",
+        "authorization": "Bearer {0}".format(credential.token),
+    }
+
 
 
 @dataclass(frozen=True)
@@ -106,9 +207,25 @@ class ConnectorPolicy:
         recorded audience); a caller-supplied Authorization/token is a
         programming error we refuse, not a header we forward."""
         keys = {str(k).lower() for k in (supplied or {})}
-        if keys & {"authorization", "x-api-key", "cookie", "proxy-authorization"}:
+        if keys & CALLER_CREDENTIAL_KEYS:
             raise PolicyViolation(
                 "caller_token_forbidden: connectors never forward caller credentials")
+
+    def forbid_caller_tokens_deep(self, value: Any, path: str = "arguments") -> None:
+        """A82: the args boundary. A caller credential hidden anywhere in the
+        tool arguments (nested object/list) is refused before anything is
+        sent — the same rule as the header boundary."""
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if str(key).strip().lower() in CALLER_CREDENTIAL_KEYS:
+                    raise PolicyViolation(
+                        "caller_token_forbidden: caller credential key {0!r} at "
+                        "{1}; connectors never forward caller credentials".format(
+                            key, path))
+                self.forbid_caller_tokens_deep(item, "{0}.{1}".format(path, key))
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                self.forbid_caller_tokens_deep(item, "{0}[{1}]".format(path, index))
 
 
 def load_connector_registry(path: Path) -> Dict[str, ConnectorPolicy]:
@@ -129,6 +246,48 @@ def load_connector_registry(path: Path) -> Dict[str, ConnectorPolicy]:
                 "malformed_manifest: duplicate connector_id {0}".format(policy.connector_id))
         registry[policy.connector_id] = policy
     return registry
+
+
+class ConnectorRegistry:
+    """A81: a live registry. Clients hold ``registry.provider(id)`` instead of
+    a frozen policy snapshot, so a manifest reload or an explicit revocation
+    takes effect on the SAME live client instance — visibility and calls
+    stop immediately, not after the client is rebuilt."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._policies: Dict[str, ConnectorPolicy] = {}
+        self.reload()
+
+    def reload(self) -> Dict[str, ConnectorPolicy]:
+        policies = load_connector_registry(self.path)
+        with self._lock:
+            self._policies = policies
+        return policies
+
+    def provider(self, connector_id: str) -> Callable[[], ConnectorPolicy]:
+        return lambda: self.policy(connector_id)
+
+    def policy(self, connector_id: str) -> ConnectorPolicy:
+        with self._lock:
+            policy = self._policies.get(connector_id)
+        if policy is None:
+            raise PolicyViolation("unknown_connector: {0}".format(connector_id))
+        return policy
+
+    def revoke(self, connector_id: str) -> ConnectorPolicy:
+        """A81: revocation without a file round-trip; the next lookup on an
+        existing client sees it."""
+        with self._lock:
+            current = self._policies.get(connector_id)
+            if current is None:
+                raise PolicyViolation("unknown_connector: {0}".format(connector_id))
+            revoked = replace(current, revoked=True)
+            next_policies = dict(self._policies)
+            next_policies[connector_id] = revoked
+            self._policies = next_policies
+        return revoked
 
 
 def resolve_endpoint_addresses(policy: ConnectorPolicy,

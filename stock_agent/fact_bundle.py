@@ -52,7 +52,9 @@ def _digest(value: Any) -> str:
 def build_research_fact_bundle(config: Dict[str, Any], task: Dict[str, Any], *,
                                fact_selectors: Optional[List[Dict[str, Any]]] = None,
                                extra_facts: Optional[List[Dict[str, Any]]] = None,
-                               now: Optional[str] = None) -> Dict[str, Any]:
+                               now: Optional[str] = None,
+                               evidence_views: Optional[List[Dict[str, Any]]] = None,
+                               association_signal_ids: Optional[Any] = None) -> Dict[str, Any]:
     """Freeze the deliverable fact set for ONE research attempt.
 
     ``fact_selectors``: excerpt selectors (R12a) whose excerpt text becomes
@@ -60,6 +62,15 @@ def build_research_fact_bundle(config: Dict[str, Any], task: Dict[str, Any], *,
     ``extra_facts``: fact records that may carry a ``source_id`` (a
     source-registry id) for host-side egress rights; their content is only
     delivered when the registry's CURRENT external-send right allows it.
+    ``evidence_views``: trusted config views to resolve the selectors in —
+    the base vault plus, when the task's recorded owner owns one, that
+    owner's personal namespace (research_worker computes them; the default
+    keeps single-vault behavior for direct callers).
+    ``association_signal_ids``: when provided, an excerpt whose source
+    document carries none of these task-bound signals is excluded with
+    ``not_associated_with_task`` — the SAME rule the safe-context assembly
+    applies to evidence summaries, so a fact can never ride the request
+    while its source document is honestly reported as not delivered.
     """
     task_id = str(task.get("task_id") or "")
     input_version = int(task.get("input_version") or 1)
@@ -67,8 +78,8 @@ def build_research_fact_bundle(config: Dict[str, Any], task: Dict[str, Any], *,
     records = list(extra_facts or [])[:MAX_BUNDLE_FACTS]
     if not selectors and not records:
         raise FactBundleError("a fact bundle needs at least one fact source")
-
-    verified = verified_evidence_documents(config)
+    views = list(evidence_views) if evidence_views else [config]
+    projections = [(view, verified_evidence_documents(view)) for view in views]
     registry = load_source_registry(config)
     evidence_seen: Dict[str, str] = {}
     delivered: List[Dict[str, Any]] = []
@@ -76,20 +87,37 @@ def build_research_fact_bundle(config: Dict[str, Any], task: Dict[str, Any], *,
 
     for selector in selectors:
         label = str(selector.get("document_id") or "unknown-document")
-        try:
-            excerpt = verify_excerpt_selection(config, selector)
-        except EvidenceExcerptError as exc:
+        excerpt = None
+        document = None
+        detail = ""
+        for view, documents in projections:
+            try:
+                excerpt = verify_excerpt_selection(view, selector)
+            except EvidenceExcerptError as exc:
+                detail = str(exc)
+                excerpt = None
+                continue
+            document = documents.get(str(excerpt["document_sha256"]))
+            break
+        if excerpt is None:
             excluded.append({"source": "excerpt", "ref": label,
                              "reason": "source_not_verified",
-                             "detail": str(exc)[:300]})
+                             "detail": detail[:300] or "no trusted namespace verifies this selector"})
             continue
-        sha = str(excerpt["document_sha256"])
-        document = verified.get(sha)
         if document is None:
             excluded.append({"source": "excerpt", "ref": label,
                              "reason": "source_not_verified",
                              "detail": "document not in the current verified projection"})
             continue
+        if association_signal_ids is not None:
+            document_signals = {str(item) for item in (document.get("signal_ids") or [])}
+            if not (document_signals & {str(item) for item in association_signal_ids}):
+                excluded.append({"source": "excerpt", "ref": label,
+                                 "reason": "not_associated_with_task",
+                                 "detail": "source document carries none of the task's bound signals "
+                                           "(same rule as evidence summaries)"})
+                continue
+        sha = str(excerpt["document_sha256"])
         evidence_seen[sha] = str(document.get("document_id") or label)
         delivered.append({
             "kind": "excerpt_statement",

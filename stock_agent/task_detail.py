@@ -13,9 +13,44 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from .models import now_iso
+from .research_library import report_identity
 
 DETAIL_SCHEMA_VERSION = "1.0"
 SCOPE_NOTE = "personal_research_only_not_institutional"
+
+
+def _input_version_history(store: Any, task_id: str) -> list:
+    """Per-version readable history (A67) from the immutable snapshot chain:
+    the follow-up note the user typed and the documents that version
+    selected travel WITH the version, never re-derived from elsewhere."""
+    history = []
+    for item in (store.input_snapshots(task_id) if hasattr(store, "input_snapshots") else []):
+        payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+        context = payload.get("public_context") if isinstance(payload.get("public_context"), dict) else {}
+        summaries = context.get("evidence_summaries") if isinstance(context.get("evidence_summaries"), dict) else {}
+        history.append({
+            "input_version": int(item.get("input_version") or 0),
+            "reason": str(item.get("reason") or ""),
+            "created_at": str(item.get("created_at") or ""),
+            "created_by": str(item.get("created_by") or ""),
+            "followup_note": str(payload.get("extra_note") or ""),
+            "question": str(payload.get("research_question") or "")[:300],
+            "evidence_documents": sorted(str(key) for key in summaries),
+        })
+    return history
+
+
+def _fact_bundle_summary(bundle: Any) -> Optional[Dict[str, Any]]:
+    """Case-view projection of the attempt's fact bundle: identities and the
+    exclusion reasons — never the fact contents themselves."""
+    if not isinstance(bundle, dict):
+        return None
+    return {
+        "bundle_id": str(bundle.get("bundle_id") or ""),
+        "input_version": bundle.get("input_version"),
+        "delivered_facts": [str(fact.get("fact_key") or "") for fact in bundle.get("facts") or []],
+        "excluded": list(bundle.get("excluded") or []),
+    }
 
 
 def task_detail(store: Any, task_id: str, *, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -85,6 +120,12 @@ def task_detail(store: Any, task_id: str, *, config: Optional[Dict[str, Any]] = 
         "is_replay": str(task.get("execution_mode") or "live") == "replay",
         "input_version": int(task.get("input_version") or 1),
         "row_version": int(task.get("version") or 1),
+        # R20: the report's own version — the case, the input version that
+        # produced it (input_version above), the payload schema it conforms
+        # to, and a digest of the report body. Later additions to the output
+        # (quality verdict, personal sign-off) and row bumps leave it
+        # unchanged.
+        "report_version": report_identity(output, task["task_id"], task.get("input_version")),
         "attempt_count": int(task.get("attempt_count") or 0),
         "max_attempts": int(task.get("max_attempts") or 0),
         "cancel_requested": bool(task.get("cancel_requested")),
@@ -108,6 +149,11 @@ def task_detail(store: Any, task_id: str, *, config: Optional[Dict[str, Any]] = 
             "prompt_version": str(model_call.get("prompt_version") or ""),
             "error": str(model_call.get("error") or ""),
             "governance": model_call.get("governance") if isinstance(model_call.get("governance"), dict) else {},
+            # R13/R15: the attempt's frozen fact bundle, summarized for the
+            # case view — what delivered, and every exclusion with its
+            # reason, so a fact not delivered shows the SAME story here as
+            # in the request and the bundle audit.
+            "fact_bundle": _fact_bundle_summary(model_call.get("fact_bundle")),
             # R06: the quality verdict that gate-checked this run, plus the
             # preserved draft when completion was refused for uncited specific
             # claims (the task sits blocked with the gap draft readable here).
@@ -117,6 +163,11 @@ def task_detail(store: Any, task_id: str, *, config: Optional[Dict[str, Any]] = 
         "output": output,
         "output_quality": output.get("quality") if isinstance(output.get("quality"), dict) else {},
         "personal_acknowledgement": acknowledgement,
+        # A67 (readable history): the immutable per-version input chain from
+        # the store — version, reason, timestamp, the follow-up note the user
+        # actually typed, and the documents that version selected, so the
+        # case can be re-opened and the feedback read back verbatim.
+        "input_versions": _input_version_history(store, task_id),
         "pending_human_questions": questions,
         "last_error": str(task.get("last_error") or ""),
     }

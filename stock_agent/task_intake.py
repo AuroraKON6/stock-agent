@@ -150,6 +150,8 @@ def ensure_question_task(
     intent_id: str = "",
     new_research: bool = False,
     as_of: str = "",
+    spec_overrides: Optional[Dict[str, Any]] = None,
+    input_owner_binding: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Create a question task with explicit retry/new-research semantics (R01).
 
@@ -211,6 +213,24 @@ def ensure_question_task(
         idempotency_key = "question_intent::{0}".format(business_intent_id)
     else:
         idempotency_key = question_key
+    # Caller-owned spec enrichment (R14 A93/A90): applied INSIDE the same
+    # create transaction, so the task is born claimable with its COMPLETE
+    # input — a worker's first claim can never observe a half-finished
+    # payload that a later version bump was meant to complete. Dicts merge
+    # DEEP, per key at every level, and anything else replaces: caller
+    # selections ADD to what the pipeline already gathered (a selected
+    # personal document joins the signal-bound summaries instead of
+    # replacing them). Applied after the branch bookkeeping above so callers
+    # can refine origin fields.
+    if spec_overrides:
+        def _deep_merge(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+            for key, value in extra.items():
+                if isinstance(value, dict) and isinstance(base.get(key), dict):
+                    _deep_merge(base[key], value)
+                else:
+                    base[key] = value
+            return base
+        _deep_merge(spec, spec_overrides)
     task, status = store.create_task(
         title="用户问题：{0}".format(question)[:MAX_TITLE_CHARS],
         input_payload=spec,
@@ -218,6 +238,10 @@ def ensure_question_task(
         actor=actor,
         idempotency_key=idempotency_key,
         business_intent_id=business_intent_id,
+        # R15: server-side ownership record — only the calling CODE PATH can
+        # supply it (the personal workspace entry binds its session-verified
+        # principal); the payload/spec above can never write this row.
+        input_owner_binding=input_owner_binding,
     )
     return {
         "task": task,

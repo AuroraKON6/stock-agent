@@ -27,6 +27,7 @@ from .agent_protocol import (
     validate_model_output,
 )
 from .config import project_path
+from .fact_bundle import FactBundleError
 from .invocation_runtime import (
     ModelCallNotSent,
     ModelKnownFailure,
@@ -46,7 +47,7 @@ from .task_runtime import (
 )
 
 WORKER_SCHEMA_VERSION = "1.0"
-RESEARCH_PROMPT_VERSION = "research_note_v3_rounds"
+RESEARCH_PROMPT_VERSION = "research_note_v3_rounds_citation_contract"
 # Plan budget suggestion (section 4.2): W10 single case, at most 4 model
 # attempts including schema-repair retries; every intermediate round is one
 # attempt, so the cap bounds the whole run, not just the final answer.
@@ -66,7 +67,12 @@ _SYSTEM_PROMPT = (
     "Required JSON fields: schema_version (\"1.0\"), task_id, summary (<=4000 chars), "
     "key_findings (list of strings, each tied to evidence), unknowns (list of strings "
     "for what the context does not establish), evidence_refs (list of context evidence "
-    "ids you relied on; cite ONLY ids present in the context), human_questions (list of "
+    "ids you relied on; evidence_refs accepts ONLY the ids listed in "
+    "citation_contract.allowed_evidence_refs of the user message — the keys of "
+    "public_context.evidence_summaries; never a sha256 hash, a verified_facts "
+    "fact_key, an excerpt id, a quote symbol, or any id you remember from an "
+    "earlier task; when that list is empty return evidence_refs as an empty "
+    "list), human_questions (list of "
     "{question, why_needed, options}) for decisions or evidence only a human can "
     "provide, model_self_assessed_confidence (0-1, self-assessed, not a probability of "
     "being right), and optionally requested_intents (list of intents for approved "
@@ -192,7 +198,8 @@ def _quote_governance_verdicts(quotes: Dict[str, Any], config: Dict[str, Any], n
     return verdicts
 
 
-def build_safe_research_context(payload: Dict[str, Any], config: Optional[Dict[str, Any]] = None, *, now=None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def build_safe_research_context(payload: Dict[str, Any], config: Optional[Dict[str, Any]] = None, *,
+                                now=None, evidence_views: Optional[list] = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Build the research-task-specific minimized context for external egress.
 
     Facts are verified by the SAME authorities the pipelines use: quotes must
@@ -201,15 +208,33 @@ def build_safe_research_context(payload: Dict[str, Any], config: Optional[Dict[s
     missing/tampered object). The delivery record states exactly what reached
     the model so an empty context can never masquerade as an evidence-based
     analysis.
-    """
 
+    ``evidence_views``: the task's trusted namespace views (base vault plus
+    the recorded input owner's personal namespace) — a personal document
+    verifies against its owner's vault without any hand-passed config."""
     context = payload.get("public_context") if isinstance(payload.get("public_context"), dict) else {}
     quotes = context.get("quote_snapshots") if isinstance(context.get("quote_snapshots"), dict) else {}
     evidence = context.get("evidence_summaries") if isinstance(context.get("evidence_summaries"), dict) else {}
     verdicts = _quote_governance_verdicts(quotes, config or {}, now=now)
     from .evidence_context import verified_evidence_documents
 
-    retained_documents = verified_evidence_documents(config)
+    # Retained documents across the task's trusted namespaces; the first
+    # namespace (institutional) wins on shadowing — admission outranks
+    # personal retention for the same content.
+    retained_documents: Dict[str, Dict[str, Any]] = {}
+    view_by_document: Dict[str, Dict[str, Any]] = {}
+    namespace_by_document: Dict[str, str] = {}
+    for position, view in enumerate(evidence_views if evidence_views is not None else [config or {}]):
+        for sha, document in verified_evidence_documents(view).items():
+            if sha in retained_documents:
+                continue
+            retained_documents[sha] = document
+            document_id = str(document.get("document_id") or "")
+            view_by_document[document_id] = view
+            # R20: the namespace that AUTHORIZED this document at delivery
+            # time is part of the report's record — a later copy of the same
+            # bytes in another vault never rewrites which one the report cites.
+            namespace_by_document[document_id] = "personal" if position else "shared"
     safe_quotes: Dict[str, Any] = {}
     dropped_quotes: list = []
     for symbol, snapshot in quotes.items():
@@ -267,7 +292,9 @@ def build_safe_research_context(payload: Dict[str, Any], config: Optional[Dict[s
             from .evidence_excerpts import EvidenceExcerptError, verify_excerpt_selection
 
             try:
-                excerpt = verify_excerpt_selection(config or {}, item["source_selection"])
+                excerpt = verify_excerpt_selection(
+                    view_by_document.get(str(ref)) or (config or {}),
+                    item["source_selection"])
                 if excerpt["document_id"] != ref:
                     raise EvidenceExcerptError("excerpt belongs to another document")
             except EvidenceExcerptError:
@@ -306,6 +333,8 @@ def build_safe_research_context(payload: Dict[str, Any], config: Optional[Dict[s
         "delivered_quotes": sorted(safe_quotes.keys()),
         "dropped_quotes": sorted(dropped_quotes),
         "delivered_evidence": sorted(safe_evidence.keys()),
+        "evidence_namespaces": {ref: namespace_by_document.get(ref, "unrecorded")
+                                for ref in sorted(safe_evidence.keys())},
         "dropped_evidence": sorted(dropped_evidence),
         "outbound_sha256": hashlib.sha256(
             json.dumps(safe_context, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -345,6 +374,42 @@ def govern_egress(task: Dict[str, Any], config: Dict[str, Any]) -> Tuple[bool, s
     return True, "", {"gate": "llm_governance", "decision": "approved"}, safe
 
 
+def allowed_evidence_refs(safe_context: Dict[str, Any]) -> list:
+    """The ONLY ids a report may cite: the documents delivered in THIS
+    request's ``public_context.evidence_summaries``. Both the citation
+    contract written into the prompt and the two ``validate_model_output``
+    calls read this one function, so the advertised set and the enforced set
+    cannot drift apart."""
+
+    return sorted((safe_context.get("evidence_summaries") or {}).keys())
+
+
+def build_citation_contract(safe_context: Dict[str, Any]) -> Dict[str, Any]:
+    """Tell the model, per request, which originals it may cite.
+
+    Derived solely from the round's own context: nothing case-specific lives
+    here. Each delivered fact points at its source document's citable id, so
+    a fact is cited through the document rather than through its own key."""
+
+    evidence = safe_context.get("evidence_summaries") or {}
+    document_by_sha = {str(item.get("sha256") or ""): str(ref) for ref, item in evidence.items()}
+    fact_citations = [
+        {"fact_key": str(fact.get("fact_key") or ""),
+         "evidence_ref": document_by_sha[str(fact.get("document_sha256") or "")]}
+        for fact in (safe_context.get("verified_facts") or [])
+        if isinstance(fact, dict) and document_by_sha.get(str(fact.get("document_sha256") or ""))]
+    return {
+        "allowed_evidence_refs": allowed_evidence_refs(safe_context),
+        "rule": ("evidence_refs must be a subset of allowed_evidence_refs: copy ids "
+                 "character for character, do not shorten, reformat or invent them. "
+                 "Values appearing elsewhere in the context (sha256, fact_key, "
+                 "excerpt ids, quote symbols) are not citable evidence ids. "
+                 "Cite a verified_fact through its evidence_ref from fact_citations. "
+                 "If allowed_evidence_refs is empty, return evidence_refs as []."),
+        "fact_citations": fact_citations,
+    }
+
+
 def build_user_prompt(task: Dict[str, Any], safe_payload: Dict[str, Any], safe_context: Dict[str, Any],
                       prior_rounds: Optional[list] = None) -> str:
     prompt = {
@@ -352,11 +417,86 @@ def build_user_prompt(task: Dict[str, Any], safe_payload: Dict[str, Any], safe_c
         "task_id": task["task_id"],
         "input_version": task["input_version"],
         "research_question": str(safe_payload.get("summary") or (task.get("input_payload") or {}).get("research_question") or ""),
+        "citation_contract": build_citation_contract(safe_context),
         "public_context": safe_context,
     }
     if prior_rounds:
         prompt["prior_rounds"] = prior_rounds
     return json.dumps(prompt, ensure_ascii=False, default=str)
+
+
+def _task_input_owner(store: TaskStore, task_id: str) -> str:
+    """Trusted owner of the task's input, ONLY for tasks the personal entry
+    created: the SERVER-SIDE binding row the entry wrote inside the create
+    transaction (the session-verified principal, bound by calling-code
+    authority). The v1 snapshot proves payload content stayed unchanged —
+    never that an origin field was issued by the personal session, which is
+    exactly why ownership lives in a record business input cannot write.
+    Normal/pipeline/historical tasks have no binding → shared view only."""
+    from .personal_evidence import PERSONAL_ORIGIN_VIA
+
+    binding = store.input_owner_binding(task_id)
+    if binding and str(binding.get("via") or "") == PERSONAL_ORIGIN_VIA:
+        return str(binding.get("owner") or "").strip()
+    return ""
+
+
+def freeze_approved_fact_bundle(task: Dict[str, Any], config: Dict[str, Any],
+                                safe_context: Dict[str, Any],
+                                delivery: Dict[str, Any],
+                                evidence_views: Optional[list] = None) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+    """R13: freeze the attempt's fact bundle over an ASSEMBLED safe context.
+
+    Payload-declared facts with no host-policy basis and registry-denied
+    sources are excluded with recorded reasons (A60/A61); only still-
+    deliverable bundle facts enter the minimized model context. The bundle
+    records the EXACT outbound payload hash (A63) with the SAME canonical
+    digest the delivery record shows. Returns the (possibly extended)
+    context, the (possibly extended) delivery record, and the bound bundle
+    (None when the payload declares no facts). Every caller re-runs this
+    over the CURRENT payload/context — a rebuild that forgets it would let
+    the delivery record claim facts a later round never carried.
+
+    ``evidence_views``: the task's trusted namespace views for selector
+    verification. The excerpt's source document must ALSO pass the same
+    task-association rule the safe-context assembly applies to evidence
+    summaries — a fact never rides the request while its source document is
+    honestly reported as not delivered."""
+    payload = task.get("input_payload") or {}
+    payload_facts = payload.get("approved_facts") or []
+    fact_selectors = [item for item in payload_facts
+                      if isinstance(item, dict) and "excerpt_sha256" in item]
+    fact_records = [item for item in payload_facts
+                    if isinstance(item, dict) and "excerpt_sha256" not in item]
+    if not fact_selectors and not fact_records:
+        return safe_context, delivery, None
+    from .fact_bundle import bind_outbound_payload, build_research_fact_bundle, payload_digest
+    from .task_supply import load_research_signals
+
+    symbols = payload.get("symbols")
+    if symbols is not None and (not isinstance(symbols, list) or any(not isinstance(s, str) for s in symbols)):
+        symbols = []
+    bound_signals, _binding = load_research_signals(
+        config, symbols=symbols, signal_ids=payload.get("bound_signal_ids") or [],
+        lookback_hours=payload.get("signal_lookback_hours"))
+    bundle = build_research_fact_bundle(
+        config, task, fact_selectors=fact_selectors,
+        extra_facts=fact_records, evidence_views=evidence_views,
+        association_signal_ids={item["signal_id"] for item in bound_signals})
+    # Only STILL-DELIVERABLE bundle facts enter the minimized model context;
+    # exclusions live in the audit, never in the prompt.
+    delivered_facts = [dict(fact, content=str(fact.get("content") or "")[:1000])
+                       for fact in bundle.get("facts") or []]
+    if delivered_facts:
+        safe_context = dict(safe_context)
+        safe_context["verified_facts"] = delivered_facts
+    # A63: bind the payload hash AFTER the final context is assembled, with
+    # the SAME canonical digest the delivery record shows.
+    outbound_hash = payload_digest(safe_context)
+    bundle = bind_outbound_payload(bundle, safe_context)
+    delivery = dict(delivery, fact_bundle_id=bundle["bundle_id"],
+                    outbound_sha256=outbound_hash)
+    return safe_context, delivery, bundle
 
 
 def run_research_task(
@@ -413,6 +553,15 @@ def run_research_task(
         system_prompt += "\n\nRole instructions:\n" + role_text
     store.mark_running(task_id, worker_id=worker_id, fencing_token=task["fencing_token"], expected_version=task["version"])
     task = store.get_task(task_id)
+    # The task's trusted evidence namespaces: the base vault plus the input
+    # owner's personal namespace when one exists. The owner comes from the
+    # store's own v1 snapshot record — never from the payload — so shared
+    # sources keep verifying while personal evidence resolves WITHOUT a
+    # hand-passed config (the production claim path passes only the app
+    # config).
+    from .personal_evidence import task_evidence_views
+
+    evidence_views = task_evidence_views(config, _task_input_owner(store, task_id))
     started = time.perf_counter()
 
     model_call: Dict[str, Any] = {
@@ -598,7 +747,8 @@ def run_research_task(
     allowed, reason, governance, safe_payload = govern_egress(task, config)
     if not allowed:
         return _blocked(reason, governance)
-    safe_context, delivery = build_safe_research_context(task.get("input_payload") or {}, config=config)
+    safe_context, delivery = build_safe_research_context(task.get("input_payload") or {}, config=config,
+                                                          evidence_views=evidence_views)
     model_call["context_delivery"] = delivery
     model_call["outbound_context"] = safe_context
     # R13: freeze the attempt's fact bundle and bind the EXACT outbound
@@ -607,33 +757,12 @@ def run_research_task(
     # registry-denied sources are excluded here with recorded reasons
     # (A60/A61); the bundle snapshot rides the model_call audit.
     try:
-        from .fact_bundle import (FactBundleError, bind_outbound_payload,
-                                  build_research_fact_bundle, payload_digest)
-
-        payload_facts = (task.get("input_payload") or {}).get("approved_facts") or []
-        fact_selectors = [item for item in payload_facts
-                          if isinstance(item, dict) and "excerpt_sha256" in item]
-        fact_records = [item for item in payload_facts
-                        if isinstance(item, dict) and "excerpt_sha256" not in item]
-        if fact_selectors or fact_records:
-            bundle = build_research_fact_bundle(
-                config, task, fact_selectors=fact_selectors,
-                extra_facts=fact_records)
-            # Only STILL-DELIVERABLE bundle facts enter the minimized model
-            # context; exclusions live in the audit, never in the prompt.
-            delivered_facts = [dict(fact, content=str(fact.get("content") or "")[:1000])
-                               for fact in bundle.get("facts") or []]
-            if delivered_facts:
-                safe_context = dict(safe_context)
-                safe_context["verified_facts"] = delivered_facts
-            # A63: bind the payload hash AFTER the final context is assembled,
-            # with the SAME canonical digest the delivery record shows.
-            model_call["outbound_context"] = safe_context
-            outbound_hash = payload_digest(safe_context)
-            model_call["fact_bundle"] = bind_outbound_payload(bundle, safe_context)
-            model_call["context_delivery"] = dict(
-                delivery, fact_bundle_id=bundle["bundle_id"],
-                outbound_sha256=outbound_hash)
+        safe_context, delivery, bundle = freeze_approved_fact_bundle(
+            task, config, safe_context, delivery, evidence_views=evidence_views)
+        model_call["context_delivery"] = delivery
+        model_call["outbound_context"] = safe_context
+        if bundle is not None:
+            model_call["fact_bundle"] = bundle
     except FactBundleError as exc:
         model_call["fact_bundle_error"] = str(exc)[:300]
 
@@ -682,7 +811,19 @@ def run_research_task(
                 allowed, reason, governance, safe_payload = govern_egress(task, config)
                 if not allowed:
                     return _blocked(reason, governance)
-                safe_context, delivery = build_safe_research_context(task.get("input_payload") or {}, config=config)
+                safe_context, delivery = build_safe_research_context(task.get("input_payload") or {}, config=config,
+                                                                      evidence_views=evidence_views)
+                # The fact bundle re-freezes per round (A62: selectors
+                # re-verify against the CURRENT vault), so a later round's
+                # prompt carries the same approved facts — a rebuild without
+                # this would silently drop them after round one.
+                try:
+                    safe_context, delivery, bundle = freeze_approved_fact_bundle(
+                        task, config, safe_context, delivery, evidence_views=evidence_views)
+                    if bundle is not None:
+                        model_call["fact_bundle"] = bundle
+                except FactBundleError as exc:
+                    model_call["fact_bundle_error"] = str(exc)[:300]
                 model_call["context_delivery"] = delivery
                 model_call["outbound_context"] = safe_context
 
@@ -754,7 +895,7 @@ def run_research_task(
             try:
                 parsed = _parse_llm_json(raw_text)
                 output = parsed[0] if isinstance(parsed, list) and parsed else parsed
-                allowed_refs = sorted(safe_context.get("evidence_summaries", {}).keys())
+                allowed_refs = allowed_evidence_refs(safe_context)
                 output = validate_model_output(output, allowed_evidence_refs=allowed_refs)
                 claimed_task_id = str(output.get("task_id") or task_id)
                 if claimed_task_id != task_id:
@@ -814,8 +955,21 @@ def run_research_task(
         try:
             parsed = _parse_llm_json(raw_text)
             output = parsed[0] if isinstance(parsed, list) and parsed else parsed
-            safe_context, _delivery = build_safe_research_context(task.get("input_payload") or {}, config=config)
-            allowed_refs = sorted(safe_context.get("evidence_summaries", {}).keys())
+            safe_context, delivery = build_safe_research_context(task.get("input_payload") or {}, config=config,
+                                                                  evidence_views=evidence_views)
+            # The re-verified context must include the SAME frozen facts the
+            # delivery record reports, or the quality gate below would judge
+            # the report against a context that dropped them.
+            try:
+                safe_context, delivery, bundle = freeze_approved_fact_bundle(
+                    task, config, safe_context, delivery, evidence_views=evidence_views)
+                model_call["context_delivery"] = delivery
+                model_call["outbound_context"] = safe_context
+                if bundle is not None:
+                    model_call["fact_bundle"] = bundle
+            except FactBundleError as exc:
+                model_call["fact_bundle_error"] = str(exc)[:300]
+            allowed_refs = allowed_evidence_refs(safe_context)
             output = validate_model_output(output, allowed_evidence_refs=allowed_refs)
             claimed_task_id = str(output.get("task_id") or task_id)
             if claimed_task_id != task_id and claimed_task_id != "placeholder":
