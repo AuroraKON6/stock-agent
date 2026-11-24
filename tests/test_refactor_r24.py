@@ -8,6 +8,7 @@ runtime table-by-table against the live source, explicitly confirming that
 unknown-outcome attempts (open reconciliation work) survived.
 """
 import hashlib
+import os
 import sys
 import tempfile
 import unittest
@@ -137,7 +138,8 @@ class DefaultSourceSetTests(R24BackupTestCase):
         (frozen / "single-research-replay.yml").write_bytes(dsl)
         (frozen / "single-research-replay.manifest.json").write_bytes(manifest)
         (frozen / "unrelated.json").write_text("{}", encoding="utf-8")
-        (frozen / "linked.yml").symlink_to(frozen / "single-research-replay.yml")
+        if os.name != "nt":
+            (frozen / "linked.yml").symlink_to(frozen / "single-research-replay.yml")
         (frozen.parent / "draft").mkdir()
         (frozen.parent / "draft/unsupported.yml").write_bytes(dsl)
 
@@ -145,8 +147,8 @@ class DefaultSourceSetTests(R24BackupTestCase):
         entries = {entry["path"]: entry["kind"] for entry in _manifest_entries(self.config, backup)
                    if entry["path"].startswith("data/workflow_artifacts/")}
         self.assertEqual(entries, {
-            str(relative / "single-research-replay.yml"): "workflow_dsl",
-            str(relative / "single-research-replay.manifest.json"): "workflow_manifest",
+            (relative / "single-research-replay.yml").as_posix(): "workflow_dsl",
+            (relative / "single-research-replay.manifest.json").as_posix(): "workflow_manifest",
         })
         drill = run_restore_drill(self.config, backup["bundle_path"])
         self.assertEqual(drill["status"], "PASS", drill.get("errors"))

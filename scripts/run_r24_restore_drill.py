@@ -34,12 +34,13 @@ class Drill:
         self.project = "stock-agent-r24-" + uuid.uuid4().hex[:12]
         self.image = self.project + ":candidate"
         self.env = {**os.environ, "R25_IMAGE": self.image, "PYTHON": sys.executable}
+        self.build_tree = self.output / "image-build"
         self.compose = [
             "docker", "compose", "--env-file", "/dev/null", "--project-name", self.project,
-            "-f", "deploy/testing/r25_precheck.compose.yaml", "-f", "deploy/testing/r24_restore.compose.yaml",
+            "-f", str(self.build_tree / "deploy/testing/r25_precheck.compose.yaml"),
+            "-f", str(self.build_tree / "deploy/testing/r24_restore.compose.yaml"),
         ]
         self.records = []
-        self.build_tree = self.output / "image-build"
         self.image_started = False
 
     def run(self, name: str, command: list[str], *, expected: int = 0, cwd: Path = ROOT) -> str:
@@ -93,9 +94,9 @@ class Drill:
             config["volumes"][name]["name"] == f"{self.project}_{name}"
             and not config["volumes"][name].get("external") for name in mounts.values()),
             "Expected distinct project-owned volumes")
-        require(all(mount["read_only"] and Path(mount["source"]).is_relative_to(ROOT)
+        require(all(mount["read_only"] and Path(mount["source"]).is_relative_to(self.build_tree)
                     for mount in service["volumes"] if mount["type"] == "bind"),
-                "Expected only read-only checkout binds")
+                "Expected only read-only candidate worktree binds")
 
         bound_image = f"{self.image}@{binding['image_digest']}"
         bound_id = self.run("bound-image-id", ["docker", "image", "inspect", bound_image,
@@ -172,11 +173,12 @@ class Drill:
     def cleanup(self) -> None:
         failures = []
         commands = [
-            ("cleanup-compose", self.compose + ["down", "--volumes", "--remove-orphans"]),
             ("remaining-containers", ["docker", "ps", "-aq", "--filter"]),
             ("remaining-volumes", ["docker", "volume", "ls", "-q", "--filter"]),
             ("remaining-networks", ["docker", "network", "ls", "-q", "--filter"]),
         ]
+        if self.build_tree.exists():
+            commands.insert(0, ("cleanup-compose", self.compose + ["down", "--volumes", "--remove-orphans"]))
         for name, cmd in commands:
             if name.startswith("remaining-"):
                 cmd.append(f"label=com.docker.compose.project={self.project}")
