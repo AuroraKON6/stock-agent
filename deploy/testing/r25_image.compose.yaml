@@ -1,0 +1,44 @@
+# R25 image verification overlay (KONM-38) — temporary, isolated Compose project
+# for proving the candidate image itself schedules, persists and recovers.
+# NOT a deployment: an internal network (no egress path at all), no host ports,
+# synthetic replay tasks only, and every store is a project-scoped temp volume.
+#
+# Layered over deploy/compose.yaml, which keeps supplying the image pin, the
+# APP_* roots, the non-root user, read_only, cap_drop and no-new-privileges:
+#
+#   docker compose -p konm38-r25-image \
+#     -f deploy/compose.yaml -f deploy/testing/r25_image.compose.yaml \
+#     run --rm research-api python -m stock_agent ...
+#
+# The only host path is the synthetic config directory, mounted read-only in
+# a separate path. The deployment's config volume is populated by the image,
+# which supplies the application and all static backup inputs.
+#
+# Which side an invocation runs as is chosen by two variables:
+#   R25_STATE_VOL     konm38-r25-image-cstate  container side's state
+#                     konm38-r25-image-rstate  restore target, later the
+#                                              legacy side's recovered store
+#   R25_EVIDENCE_VOL  konm38-r25-image-cevidence / -revidence (same pairing)
+services:
+  research-api:
+    restart: "no"
+    volumes:
+      - ${R25_CONFIG_DIR:?set R25_CONFIG_DIR to a synthetic config directory}:/drill-config:ro
+      - r25-state:/var/stock-agent/state
+      - r25-evidence:/var/stock-agent/evidence
+      # The ownership registry is shared by both sides, so it is its own
+      # volume mounted at data/scheduler_ownership inside whichever state
+      # volume is active.
+      - r25-registry:/var/stock-agent/state/scheduler_ownership
+
+networks:
+  default:
+    internal: true  # structural no-egress guarantee: no provider can be reached
+
+volumes:
+  r25-state:
+    name: ${COMPOSE_PROJECT_NAME:?set an isolated Compose project}-${R25_STATE_VOL:?set R25_STATE_VOL to cstate or rstate}
+  r25-evidence:
+    name: ${COMPOSE_PROJECT_NAME:?set an isolated Compose project}-${R25_EVIDENCE_VOL:?set R25_EVIDENCE_VOL to cevidence or revidence}
+  r25-registry:
+    name: ${COMPOSE_PROJECT_NAME:?set an isolated Compose project}-registry

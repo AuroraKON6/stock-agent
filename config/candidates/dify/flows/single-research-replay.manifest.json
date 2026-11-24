@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "dify_release": "1.17.1",
+  "dify_release_commit": "8387590ace4a094de812b7847fc6a4c3a27cd52b",
+  "execution_mode": "replay",
+  "artifact": "single-research-replay.yml",
+  "workflow_version": "sha256:18df408c8ada3e8af4ed0b5d0faaf9488ab2b00b1332e2b65c4a53f567a7e386"
+}

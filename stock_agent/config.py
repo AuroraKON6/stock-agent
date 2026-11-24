@@ -5,10 +5,39 @@ import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# R25: a deployment relocates the project trees through the APP_* roots of
+# runtime_layout (compose mounts them as volumes). The evidence tree is
+# listed first because it sits INSIDE the data tree on the host and has its
+# own root in a deployment: the longest matching prefix wins. On the host
+# none of the variables is set, so every relative path still resolves under
+# PROJECT_ROOT exactly as before.
+RELOCATABLE_PROJECT_TREES = (
+    ("data/evidence_vault", "APP_EVIDENCE_ROOT"),
+    ("config", "APP_CONFIG_ROOT"),
+    ("data", "APP_STATE_ROOT"),
+    ("reports", "APP_REPORT_ROOT"),
+)
+_relocated_roots_cache: list = [(), {}]
+
+
+def relocated_project_roots() -> Dict[Tuple[str, ...], Path]:
+    """Project trees whose APP_* root is set in the environment, keyed by
+    their relative path parts (longest first)."""
+    key = tuple(os.environ.get(variable, "") for _, variable in RELOCATABLE_PROJECT_TREES)
+    cached_key, cached_roots = _relocated_roots_cache
+    if key != cached_key:
+        cached_roots = {}
+        for (tree, _variable), value in zip(RELOCATABLE_PROJECT_TREES, key):
+            if value.strip():
+                cached_roots[Path(tree).parts] = (PROJECT_ROOT / value.strip()).resolve()
+        _relocated_roots_cache[:] = [key, cached_roots]
+    return dict(cached_roots)
+
 
 # Central project-path override. Modules that captured ``project_path`` at
 # import time still honor an active override because the shared function
@@ -27,7 +56,48 @@ def project_path(path_value: str) -> Path:
     override = _PROJECT_PATH_OVERRIDE.get()
     if override is not None:
         return Path(override(path_value))
+    for parts, root in relocated_project_roots().items():
+        if path.parts[:len(parts)] == parts:
+            rest = path.parts[len(parts):]
+            return root.joinpath(*rest) if rest else root
     return PROJECT_ROOT / path
+
+
+def project_workspace_roots() -> List[Tuple[Tuple[str, ...], Path]]:
+    """Every place ``project_path`` can resolve into, as ``(project-relative
+    prefix, directory)``: the relocated trees first (a nested tree such as
+    the evidence vault must win over ``data``), then the project root. With an
+    active override only that root exists."""
+    override = _PROJECT_PATH_OVERRIDE.get()
+    if override is not None:
+        return [((), Path(override(".")).resolve())]
+    return [*(relocated_project_roots().items()), ((), PROJECT_ROOT)]
+
+
+def project_relative_path(path_value: Union[str, Path]) -> str:
+    """The project-relative spelling of ``path``: what ``project_path`` takes
+    to reach the same file again. Files under a relocated tree keep their
+    ``data/...``-style name so bundles and manifests stay layout-neutral;
+    anything outside the project roots is returned as an absolute string."""
+    resolved = Path(path_value).resolve()
+    for prefix, root in project_workspace_roots():
+        if _is_below(resolved, root):
+            return Path(*prefix, resolved.relative_to(root)).as_posix()
+    return str(resolved)
+
+
+def within_project_roots(path_value: Union[str, Path]) -> bool:
+    """True when ``path`` sits below one of the roots ``project_path`` uses."""
+    resolved = Path(path_value).resolve()
+    return any(_is_below(resolved, root) for _prefix, root in project_workspace_roots())
+
+
+def _is_below(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 @contextmanager

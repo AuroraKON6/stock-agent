@@ -27,7 +27,12 @@ from .audit_log import (
     file_hash,
     object_hash,
 )
-from .config import project_path
+from .config import (
+    project_path,
+    project_relative_path,
+    project_workspace_roots,
+    within_project_roots,
+)
 from .runtime_layout import resolve_layout
 from .release_controls import build_release_candidate_identity
 
@@ -707,13 +712,12 @@ def render_backup_restore_markdown(snapshot: Dict[str, Any]) -> str:
 def _discover_sources(
     config: Dict[str, Any], cfg: Dict[str, Any]
 ) -> Tuple[List[Tuple[Path, str, str]], List[str]]:
-    root = project_path(".").resolve()
     found: Dict[str, Tuple[Path, str, str]] = {}
     missing: List[str] = []
 
     def add_path(path: Path, relative: str, kind: str) -> None:
         resolved = path.resolve()
-        if not path.is_file() or path.is_symlink() or not _is_within(resolved, root):
+        if not path.is_file() or path.is_symlink() or not within_project_roots(resolved):
             return
         normalized = PurePosixPath(relative.replace("\\", "/")).as_posix()
         found[normalized] = (path, normalized, kind)
@@ -729,23 +733,29 @@ def _discover_sources(
         if source_root.is_dir():
             for path in source_root.rglob("*"):
                 if path.is_file():
-                    add_path(path, path.resolve().relative_to(root).as_posix(), "method_bundle")
+                    add_path(path, project_relative_path(path), "method_bundle")
 
-    data_root = project_path("data")
-    if data_root.is_dir():
-        for path in data_root.rglob("*.jsonl"):
-            relative = path.resolve().relative_to(root).as_posix()
-            lowered = "/{0}".format(relative.lower())
-            if any(marker in lowered for marker in EXCLUDED_FACT_MARKERS):
-                continue
-            if any(marker in path.name.lower() for marker in EXCLUDED_NAME_MARKERS):
-                continue
-            add_path(path, relative, "fact_jsonl")
+    def add_fact_jsonl(fact_root: Path) -> None:
+        if fact_root.is_dir():
+            for path in fact_root.rglob("*.jsonl"):
+                relative = project_relative_path(path)
+                lowered = "/{0}".format(relative.lower())
+                if any(marker in lowered for marker in EXCLUDED_FACT_MARKERS):
+                    continue
+                if any(marker in path.name.lower() for marker in EXCLUDED_NAME_MARKERS):
+                    continue
+                add_path(path, relative, "fact_jsonl")
+
+    add_fact_jsonl(project_path("data"))
+    # A relocated evidence vault (APP_EVIDENCE_ROOT) is no longer below data/.
+    evidence_root = project_path("data/evidence_vault")
+    if not _is_within(evidence_root, project_path("data")):
+        add_fact_jsonl(evidence_root)
 
     actions_root = project_path("reports/actions")
     if actions_root.is_dir():
         for path in actions_root.rglob("*.jsonl"):
-            relative = path.resolve().relative_to(root).as_posix()
+            relative = project_relative_path(path)
             add_path(path, relative, "action_audit_jsonl")
 
     index_path = project_path("data/evidence_vault/index.json")
@@ -755,14 +765,14 @@ def _discover_sources(
     if object_root.is_dir():
         for path in object_root.rglob("*"):
             if path.is_file():
-                add_path(path, path.resolve().relative_to(root).as_posix(), "evidence_object")
+                add_path(path, project_relative_path(path), "evidence_object")
 
     for value in cfg["sqlite_paths"]:
         path = project_path(str(value))
         relative = _relative_project_path(path)
         if not path.is_file():
             missing.append(relative)
-        elif path.is_symlink() or not _is_within(path.resolve(), root):
+        elif path.is_symlink() or not within_project_roots(path.resolve()):
             missing.append("unsafe sqlite path: {0}".format(relative))
         else:
             add_path(path, relative, "sqlite")
@@ -774,11 +784,11 @@ def _discover_sources(
     if personal_root.is_dir():
         for index_path in personal_root.glob("*/index.json"):
             add_path(index_path,
-                     index_path.resolve().relative_to(root).as_posix(),
+                     project_relative_path(index_path),
                      "personal_evidence_index")
         for path in personal_root.glob("*/objects/sha256/*/*"):
             if path.is_file():
-                add_path(path, path.resolve().relative_to(root).as_posix(),
+                add_path(path, project_relative_path(path),
                          "personal_evidence_object")
 
     return [found[key] for key in sorted(found)], _unique(missing)
@@ -983,13 +993,24 @@ def _jsonl_metadata(path: Path) -> Dict[str, Any]:
     }
 
 
+def _open_payload_sqlite(path: Path) -> sqlite3.Connection:
+    """Open a bundle/restored SQLite file without touching it or its
+    directory. A write-ahead-log database normally needs -wal/-shm sidecars
+    to be created next to the file even for a read: that leaves unmanifested
+    files inside the bundle, and fails outright on a read-only mount (a
+    bundle shared with the recovering side). SQLite's immutable mode needs
+    neither, which is exactly what a sealed bundle payload is."""
+    uri = Path(path).resolve().as_uri()
+    return sqlite3.connect(uri + "?mode=ro&immutable=1", uri=True, timeout=10)
+
+
 def _sqlite_metadata(path: Path) -> Dict[str, Any]:
     tables: Dict[str, int] = {}
     schema_rows: List[Tuple[str, str]] = []
     status = "FAIL"
     errors: List[str] = []
     try:
-        connection = sqlite3.connect(str(path), timeout=10)
+        connection = _open_payload_sqlite(path)
         try:
             checks = [str(row[0]) for row in connection.execute("PRAGMA quick_check")]
             status = "OK" if checks == ["ok"] else "FAIL"
@@ -1066,7 +1087,7 @@ def _scan_payload(payload_root: Path, entries: Sequence[Dict[str, Any]]) -> Dict
 def _scan_sqlite(path: Path, relative: str) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
     try:
-        connection = sqlite3.connect(str(path), timeout=10)
+        connection = _open_payload_sqlite(path)
         try:
             tables = [
                 row[0] for row in connection.execute(
@@ -1216,9 +1237,9 @@ def _manifest_identity(manifest: Dict[str, Any]) -> str:
 
 
 def _controlled_root(path_value: str, label: str) -> Path:
-    root = project_path(".").resolve()
     path = project_path(path_value).resolve()
-    if not _is_within(path, root) or path == root:
+    roots = tuple(root for _prefix, root in project_workspace_roots())
+    if not within_project_roots(path) or any(path == root for root in roots):
         raise BackupRestoreError("{0} must stay inside the project workspace".format(label))
     return path
 
@@ -1407,10 +1428,7 @@ def _coerce_now(value: Optional[datetime]) -> datetime:
 
 
 def _relative_project_path(path: Path) -> str:
-    try:
-        return path.resolve().relative_to(project_path(".").resolve()).as_posix()
-    except Exception:
-        return str(path)
+    return project_relative_path(path)
 
 
 def _unique(values: Iterable[str]) -> List[str]:
@@ -1454,7 +1472,14 @@ def _task_runtime_integrity(restored_root: Path, entries: Sequence[Dict[str, Any
     errors: List[str] = []
     tables: Dict[str, Dict[str, int]] = {}
     unknown_preserved: Optional[int] = None
+    # The live side resolves through project_path, so a relocated state tree
+    # (APP_STATE_ROOT) is read where the running service actually writes it.
     source_db = _find_runtime_db(project_path("."))
+    if source_db is None:
+        source_db = next(
+            (path for path in (project_path("data/task_runtime/tasks.sqlite3"),
+                               project_path("data/stock_agent.sqlite3")) if path.is_file()),
+            None)
     restored_db = _find_runtime_db(restored_root)
     if source_db is None or restored_db is None:
         return {"status": "SKIPPED",

@@ -38,7 +38,14 @@ RUN npm ci --ignore-scripts --omit=dev
 FROM ${NODE_IMAGE}
 # python:3.12-slim and node:22-slim share the Debian bookworm userland, so
 # overlaying the python image's /usr/local (interpreter + stdlib) is a
-# self-consistent runtime.
+# self-consistent runtime. The overlay's C extensions still link against
+# shared libraries that python:3.12-slim carries but node:22-slim does not:
+# _sqlite3 needs libsqlite3.so.0 and _ssl needs libssl.so.3 — without them
+# `import sqlite3` / `import ssl` fail at image runtime, so the task store,
+# backup/restore and TLS cannot load at all (found by the R25 precheck).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libsqlite3-0 libssl3 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=python-builder /usr/local /usr/local
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
@@ -47,7 +54,8 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     APP_STATE_ROOT=/var/stock-agent/state \
     APP_EVIDENCE_ROOT=/var/stock-agent/evidence \
     APP_REPORT_ROOT=/var/stock-agent/reports \
-    APP_TEMP_ROOT=/tmp/stock-agent
+    APP_TEMP_ROOT=/tmp/stock-agent \
+    TMPDIR=/tmp/stock-agent
 WORKDIR /app
 # Application source only — .dockerignore strips .git, host venvs, local
 # configs, secrets, data/, reports/, logs/ (A37 stop conditions). The
@@ -55,6 +63,11 @@ WORKDIR /app
 # root before `docker build`, so the optional COPY lands it in /app.
 COPY stock_agent ./stock_agent
 COPY requirements.linux-py312.lock.txt ./
+# R24/R25: the backup entry point (backup-create) refuses to run without its
+# REQUIRED_STATIC_PATHS, so they ship with the application instead of being
+# mounted from the host at restore time (R25 precheck finding 3).
+COPY pyproject.toml requirements.lock.txt ./
+COPY config/watchlist.example.json ./config/
 COPY PROVENANCE.json* ./
 COPY --from=python-builder /opt/venv /opt/venv
 COPY --from=pi-builder /pi/node_modules /app/pi_runtime/node_modules
@@ -62,8 +75,13 @@ COPY pi_runtime/package.json pi_runtime/package-lock.json /app/pi_runtime/
 RUN groupadd --system app \
     && useradd --system --gid app --home /app app \
     && mkdir -p /var/stock-agent/state /var/stock-agent/evidence \
-                /var/stock-agent/reports /tmp/stock-agent /app/config \
+                /var/stock-agent/reports /tmp/stock-agent /app/config /app/logs \
     && chown -R app:app /var/stock-agent /tmp/stock-agent /app
+# The empty roots above carry the app owner into freshly created named
+# volumes (volume copy-up), so the non-root service can write its state.
+# Runtime path resolution: config/ -> APP_CONFIG_ROOT, data/ -> APP_STATE_ROOT,
+# data/evidence_vault/ -> APP_EVIDENCE_ROOT, reports/ -> APP_REPORT_ROOT
+# (stock_agent.config.project_path); the image root itself stays read-only.
 USER app
 # The image carries no .git: release identity is the PROVENANCE chain —
 # verified read-only via stock_agent.release_provenance (BLOCKED without the

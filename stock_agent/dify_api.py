@@ -379,9 +379,13 @@ class DifyGateway:
     # contract: research status                                          #
     # ------------------------------------------------------------------ #
 
-    def research_status(self, token: str, *, task_id: str,
+    def research_status(self, token: str, *, task_id: str, status_only: bool = False,
                         now: Optional[datetime] = None) -> Dict[str, Any]:
+        if not isinstance(status_only, bool):
+            raise ValueError("status_only must be a boolean")
         _, task = self._gate_task(token, "read_research", str(task_id or ""))
+        if status_only:
+            return {key: task[key] for key in ("task_id", "case_id", "status")}
         return self._public_task_view(task, now=now)
 
     # ------------------------------------------------------------------ #

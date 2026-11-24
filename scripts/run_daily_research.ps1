@@ -12,7 +12,13 @@ param(
     [string]$TriggerSource = "manual",
     [Alias("SkipOpenClaw")]
     [switch]$SkipPi,
-    [string]$Config = "config/watchlist.local.json"
+    [string]$Config = "config/watchlist.local.json",
+    [string]$ScheduleId,
+    [string]$PlannedSlot,
+    [string]$ScopeVersion = "",
+    [string]$ScheduledTaskSpec,
+    [ValidateSet("replay", "live")]
+    [string]$ScheduledExecutionMode = "replay"
 )
 
 $ErrorActionPreference = "Continue"
@@ -31,10 +37,44 @@ if ([string]::IsNullOrWhiteSpace($env:HTTPS_PROXY) -and -not [string]::IsNullOrW
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 # Entry points must use the locked interpreter; PATH python is not a supported
 # fallback because it resolves to an uncontrolled environment (e.g. Anaconda).
-$PythonExe = Join-Path $ProjectRoot ".venv312\Scripts\python.exe"
+$PythonExe = if ($env:OS -eq "Windows_NT") {
+    Join-Path $ProjectRoot ".venv312\Scripts\python.exe"
+} else {
+    Join-Path $ProjectRoot ".venv312/bin/python"
+}
 if (-not (Test-Path -LiteralPath $PythonExe)) {
     Write-Error "Locked interpreter not found: $PythonExe (expected .venv312; PATH python is not a supported fallback)"
     exit 2
+}
+if ($ScheduleId -or $PlannedSlot -or $ScheduledTaskSpec) {
+    if ($TriggerSource -ne "scheduled" -or $Mode -ne "daily" -or
+        -not ($ScheduleId -and $PlannedSlot -and $ScheduledTaskSpec)) {
+        Write-Error "Scheduled submission requires daily scheduled mode, ScheduleId, PlannedSlot and ScheduledTaskSpec."
+        exit 2
+    }
+    $SubmitArgs = @("-B", "-m", "stock_agent", "scheduled-task-submit",
+        "--config", $Config, "--scheduler", "legacy-powershell",
+        "--schedule-id", $ScheduleId, "--planned-slot", $PlannedSlot,
+        "--spec", $ScheduledTaskSpec, "--execution-mode", $ScheduledExecutionMode)
+    if ($ScopeVersion) { $SubmitArgs += @("--scope-version", $ScopeVersion) }
+    Push-Location $ProjectRoot
+    try {
+        & $PythonExe @SubmitArgs
+        $SubmitExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    exit $SubmitExit
+}
+if ($TriggerSource -eq "scheduled") {
+    Push-Location $ProjectRoot
+    try {
+        & $PythonExe -B -m stock_agent cutover-legacy-check --config $Config
+        $OwnershipExit = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($OwnershipExit -ne 0) { exit $OwnershipExit }
 }
 $Stamp = (Get-Date -Format "yyyyMMddTHHmmss")
 $LogDir = Join-Path $ProjectRoot "logs\scheduled"

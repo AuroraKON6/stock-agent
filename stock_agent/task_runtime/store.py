@@ -21,7 +21,7 @@ import hashlib
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -495,8 +495,8 @@ class TaskStore:
                     # differing under the same intent is an explicit conflict.
                     if str(existing["execution_mode"]) != execution_mode or not (
                         isinstance(stored_payload, dict)
-                        and self._logical_content_fingerprint(stored_payload)
-                        == self._logical_content_fingerprint(input_payload)
+                        and self._logical_content_fingerprint(stored_payload, business_intent_id)
+                        == self._logical_content_fingerprint(input_payload, business_intent_id)
                     ):
                         self._rollback()
                         raise TaskIdempotencyConflictError(
@@ -663,14 +663,25 @@ class TaskStore:
     _PLATFORM_RUN_ORIGIN_KEYS = ("dify_run_id", "platform_run_id", "n8n_execution_id")
 
     @classmethod
-    def _logical_content_fingerprint(cls, payload: Any) -> str:
-        if not isinstance(payload, dict):
-            return cls._content_fingerprint(payload)
+    def _logical_content_fingerprint(cls, payload: Dict[str, Any], business_intent_id: str) -> str:
         origin = payload.get("origin")
         if isinstance(origin, dict) and any(key in origin for key in cls._PLATFORM_RUN_ORIGIN_KEYS):
             stripped_origin = {key: value for key, value in origin.items()
                                if key not in cls._PLATFORM_RUN_ORIGIN_KEYS}
-            return cls._content_fingerprint(dict(payload, origin=stripped_origin))
+            payload = dict(payload, origin=stripped_origin)
+        if business_intent_id.startswith("schedule::"):
+            slot = payload.get("scheduled_slot")
+            if isinstance(slot, dict) and isinstance(slot.get("planned_slot"), str):
+                try:
+                    moment = datetime.fromisoformat(slot["planned_slot"])
+                    if moment.tzinfo is not None:
+                        # Preserve old payloads and compare exact instants, including
+                        # any fractional seconds the slot key omits.
+                        planned_slot = moment.astimezone(timezone.utc).isoformat()
+                        payload = dict(payload, scheduled_slot=dict(slot, planned_slot=planned_slot))
+                except (ValueError, OverflowError):
+                    # Unparseable historical values keep their exact comparison.
+                    pass
         return cls._content_fingerprint(payload)
 
     def _write_input_snapshot(self, task_id: str, input_version: int, payload: Dict[str, Any],

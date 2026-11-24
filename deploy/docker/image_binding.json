@@ -1,0 +1,6 @@
+{
+  "builder": "scripts/build_image.sh",
+  "image_digest": "sha256:acad75a8f2e23c80e76edb33d7614d79d8145dd5f10cb720f1e9b56091270acd",
+  "provenance_sha256": "e32f53eaf49bba5269bf4e870d8d69c3dc1a786aaeee3a85a6099533f7cef2f0",
+  "schema_version": "1.0"
+}

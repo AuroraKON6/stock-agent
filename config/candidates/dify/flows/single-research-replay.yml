@@ -1,0 +1,515 @@
+app:
+  name: Stock Agent R16 replay
+  description: Create one replay task and return its case link
+  mode: workflow
+  icon: 📋
+  icon_background: '#E4FBCC'
+  use_icon_as_answer_icon: false
+kind: app
+version: 0.3.1
+dependencies: []
+workflow:
+  conversation_variables: []
+  environment_variables:
+  - id: 05d5cebc-c5ae-465d-aa07-6ab8a67acc97
+    name: STOCK_AGENT_SERVICE_SECRET
+    value_type: secret
+    value: ''
+    description: Case-scoped backend service credential
+  - id: b59324b4-836a-4266-96cc-c78862850861
+    name: STOCK_AGENT_WORKFLOW_VERSION
+    value_type: string
+    value: ''
+    description: Reviewed sha256 workflow version
+  - id: c761736c-9afe-4d1b-bbe7-76d808fdab3e
+    name: R16_CREATE_UNCONFIRMED
+    value_type: string
+    value: create_unconfirmed
+    description: ''
+  - id: f28ed1ec-6120-4c41-81e7-89656f151864
+    name: R16_STATUS_UNCONFIRMED
+    value_type: string
+    value: status_unconfirmed
+    description: ''
+  - id: da3bc464-a21e-4f18-bc8c-a9a68913e335
+    name: R16_CASE_PATH_DEFAULT
+    value_type: string
+    value: /
+    description: ''
+  features:
+    file_upload:
+      enabled: false
+    opening_statement: ''
+    suggested_questions: []
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    text_to_speech:
+      enabled: false
+    suggested_questions_after_answer:
+      enabled: false
+  graph:
+    nodes:
+    - id: '16001'
+      type: custom
+      data:
+        type: start
+        title: Public case
+        variables:
+        - label: title
+          variable: title
+          type: text-input
+          max_length: 120
+          options: []
+          required: true
+        - label: case_id
+          variable: case_id
+          type: text-input
+          max_length: 128
+          options: []
+          required: true
+        - label: research_question
+          variable: research_question
+          type: paragraph
+          max_length: 2000
+          options: []
+          required: true
+        - label: input_version
+          variable: input_version
+          type: number
+          max_length: null
+          options: []
+          required: true
+        - label: business_intent_id
+          variable: business_intent_id
+          type: text-input
+          max_length: 128
+          options: []
+          required: true
+      position:
+        x: 40
+        y: 140
+      positionAbsolute:
+        x: 40
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16003'
+      type: custom
+      data:
+        type: http-request
+        title: Create or recover task
+        method: POST
+        url: http://stock-agent-r16-gateway:8770/api/dify/v1/create-research
+        authorization:
+          type: api-key
+          config:
+            type: bearer
+            api_key: '{{#env.STOCK_AGENT_SERVICE_SECRET#}}'
+        headers: ''
+        params: ''
+        body:
+          type: x-www-form-urlencoded
+          data:
+          - type: text
+            key: title
+            value: '{{#16001.title#}}'
+          - type: text
+            key: case_id
+            value: '{{#16001.case_id#}}'
+          - type: text
+            key: research_question
+            value: '{{#16001.research_question#}}'
+          - type: text
+            key: input_version
+            value: '{{#16001.input_version#}}'
+          - type: text
+            key: business_intent_id
+            value: '{{#16001.business_intent_id#}}'
+          - type: text
+            key: dify_run_id
+            value: '{{#sys.workflow_run_id#}}'
+          - type: text
+            key: workflow_version
+            value: '{{#env.STOCK_AGENT_WORKFLOW_VERSION#}}'
+          - type: text
+            key: execution_mode
+            value: replay
+        timeout:
+          connect: 2
+          read: 3
+          write: 2
+        retry_config:
+          retry_enabled: false
+          max_retries: 0
+          retry_interval: 0
+        error_strategy: default-value
+        default_value:
+        - key: body
+          type: string
+          value: '{}'
+        - key: status_code
+          type: number
+          value: 0
+        - key: headers
+          type: object
+          value: '{}'
+      position:
+        x: 344
+        y: 140
+      positionAbsolute:
+        x: 344
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16005'
+      type: custom
+      data:
+        type: if-else
+        title: Task confirmed?
+        cases:
+        - case_id: 'true'
+          id: 'true'
+          logical_operator: and
+          conditions:
+          - id: http-ok
+            varType: number
+            comparison_operator: '='
+            value: '200'
+            variable_selector:
+            - '16003'
+            - status_code
+          - id: receipt-body
+            varType: string
+            comparison_operator: contains
+            value: '{"ok": true, "data": {"task_id": "task_'
+            variable_selector:
+            - '16003'
+            - body
+          - id: receipt-header
+            varType: string
+            comparison_operator: not empty
+            value: ''
+            variable_selector:
+            - '16003'
+            - headers
+            - r16_task_id
+      position:
+        x: 648
+        y: 140
+      positionAbsolute:
+        x: 648
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16006'
+      type: custom
+      data:
+        type: http-request
+        title: Read status once
+        method: POST
+        url: http://stock-agent-r16-gateway:8770/api/dify/v1/research-status
+        authorization:
+          type: api-key
+          config:
+            type: bearer
+            api_key: '{{#env.STOCK_AGENT_SERVICE_SECRET#}}'
+        headers: ''
+        params: ''
+        body:
+          type: x-www-form-urlencoded
+          data:
+          - type: text
+            key: task_id
+            value: '{{#16003.headers.r16_task_id#}}'
+          - type: text
+            key: status_only
+            value: 'true'
+        timeout:
+          connect: 2
+          read: 3
+          write: 2
+        retry_config:
+          retry_enabled: false
+          max_retries: 0
+          retry_interval: 0
+        error_strategy: default-value
+        default_value:
+        - key: body
+          type: string
+          value: '{}'
+        - key: status_code
+          type: number
+          value: 0
+        - key: headers
+          type: object
+          value: '{}'
+      position:
+        x: 952
+        y: 140
+      positionAbsolute:
+        x: 952
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16007'
+      type: custom
+      data:
+        type: if-else
+        title: Status confirmed?
+        cases:
+        - case_id: 'true'
+          id: 'true'
+          logical_operator: and
+          conditions:
+          - id: http-ok
+            varType: number
+            comparison_operator: '='
+            value: '200'
+            variable_selector:
+            - '16006'
+            - status_code
+          - id: receipt-body
+            varType: string
+            comparison_operator: contains
+            value: '{"ok": true, "data": {"task_id": "task_'
+            variable_selector:
+            - '16006'
+            - body
+          - id: receipt-header
+            varType: string
+            comparison_operator: not empty
+            value: ''
+            variable_selector:
+            - '16006'
+            - headers
+            - r16_status
+      position:
+        x: 1256
+        y: 140
+      positionAbsolute:
+        x: 1256
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16008'
+      type: custom
+      data:
+        type: end
+        title: Return task link and status
+        outputs:
+        - variable: status
+          value_selector:
+          - '16006'
+          - headers
+          - r16_status
+          value_type: string
+        - variable: task_id
+          value_selector:
+          - '16003'
+          - headers
+          - r16_task_id
+          value_type: string
+        - variable: case_path
+          value_selector:
+          - '16003'
+          - headers
+          - r16_case_path
+          value_type: string
+        - variable: case_id
+          value_selector:
+          - '16001'
+          - case_id
+          value_type: string
+        - variable: business_intent_id
+          value_selector:
+          - '16001'
+          - business_intent_id
+          value_type: string
+      position:
+        x: 1560
+        y: 140
+      positionAbsolute:
+        x: 1560
+        y: 140
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16009'
+      type: custom
+      data:
+        type: end
+        title: Return unconfirmed creation
+        outputs:
+        - variable: status
+          value_selector:
+          - env
+          - R16_CREATE_UNCONFIRMED
+          value_type: string
+        - variable: task_id
+          value_selector: []
+          value_type: string
+        - variable: case_path
+          value_selector:
+          - env
+          - R16_CASE_PATH_DEFAULT
+          value_type: string
+        - variable: case_id
+          value_selector:
+          - '16001'
+          - case_id
+          value_type: string
+        - variable: business_intent_id
+          value_selector:
+          - '16001'
+          - business_intent_id
+          value_type: string
+      position:
+        x: 952
+        y: 380
+      positionAbsolute:
+        x: 952
+        y: 380
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    - id: '16010'
+      type: custom
+      data:
+        type: end
+        title: Return task link with unconfirmed status
+        outputs:
+        - variable: status
+          value_selector:
+          - env
+          - R16_STATUS_UNCONFIRMED
+          value_type: string
+        - variable: task_id
+          value_selector:
+          - '16003'
+          - headers
+          - r16_task_id
+          value_type: string
+        - variable: case_path
+          value_selector:
+          - '16003'
+          - headers
+          - r16_case_path
+          value_type: string
+        - variable: case_id
+          value_selector:
+          - '16001'
+          - case_id
+          value_type: string
+        - variable: business_intent_id
+          value_selector:
+          - '16001'
+          - business_intent_id
+          value_type: string
+      position:
+        x: 1560
+        y: 380
+      positionAbsolute:
+        x: 1560
+        y: 380
+      width: 244
+      height: 90
+      sourcePosition: right
+      targetPosition: left
+    edges:
+    - id: 16001-source-16003
+      type: custom
+      source: '16001'
+      sourceHandle: source
+      target: '16003'
+      targetHandle: target
+      data:
+        sourceType: start
+        targetType: http-request
+        isInIteration: false
+        isInLoop: false
+    - id: 16003-source-16005
+      type: custom
+      source: '16003'
+      sourceHandle: source
+      target: '16005'
+      targetHandle: target
+      data:
+        sourceType: http-request
+        targetType: if-else
+        isInIteration: false
+        isInLoop: false
+    - id: 16005-true-16006
+      type: custom
+      source: '16005'
+      sourceHandle: 'true'
+      target: '16006'
+      targetHandle: target
+      data:
+        sourceType: if-else
+        targetType: http-request
+        isInIteration: false
+        isInLoop: false
+    - id: 16005-false-16009
+      type: custom
+      source: '16005'
+      sourceHandle: 'false'
+      target: '16009'
+      targetHandle: target
+      data:
+        sourceType: if-else
+        targetType: end
+        isInIteration: false
+        isInLoop: false
+    - id: 16006-source-16007
+      type: custom
+      source: '16006'
+      sourceHandle: source
+      target: '16007'
+      targetHandle: target
+      data:
+        sourceType: http-request
+        targetType: if-else
+        isInIteration: false
+        isInLoop: false
+    - id: 16007-true-16008
+      type: custom
+      source: '16007'
+      sourceHandle: 'true'
+      target: '16008'
+      targetHandle: target
+      data:
+        sourceType: if-else
+        targetType: end
+        isInIteration: false
+        isInLoop: false
+    - id: 16007-false-16010
+      type: custom
+      source: '16007'
+      sourceHandle: 'false'
+      target: '16010'
+      targetHandle: target
+      data:
+        sourceType: if-else
+        targetType: end
+        isInIteration: false
+        isInLoop: false
+    viewport:
+      x: 0
+      y: 0
+      zoom: 0.65

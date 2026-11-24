@@ -13,17 +13,23 @@ state checks live. The HTTP layer only maps exceptions to status codes:
 
 Human-protected actions are NOT special-cased here: the gateway already
 requires a principal verification no Dify credential can mint.
+
+The isolated R16 listener can additionally accept its two native HTTP-node
+forms and expose validated receipt fields as response headers.
 """
 from __future__ import annotations
 
 import json
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Tuple
+from urllib.parse import parse_qsl
 
 from . import dify_access
 from .dify_api import DifySubmissionError
 from .task_runtime.store import (
+    ALLOWED_TRANSITIONS,
     TaskRuntimeError,
     TaskIdempotencyConflictError,
     TaskTransitionError,
@@ -33,14 +39,16 @@ from .task_runtime.store import (
 SERVER_VERSION = "1.0"
 _MAX_BODY_BYTES = 1024 * 1024
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_REPLAY_CREATE = "/api/dify/v1/create-research"
+_REPLAY_STATUS = "/api/dify/v1/research-status"
 
 # path -> (gateway method name, required keyword arguments)
 _ROUTES: Dict[str, Tuple[str, Tuple[str, ...]]] = {
-    "/api/dify/v1/create-research": (
+    _REPLAY_CREATE: (
         "create_research",
         ("title", "case_id", "input_version", "research_question",
          "dify_run_id", "workflow_version")),
-    "/api/dify/v1/research-status": ("research_status", ("task_id",)),
+    _REPLAY_STATUS: ("research_status", ("task_id",)),
     "/api/dify/v1/fact-bundle": ("read_fact_bundle", ("case_id", "input_version")),
     "/api/dify/v1/submit-result": (
         "submit_candidate_result",
@@ -63,7 +71,44 @@ def _is_loopback_host(host: str) -> bool:
     return host.rsplit(":", 1)[0] in _LOOPBACK_HOSTS if ":" in host else False
 
 
-def create_dify_api_server(gateway: Any, host: str = "127.0.0.1", port: int = 8770) -> ThreadingHTTPServer:
+def _replay_form_body(path: str, raw: bytes) -> dict:
+    pairs = parse_qsl(raw.decode("ascii"), keep_blank_values=True, strict_parsing=True,
+                      max_num_fields=8, encoding="utf-8", errors="strict")
+    body = dict(pairs)
+    if len(pairs) != len(body):
+        raise ValueError("duplicate form fields")
+    if path == _REPLAY_CREATE:
+        if body.keys() != set(_ROUTES[path][1]) | {"business_intent_id", "execution_mode"}:
+            raise ValueError("unexpected replay creation fields")
+        version = body["input_version"]
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", version) or int(version) >= 2**63:
+            raise ValueError("input_version must be a positive integer")
+        return {**body, "input_version": int(version)}
+    if body.keys() != {"task_id", "status_only"} or body["status_only"] != "true":
+        raise ValueError("expected task_id and status_only=true")
+    return {**body, "status_only": True}
+
+
+def _replay_receipt_headers(path: str, request: dict, payload: dict) -> dict:
+    task_id = payload.get("task_id", "")
+    if not isinstance(task_id, str) or not re.fullmatch(r"task_[0-9a-f]{16}", task_id):
+        raise ValueError("invalid task ID in replay receipt")
+    if path == _REPLAY_CREATE:
+        platform_run = payload.get("platform_run")
+        if (payload.get("case_id") != request["case_id"]
+                or not isinstance(platform_run, dict)
+                or platform_run.get("run_id") != request["dify_run_id"]):
+            raise ValueError("creation receipt does not match the requested case and Dify run")
+        # Graphon's nested template selectors accept underscores in keys.
+        return {"R16_Task_Id": task_id, "R16_Case_Path": "/?task=" + task_id}
+    status = payload.get("status")
+    if task_id != request["task_id"] or not isinstance(status, str) or status not in ALLOWED_TRANSITIONS:
+        raise ValueError("invalid replay task status receipt")
+    return {"R16_Status": status}
+
+
+def create_dify_api_server(gateway: Any, host: str = "127.0.0.1", port: int = 8770, *,
+                           replay_forms: bool = False) -> ThreadingHTTPServer:
     class _DifyApiHandler(BaseHTTPRequestHandler):
         server_version = "stock-agent-dify-api/{0}".format(SERVER_VERSION)
 
@@ -84,13 +129,15 @@ def create_dify_api_server(gateway: Any, host: str = "127.0.0.1", port: int = 87
             self.end_headers()
             self.wfile.write(body)
 
-        def _respond(self, payload: Dict[str, Any]) -> None:
+        def _respond(self, payload: Dict[str, Any], headers: dict | None = None) -> None:
             body = json.dumps({"ok": True, "data": payload},
                               ensure_ascii=False, default=str).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -166,10 +213,14 @@ def create_dify_api_server(gateway: Any, host: str = "127.0.0.1", port: int = 87
                 self._reject(400, "invalid_body", "missing or oversized body")
                 return
             raw = self.rfile.read(length)
+            use_replay_form = (
+                replay_forms and self.path in {_REPLAY_CREATE, _REPLAY_STATUS}
+                and self.headers.get_content_type() == "application/x-www-form-urlencoded"
+            )
             try:
-                body = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                self._reject(400, "invalid_json")
+                body = _replay_form_body(self.path, raw) if use_replay_form else json.loads(raw.decode("utf-8"))
+            except ValueError:
+                self._reject(400, "invalid_replay_form" if use_replay_form else "invalid_json")
                 return
             if not isinstance(body, dict):
                 self._reject(400, "invalid_body", "body must be a JSON object")
@@ -195,7 +246,12 @@ def create_dify_api_server(gateway: Any, host: str = "127.0.0.1", port: int = 87
             except (ValueError, TaskRuntimeError) as exc:
                 self._reject(400, "invalid_request", str(exc))
                 return
-            self._respond(payload)
+            try:
+                headers = _replay_receipt_headers(self.path, body, payload) if use_replay_form else None
+            except ValueError:
+                self._reject(500, "invalid_replay_receipt")
+                return
+            self._respond(payload, headers)
 
     class _DifyApiServer(ThreadingHTTPServer):
         daemon_threads = True
@@ -204,8 +260,9 @@ def create_dify_api_server(gateway: Any, host: str = "127.0.0.1", port: int = 87
     return _DifyApiServer((host, port), _DifyApiHandler)
 
 
-def serve_dify_api(gateway: Any, host: str = "127.0.0.1", port: int = 8770) -> None:
-    server = create_dify_api_server(gateway, host=host, port=port)
+def serve_dify_api(gateway: Any, host: str = "127.0.0.1", port: int = 8770, *,
+                   replay_forms: bool = False) -> None:
+    server = create_dify_api_server(gateway, host=host, port=port, replay_forms=replay_forms)
     try:
         server.serve_forever()
     finally:
