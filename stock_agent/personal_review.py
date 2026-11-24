@@ -309,11 +309,16 @@ def _delivery(payload: Dict[str, Any],
             state, authoritative = "prepared_only", False
     elif str(model_call.get("replay_source") or ""):
         state, authoritative = "replayed", True
-    elif bool(model_call.get("called")):
-        state, authoritative = "sent", True
     elif "outcome unknown" in error:
+        # No call ledger and no per-round context: the error text is the only
+        # statement that the request may have reached the provider.
         state, authoritative = "send_unknown", False
     elif model_call:
+        # Live history with no per-round binding and no attempt row at all
+        # (the pre-R02 writer): ``called`` only says SOME round returned in a
+        # format that overwrites the top-level context every round, so the
+        # current context — including a later, never-sent reference set — has
+        # no delivery credential. Unverified = not delivered.
         state, authoritative = "prepared_only", False
     else:
         state, authoritative = "no_execution_record", False

@@ -1587,6 +1587,44 @@ class SignoffAndDeliveryTests(R22IntegrationCase):
                          "the first round's send stays in the call ledger")
         self.assertEqual(row["metering"]["invocation_sent"], ["yes"])
 
+    def test_zero_invocation_legacy_record_never_claims_delivered_refs(self):
+        fixture = self.attempt_fixture(
+            "test_a07_timeout_after_send_is_unknown_and_never_auto_requeued")
+        store = fixture.store
+        task = fixture.create_live_task()
+        task_id = task["task_id"]
+        token = int(store.get_task(task_id)["fencing_token"])
+        # The pre-R02 writer wrote no invocation ledger at all: ``called`` is
+        # the only trace of its first round, while the top-level context is
+        # the second round's prepared set (budget refused before any send).
+        legacy = {
+            "mode": "live", "called": True,
+            "rounds": [{"round": 1}],
+            "context_delivery": {"delivered_evidence": ["doc-1", "doc-2"]},
+            "outbound_context": {"evidence_summaries": {
+                "doc-1": {"summary": "synthetic A", "sha256": "0" * 64},
+                "doc-2": {"summary": "synthetic B", "sha256": "1" * 64}}},
+            "governance": {"gate": "budget", "decision": "denied"},
+            "error": "daily model-call budget exhausted: 1/1 attempts today",
+        }
+        store.mark_blocked(task_id, worker_id="w-r02", fencing_token=token,
+                           error=legacy["error"], model_call=legacy)
+        self.assertEqual(store.invocation_attempts(task_id), [],
+                         "this historical writer left no call ledger")
+        row = project_review(store, identity=self.identity(),
+                             task_ids=[task_id])["tasks"][0]
+        sources = row["sources"]
+        self.assertEqual(sources["delivery_state"], "prepared_only",
+                         "a global called flag is not a per-round send credential")
+        self.assertFalse(sources["delivery_authoritative"])
+        self.assertEqual(sources["delivered_evidence"], {})
+        self.assertEqual(sources["delivery_rounds"], [])
+        self.assertNotIn("doc-2", sources["allowed_references"],
+                         "the never-sent reference is not a delivered reference")
+        self.assertNotIn("doc-1", sources["allowed_references"])
+        self.assertEqual(row["metering"]["invocation_attempts"], 0)
+        self.assertEqual(row["metering"]["invocation_sent"], [])
+
     def test_review_uses_worker_delivery_ledger_not_input_payload(self):
         undelivered = "synthetic-not-in-vault"
         spec = self.spec()

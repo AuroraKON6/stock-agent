@@ -42,7 +42,7 @@ Python 3.12.15，仓库锁定 `pyyaml==6.0.3`。全部在仓库根目录执行�
 | 命令 | 结果 |
 | --- | --- |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22.py` | 9 OK / exit 0 |
-| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 55 OK / exit 0（本单专项，第八轮后） |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 56 OK / exit 0（本单专项，第九轮后） |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17.py` | 12 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17_role_api.py` | 19 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r18.py` | 34 OK / exit 0 |
@@ -302,3 +302,24 @@ sol 在候选 `001d05a` 上用 `legacy_context_check.py` 复现 1 个反例（ex
 | 相邻 R01 / R14 / R20 / R20 scope / R15 personal / research rounds / fault matrix | 21 / 11 / 8 / 40 / 10 / 10 / 6 OK，均 exit 0（R20 scope 另连跑 8 次均 OK） |
 
 边界说明：这是有意的取舍——旧格式没有任何能把「上下文字节」绑到 invocation 行的证据（顶层上下文每轮覆盖、无逐轮哈希），因此宁可把上下文标为仅准备/未核实，也不借一次历史发送把引用记成已投递。新格式的逐轮 `outbound_context_sha256` + 显式 `attempt_id`/租约绑定继续支持 `sent`。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 未改动，与 KONM-80 无共享文件冲突。
+
+
+## 15. 第九轮复验返工（R02 前零 invocation 的历史记录）
+
+sol 在候选 `113e42e` 上用 `delivery_compatibility_checks.py` 复现 1 个反例（2 PASS / 1 FAIL，exit 1）：R02 之前的 worker `58710bc` 首轮只发送合成引用 A；第二轮已准备 A、B，但预算拒绝而未发送。该格式既没有逐轮上下文，也没有任何 invocation 行，顶层 `called=true` 来自首轮——复盘仍落进「`called` → `sent`」的权威分支，把 B 记成已投递。
+
+| 失败项 | 修复 | 回归 / 证据 |
+| --- | --- | --- |
+| 零台账的 live 历史记录凭全局 `called` 进入权威分支，顶层上下文（含后一轮从未发送的引用）被当作已投递 | 删除 `_delivery` 的 `called → sent` 兜底：只有逐轮绑定（当前格式的 `context_rounds` + 显式 `attempt_id`/租约，或台账上可验证的最新轮）才可能给出 `sent`。无逐轮绑定的 live 历史记录统一为 `prepared_only`（若错误文本表明结果未知则 `send_unknown`）；可信回放（`replay_source`）仍为 `replayed`+权威 | `test_zero_invocation_legacy_record_never_claims_delivered_refs`（台账 0 行、`prepared_only`、`delivered_evidence={}`、`allowed_references=[]`、`metering.invocation_attempts=0`）；sol `delivery_compatibility_checks.py`：三种 writer（`58710bc`/`872312b`/HEAD）全部 `second_reference_projected_delivered=false`、`projected_state=prepared_only`、非 authoritative |
+
+复验命令与结果：
+
+| 命令 | 结果 |
+| --- | --- |
+| sol `delivery_compatibility_checks.py`（`PYTHONPATH=.:tests:scripts python3.12 -B <解压目录>/delivery_compatibility_checks.py`，仓库根为 cwd） | 3/3 PASS，exit 0（脚本为 sol 附件，未提交进仓库） |
+| sol `legacy_context_check.py` / `recovery_edges.py` / `dispatch_checks.py` / `invariant_checks.py` / `acceptance_edges.py` / `focused_checks.py` / `followup_checks.py` / `process_check.py` | 1/1、4/4、2/2、3/3、6/6、10/10、8/8、2/2 PASS，均 exit 0 |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 56 OK / exit 0 |
+| R22 / R02 / R03 / R17 / R17 role API / R18 / R15 citation / R10 | 9 / 18 / 14 / 12 / 19 / 34 / 5 / 11 OK，均 exit 0 |
+| 相邻 R01 / R14 / R20 / R20 scope / R15 personal / research rounds / fault matrix | 21 / 11 / 8 / 40 / 10 / 10 / 6 OK，均 exit 0 |
+
+边界说明：`called` 不再是任何送达凭证——它只说明「某一轮拿到过应答」，而旧格式的顶层上下文每轮覆盖。旧格式因此一律只保留调用台账（若有）并标为仅准备/未核实；回放记录（`replay_source`）仍为 `replayed` 且具权威，当前格式的逐轮哈希 + 租约绑定继续支持 `sent`。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 未改动，与 KONM-80 无共享文件冲突。
