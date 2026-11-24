@@ -71,7 +71,8 @@ def _projection_entries(config: Dict[str, Any], now: Optional[datetime] = None) 
 
 
 def build_ops_view(config: Dict[str, Any], *, store: Optional[Any] = None,
-                   now: Optional[datetime] = None) -> Dict[str, Any]:
+                   now: Optional[datetime] = None,
+                   actor: Optional[str] = None) -> Dict[str, Any]:
     from .models import now_iso
 
     config = config or {}
@@ -89,7 +90,13 @@ def build_ops_view(config: Dict[str, Any], *, store: Optional[Any] = None,
     budget: Dict[str, Any] = {"calls_today": 0, "limit": 0, "enabled": False}
     failures: List[Dict[str, Any]] = []
     if store is not None:
-        summary = store.summary() or {}
+        visible_ids: Optional[set] = None
+        if actor is not None:
+            from .personal_evidence import visible_task_ids
+
+            visible_ids = visible_task_ids(store, actor)
+        summary = (store.summary(task_ids=sorted(visible_ids))
+                   if visible_ids is not None else store.summary()) or {}
         counts = dict(summary.get("task_counts") or {})
         engine["status_counts"] = counts
         engine["remaining_queued"] = int(counts.get("queued") or 0)
@@ -103,6 +110,9 @@ def build_ops_view(config: Dict[str, Any], *, store: Optional[Any] = None,
                   "enabled": decision["limit"] > 0}
 
         terminal = list(store.list_tasks(status="failed")) + list(store.list_tasks(status="blocked"))
+        if visible_ids is not None:
+            terminal = [task for task in terminal
+                        if str(task.get("task_id") or "") in visible_ids]
         terminal.sort(key=lambda task: str(task.get("updated_at") or ""), reverse=True)
         failures = [
             {

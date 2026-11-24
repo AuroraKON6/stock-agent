@@ -26,6 +26,7 @@ def build_events_view(
     lookback_hours: int = DEFAULT_LOOKBACK_HOURS,
     limit: int = DEFAULT_EVENT_LIMIT,
     purpose: str = "",
+    actor: Optional[str] = None,
 ) -> Dict[str, Any]:
     from .event_contract import event_identity
     from .models import now_iso
@@ -34,6 +35,11 @@ def build_events_view(
     from .task_supply import load_research_signals
 
     purpose = purpose or DEFAULT_EVENT_PURPOSE
+    visible_ids: Optional[set] = None
+    if store is not None and actor is not None:
+        from .personal_evidence import visible_task_ids
+
+        visible_ids = visible_task_ids(store, actor)
     rows, selection = load_research_signals(config, lookback_hours=lookback_hours)
 
     clusters: Dict[str, Dict[str, Any]] = {}
@@ -72,6 +78,8 @@ def build_events_view(
                     continue
                 task_id = str(consumption.get("task_id") or "")
                 if not task_id or task_id in seen_tasks:
+                    continue
+                if visible_ids is not None and task_id not in visible_ids:
                     continue
                 seen_tasks.add(task_id)
                 try:

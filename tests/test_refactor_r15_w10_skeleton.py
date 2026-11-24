@@ -54,7 +54,11 @@ class W10SkeletonTestCase(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        # Resolve the temp root (same practice as the isolated browser
+        # driver's realpath): under a symlinked TMPDIR (e.g. /var on macOS)
+        # the vault's reparse-point guard would otherwise reject the object
+        # path. The production guard itself stays untouched.
+        self.root = Path(temporary.name).resolve()
         self.enterContext(project_path_override(lambda value: self.root / value))
         self.config = vault_config(self.root, {})
         mdg = self.config.setdefault("market_data_governance", {})
