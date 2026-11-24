@@ -192,12 +192,33 @@ def cancel_personal_task(store: TaskStore, *, actor: str, task_id: str,
     its parent is cancelled. An ALREADY-cancelled root is not a terminal
     refusal: the entry accepts it with the row's current version and lets
     the governed entry finish the interrupted descendant pass (idempotent,
-    one event per descendant). Every other terminal state is still refused."""
+    one event per descendant). Every other terminal state is still refused.
+
+    The caller is checked against the SERVER-SIDE input-owner binding before
+    anything is written — the session actor alone is not proof of ownership.
+    A task whose binding names another owner is refused with zero events on
+    the task and on every child."""
     from .subtask_graph import cancel_task_tree  # no module cycle
 
     task = store.get_task(str(task_id or ""))
     if task["status"] in TERMINAL_STATUSES and task["status"] != STATUS_CANCELLED:
         raise WorkspaceError("cancel_terminal: task already finished ({0})".format(task["status"]))
+    binding = store.input_owner_binding(str(task["task_id"]))
+    if not binding:
+        # A descendant carries no binding of its own; the personal root does.
+        root, seen = task, {str(task["task_id"])}
+        while not binding and str(root.get("parent_task_id") or ""):
+            root_id = str(root["parent_task_id"])
+            if root_id in seen:
+                break
+            seen.add(root_id)
+            root = store.get_task(root_id)
+            binding = store.input_owner_binding(root_id)
+    owner = str((binding or {}).get("owner") or "")
+    if owner and str(actor) != owner:
+        raise WorkspaceError(
+            "personal_owner_mismatch: task {0} belongs to another personal namespace".format(
+                task_id))
     return cancel_task_tree(
         store, str(task_id), actor=actor,
         reason=str(reason or "用户取消")[:500],

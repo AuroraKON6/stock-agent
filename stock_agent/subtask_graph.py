@@ -192,7 +192,7 @@ def propose_subtasks(
     if preliminary["status"] in TERMINAL_STATUSES:
         raise SubtaskGraphError(
             "parent_terminal: {0} is {1}".format(parent_task_id, preliminary["status"]))
-    requested_in = _cancel_requested_in_chain(store, preliminary)
+    requested_in = cancelled_ancestor(store, preliminary)
     if requested_in is not None:
         raise SubtaskGraphError(
             "parent_cancel_requested: {0} (or an ancestor) has a cancellation request".format(
@@ -252,7 +252,7 @@ def _propose_locked(
     # children appear after the cancellation and outlive it. The check is made
     # inside the boundary through the authoritative connection, so it cannot
     # race the cancellation's own parent read.
-    requested_in = _cancel_requested_in_chain(store, parent)
+    requested_in = cancelled_ancestor(store, parent)
     if requested_in is not None:
         raise SubtaskGraphError(
             "parent_cancel_requested: {0} (or an ancestor) has a cancellation request".format(
@@ -742,15 +742,17 @@ def _children_of(store: TaskStore, parent_task_id: str) -> List[Dict[str, Any]]:
             if str(task.get("parent_task_id") or "") == str(parent_task_id)]
 
 
-def _cancel_requested_in_chain(store: TaskStore, task: Dict[str, Any]) -> Optional[str]:
-    """The nearest task id on ``task``'s ancestor chain with cancel requested.
+def cancelled_ancestor(store: TaskStore, task: Dict[str, Any]) -> Optional[str]:
+    """The nearest task on ``task``'s ancestor chain (itself included) that is
+    cancelled or has a cancellation request.
 
     A cancellation request is recorded on the task itself (``cancel_requested``
     is set on a leased/running row too, before the worker checkpoints). It
-    therefore has to be honoured wherever work would be created for that task
-    OR for any of its descendants — a grandchild must not be able to fan out
-    under a cancelled root whose middle node is merely queued. Walks the parent
-    chain and stops on a cycle or a missing parent (defensive only)."""
+    therefore has to be honoured wherever work would be created for that task,
+    for any of its descendants, and by a worker about to spend a model call on
+    the task: a grandchild must not fan out or dispatch under a cancelled root
+    whose middle node is merely queued. Walks the parent chain and stops on a
+    cycle or a missing parent (defensive only)."""
     seen = set()
     current: Optional[Dict[str, Any]] = task
     while current is not None:
@@ -758,7 +760,7 @@ def _cancel_requested_in_chain(store: TaskStore, task: Dict[str, Any]) -> Option
         if task_id in seen:
             return None
         seen.add(task_id)
-        if current.get("cancel_requested"):
+        if current.get("cancel_requested") or current.get("status") == STATUS_CANCELLED:
             return task_id
         parent_id = str(current.get("parent_task_id") or "")
         if not parent_id:

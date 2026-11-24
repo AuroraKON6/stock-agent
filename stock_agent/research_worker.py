@@ -42,6 +42,7 @@ from .models import AnalyzedSignal, now_iso
 from .task_runtime import (
     STATUS_BLOCKED,
     STATUS_SUCCEEDED,
+    TERMINAL_STATUSES,
     TaskRuntimeError,
     TaskStore,
 )
@@ -512,6 +513,47 @@ def _link_context_attempt(model_call: Dict[str, Any], exc: BaseException) -> Non
         records[-1]["attempt_id"] = attempt_id
 
 
+def _stop_for_cancelled_ancestor(store: TaskStore, task: Dict[str, Any],
+                                 worker_id: str,
+                                 model_call: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Refuse to spend a model call when an ancestor is cancelled.
+
+    A partial cancellation can commit the ROOT while the descendant pass has
+    not yet recorded the request on this child (the child may even still be
+    leased to us). The child must not become a live payer in that window: the
+    persistent ``cancel_requested`` flag is written here, at the worker's own
+    checkpoint, and no outbound request or invocation row is created. An
+    already-terminal child keeps its result untouched."""
+    from .subtask_graph import cancelled_ancestor  # no module cycle
+
+    ancestor = cancelled_ancestor(store, task)
+    if ancestor is None:
+        return None
+    task_id = str(task["task_id"])
+    current = store.get_task(task_id)
+    if current["status"] not in TERMINAL_STATUSES and not current.get("cancel_requested"):
+        try:
+            store.request_cancel(task_id, actor=str(worker_id),
+                                 reason="ancestor {0} was cancelled".format(ancestor),
+                                 expected_version=int(current["version"]))
+        except TaskRuntimeError:
+            # The row moved between the read and the write (or is already
+            # terminal): the cancellation itself is still enforced below.
+            pass
+    try:
+        # The worker's own checkpoint lands the terminal state in THIS lease,
+        # exactly like the normal per-round cancellation point. A stale
+        # fencing token means someone else owns the row now; still no dispatch.
+        store.cancel_if_requested(task_id, worker_id=worker_id,
+                                  fencing_token=task["fencing_token"])
+    except TaskRuntimeError:
+        pass
+    model_call["cancelled_by_ancestor"] = str(ancestor)
+    model_call["error"] = "ancestor {0} cancellation; no outbound permitted".format(ancestor)
+    return {"status": "cancelled", "model_call": model_call,
+            "cancelled_by_ancestor": str(ancestor)}
+
+
 def run_research_task(
     store: TaskStore,
     task_id: str,
@@ -595,6 +637,13 @@ def run_research_task(
     }
     if approved_role_prompt_sha256:
         model_call["role_prompt_sha256"] = approved_role_prompt_sha256
+    # A cancelled/partially-cancelled ancestor forbids ANY outbound work here,
+    # even while this child is still leased to us: dispatch now would spend
+    # budget and create an invocation row inside the cancellation's recovery
+    # window. Checked before egress and before the first round.
+    ancestor_stop = _stop_for_cancelled_ancestor(store, task, worker_id, model_call)
+    if ancestor_stop is not None:
+        return ancestor_stop
     # R02/F04: a lease renewal failure during ANY call revokes this worker's
     # right to start NEW outbound requests, even if the between-rounds renewal
     # would happen to succeed afterwards.
@@ -804,6 +853,9 @@ def run_research_task(
             current = store.cancel_if_requested(task_id, worker_id=worker_id, fencing_token=task["fencing_token"])
             if current["status"] == "cancelled":
                 return {"status": "cancelled", "model_call": model_call}
+            ancestor_stop = _stop_for_cancelled_ancestor(store, current, worker_id, model_call)
+            if ancestor_stop is not None:
+                return ancestor_stop
             elapsed = time.perf_counter() - started
             if elapsed > case_time_limit:
                 return _fail(

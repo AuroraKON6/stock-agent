@@ -42,7 +42,7 @@ Python 3.12.15，仓库锁定 `pyyaml==6.0.3`。全部在仓库根目录执行�
 | 命令 | 结果 |
 | --- | --- |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22.py` | 9 OK / exit 0 |
-| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 49 OK / exit 0（本单专项，第五轮后） |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 52 OK / exit 0（本单专项，第六轮后） |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17.py` | 12 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17_role_api.py` | 19 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r18.py` | 34 OK / exit 0 |
@@ -233,3 +233,27 @@ sol 在候选 `0d6b485` 上用 `recovery_edges.py` 复现 4 个反例（exit 1�
 | C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run9 --port 18195`（共享锁内串行） | PASS 53/53，cleanup 残留 0，端口可重绑 |
 
 边界说明：取消只在**没有 `fcntl` 模块**的平台上退化为进程内互斥；`flock` 存在但失败时取消与创建一样失败关闭。受保护恢复要求并提交一条新凭证（或复用首次已提交的同命令凭证），核销与后代传播仍是两次提交：若传播再次失败，需要再签发一张凭证——这是「单命令一凭证」的代价，已在注释中写明。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 未改动。
+
+
+## 12. 第六轮复验返工（sol 的 3 个反例）
+
+sol 在候选 `3e44c04` 上用 `invariant_checks.py` 复现 3 个反例（exit 1）。逐项修复：
+
+| # | 失败项 | 修复 | 回归 / 证据 |
+| --- | --- | --- | --- |
+| 1 | 根已提交 `cancelled`、入口报 `cancel_conflict`，恢复前启动的普通 worker 仍为该子任务发出 1 次 provider 调用、写 1 条 invocation，子成功、取消事件 0 | worker 在 egress 之前与每轮之间都检查**祖先链**（`subtask_graph.cancelled_ancestor`，含已终止的 `cancelled`）：命中即在自己的检查点写入持久 `cancel_requested` 并调用 `cancel_if_requested`（本租约内落地），记录 `cancelled_by_ancestor`，直接返回 `cancelled`——不发任何出站请求、不建 invocation；已是终态的子任务保持原结果 | `test_cancelled_ancestor_blocks_dispatch_before_recovery`（provider 桩 0 调用、`invocation_attempts==[]`、子 `cancelled`+`cancel_requested`）；invariant `cancelled_ancestor_prevents_dispatch_before_recovery`（`provider_stub_calls=0`、`invocations=0`、`child_cancel_events=2`） |
+| 2 | 外部合成 actor 从工作台取消一个他人绑定的根，根与子各写 1 条取消事件（共 2 条） | `cancel_personal_task` 在**任何写入前**校验服务端 `input_owner_binding`：任务本身没有绑定时沿父链走到个人根；绑定存在且 actor 不符即 `personal_owner_mismatch`，正常入口与已取消根的续跑入口共用该校验，零事件返回 | `test_workspace_cancel_refuses_a_foreign_owner`（两个合成身份，状态均仍 `queued`、事件 0）；invariant `workspace_cancel_uses_task_owner_binding`（`parent_cancel_events=0`、`child_cancel_events=0`） |
+| 3 | 旧格式 `model_call`（`872312b` 写出：无 `context_rounds`、`called=false`、存在上一租约的 invocation）仍被复盘判为 `sent` | 旧格式只接受**它自己记录的那一轮**的 `attempt_id`（且 `called` 为真）绑定到当前上下文；有 invocation 台账但无绑定证据时一律 `prepared_only`（不以 `called` 兜底），历史 invocation 仍完整列出可审计 | `test_legacy_model_call_never_borrows_a_prior_lease_send`（无绑定 → `prepared_only`、`delivered_evidence={}`；`called=True` 且带 `rounds[].attempt_id` 的正例 → `sent`）；invariant `legacy_context_does_not_borrow_prior_lease`（`delivery_state=prepared_only`、非 `authoritative`） |
+
+复验命令与结果：
+
+| 命令 | 结果 |
+| --- | --- |
+| sol `invariant_checks.py`（`PYTHONPATH=.:tests:scripts python3.12 -B <解压目录>/invariant_checks.py`，仓库根为 cwd） | 3/3 PASS，exit 0（脚本为 sol 附件，未提交进仓库） |
+| sol `recovery_edges.py` / `acceptance_edges.py` / `focused_checks.py` / `followup_checks.py` / `process_check.py` | 4/4、6/6、10/10、8/8、2/2 PASS，均 exit 0 |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 52 OK / exit 0 |
+| R22 / R02 / R03 / R17 / R17 role API / R18 / R15 citation / R10 | 9 / 18 / 14 / 12 / 19 / 34 / 5 / 11 OK，均 exit 0 |
+| 相邻 R01 / R14 / R20 / R20 scope / R15 personal / research rounds / fault matrix | 21 / 11 / 8 / 40 / 10 / 10 / 6 OK，均 exit 0 |
+| C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run10 --port 18197`（共享锁内串行） | PASS 53/53，`down --volumes` exit 0，残留容器/网络/卷 0，端口可重绑 |
+
+边界说明：worker 侧的祖先取消是**本地检查点**——它保证本 worker 在取消的恢复窗口内零出站、零计量，并顺手把子任务标记为 `cancelled`；跨进程的图互斥与后代清点仍由 `cancel_subtree` 负责，二者不互相替代。工作台归属校验只针对**有服务端绑定**的任务：没有绑定的（非个人来源）任务保持原有入口语义，由 store 的原子授权与版本检查把关。旧格式复盘宁可 `prepared_only` 也不以 `called` 兜底——未绑定的发送不可证明即视为未送达。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 未改动，与 KONM-80 无共享文件冲突。

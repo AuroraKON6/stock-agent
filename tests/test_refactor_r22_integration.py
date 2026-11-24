@@ -1339,6 +1339,104 @@ class SignoffAndDeliveryTests(R22IntegrationCase):
         self.assertEqual(stub.call_count, 1,
                          "the budget blocked the second dispatch before any send")
 
+    def test_cancelled_ancestor_blocks_dispatch_before_recovery(self):
+        fixture = self.attempt_fixture("test_successful_call_records_succeeded_attempt")
+        store = fixture.store
+        root = fixture.create_live_task()
+        root = store.get_task(root["task_id"])
+        child = propose_subtasks(
+            store, parent_task_id=root["task_id"],
+            proposals=[{"role_id": "event_analyst", "question": "synthetic child research"}])
+        child_id = child["created"][0]["task_id"]
+        claim = store.claim_task(child_id, "w-r02")
+        original = TaskStore.request_cancel
+
+        def renew_before_cancel(connection, task_id, **values):
+            if task_id == child_id:
+                store.renew_lease(child_id, worker_id="w-r02",
+                                  fencing_token=claim["fencing_token"])
+            return original(connection, task_id, **values)
+
+        # The root commits cancelled; the child pass exhausts its retries, so
+        # the child is still leased with NO cancel flag yet.
+        with patch.object(TaskStore, "request_cancel", renew_before_cancel):
+            with self.assertRaises(SubtaskGraphError):
+                workflow_cancel_task(
+                    str(store.db_path), root["task_id"], actor="operator",
+                    reason="取消", expected_version=root["version"])
+        partial_child = store.get_task(child_id)
+        self.assertEqual(partial_child["status"], "leased")
+        self.assertFalse(partial_child["cancel_requested"])
+        # A normal worker starts BEFORE the recovery pass: it must not spend a
+        # call or write an invocation row for a cancelled tree.
+        with patch("stock_agent.pi_runtime.call_pi_agent",
+                   return_value=fixture.response(
+                       fixture.final_output(child_id))) as stub:
+            result = fixture.run_worker(partial_child)
+        self.assertEqual(stub.call_count, 0,
+                         "a cancelled ancestor forbids every outbound call")
+        self.assertEqual(store.invocation_attempts(child_id), [],
+                         "no invocation row is written in the recovery window")
+        self.assertEqual(result["status"], "cancelled")
+        child_after = store.get_task(child_id)
+        self.assertEqual(child_after["status"], "cancelled")
+        self.assertTrue(child_after["cancel_requested"],
+                        "the worker records the persistent cancellation marker")
+        self.assertEqual(store.get_task(child_id)["output"], {})
+
+    def test_workspace_cancel_refuses_a_foreign_owner(self):
+        created = create_personal_research(
+            self.store, actor=OWNER, question="个人工作台归属校验 600519",
+            symbols=["600519"], execution_mode="replay", config=self.config)
+        root = created["task"]
+        child = propose_subtasks(
+            self.store, parent_task_id=root["task_id"],
+            proposals=[{"role_id": "event_analyst", "question": "归属校验子任务"}])
+        child_id = child["created"][0]["task_id"]
+        self.assertTrue(self.store.input_owner_binding(root["task_id"]))
+        with self.assertRaises(WorkspaceError) as caught:
+            cancel_personal_task(self.store, actor=OTHER, task_id=root["task_id"],
+                                 expected_version=root["version"], reason="越权取消")
+        self.assertIn("personal_owner_mismatch", str(caught.exception))
+        self.assertEqual(self.store.get_task(root["task_id"])["status"], "queued")
+        self.assertEqual(self.store.get_task(child_id)["status"], "queued")
+        for task_id in (root["task_id"], child_id):
+            self.assertEqual(
+                sum(event["event_type"] in {"task_cancelled", "task_cancel_requested"}
+                    for event in self.store.events(task_id)), 0,
+                "a refused owner writes no cancellation event")
+
+    def test_legacy_model_call_never_borrows_a_prior_lease_send(self):
+        from stock_agent.personal_review import _delivery
+
+        payload = {"public_context": {"evidence_summaries": {
+            "doc-1": {"summary": "synthetic", "sha256": "0" * 64}}}}
+        outbound = {"evidence_summaries": {
+            "doc-1": {"summary": "synthetic", "sha256": "0" * 64}}}
+        attempts = [{"attempt_id": "att-old-lease", "round_index": 1, "sent": "yes",
+                     "started_at": "2026-11-24T10:00:00+08:00",
+                     "worker_id": "w-r02", "fencing_token": 3}]
+        legacy_blocked = {
+            "mode": "live", "called": False, "rounds": [],
+            "context_delivery": {"delivered_evidence": ["doc-1"]},
+            "outbound_context": outbound,
+            "governance": {"gate": "budget"},
+        }
+        delivery = _delivery(payload, legacy_blocked, attempts)
+        self.assertEqual(delivery["state"], "prepared_only",
+                         "a legacy record after requeue has no send credential")
+        self.assertEqual(delivery["delivered"], {})
+        self.assertFalse(delivery["authoritative"])
+        self.assertEqual(delivery["rounds"], [])
+        # The historical invocation stays visible in the ledger, but a legacy
+        # record that DID return is still bound by its own round attempt id.
+        legacy_delivered = dict(legacy_blocked, called=True,
+                                rounds=[{"round": 1, "attempt_id": "att-old-lease"}])
+        delivered = _delivery(payload, legacy_delivered, attempts)
+        self.assertEqual(delivered["state"], "sent")
+        self.assertTrue(delivered["authoritative"])
+        self.assertEqual(delivered["rounds"][0]["attempt_id"], "att-old-lease")
+
     def test_review_uses_worker_delivery_ledger_not_input_payload(self):
         undelivered = "synthetic-not-in-vault"
         spec = self.spec()

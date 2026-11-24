@@ -222,12 +222,23 @@ def _delivery_rounds(model_call: Dict[str, Any],
                     attempt = candidates[-1] if candidates else None
             rounds.append({"round": index, "context": record, "attempt": attempt})
         return rounds
-    # Legacy/other writers: no per-round context records. The ledger alone is
-    # still more trustworthy than ``called``; the newest attempt stands for the
-    # context the worker reports (top-level delivery/outbound_context).
+    # Legacy/other writers: no per-round context records. Their only
+    # self-recorded binding is the attempt id on the round they delivered.
+    # Accept the LAST round's attempt, and only when the worker recorded a
+    # returned call — a requeued task whose new context never left must not
+    # borrow an older lease's ``sent``. Without that evidence the ledger is
+    # still listed (``attempts``) but nothing is bound to this context.
     if attempts:
-        rounds.append({"round": int(attempts[-1].get("round_index") or 0),
-                       "context": None, "attempt": attempts[-1]})
+        records = model_call.get("rounds")
+        last_record = (records[-1] if isinstance(records, list) and records
+                       and isinstance(records[-1], dict) else {})
+        attempt_id = str(last_record.get("attempt_id") or "")
+        if bool(model_call.get("called")) and attempt_id:
+            match = next((item for item in reversed(attempts)
+                          if str(item.get("attempt_id") or "") == attempt_id), None)
+            if match is not None:
+                rounds.append({"round": int(match.get("round_index") or 0),
+                               "context": None, "attempt": match})
     return rounds
 
 
@@ -279,6 +290,12 @@ def _delivery(payload: Dict[str, Any],
         state, authoritative = _sent_state(str(latest["attempt"].get("sent") or ""))
     elif latest is not None:
         # The latest prepared context has no invocation row: nothing was sent.
+        state, authoritative = "prepared_only", False
+    elif attempts:
+        # A ledger exists but nothing binds it to the current context (a
+        # legacy record after a requeue, or a run that stopped before any
+        # round). Do not fall back to ``called``: that flag may describe a
+        # previous lease. Unverified = not delivered.
         state, authoritative = "prepared_only", False
     elif str(model_call.get("replay_source") or ""):
         state, authoritative = "replayed", True
