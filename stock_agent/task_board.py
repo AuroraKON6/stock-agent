@@ -728,7 +728,9 @@ Personal acknowledgement is a personal research acknowledgement, not institution
         + esc(awaiting.length) + '</b>');
       data += chip('model calls today <b>' + esc(budget.calls_today || 0) + '</b>'
         + (budget.enabled ? ' / limit ' + esc(budget.limit) : ' <span class="ok">(budget off)</span>'));
-      html += '<span data-ov-data>' + data + '</span>';
+      // display:contents keeps each chip a direct flex item of .ovbar
+      // (its per-chip wrapping and gap), so the wrapper cannot split a chip.
+      html += '<span data-ov-data style="display:contents">' + data + '</span>';
     }
     // The snapshot time is the server's own generated_at, shown verbatim.
     var stamp = snap && snap.generatedAt
