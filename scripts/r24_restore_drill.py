@@ -65,7 +65,8 @@ def seed_attempt(store, config: dict, state: str) -> dict:
     task, _ = store.create_task(
         title=f"R24 fixture {state}", case_id=CASE, execution_mode="replay",
         business_intent_id=f"{CASE}-{state}",
-        input_payload={"research_question": f"Synthetic budget fixture {state}"})
+        input_payload={"data_classification": "public",
+                       "research_question": f"Synthetic budget fixture {state}"})
     task_id = task["task_id"]
     claimed = store.claim_task(task_id, ACTOR)
     worker = {"worker_id": ACTOR, "fencing_token": claimed["fencing_token"]}
