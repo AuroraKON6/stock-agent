@@ -40,7 +40,12 @@ from stock_agent.personal_review import (
     actor_kind,
     project_review,
 )
-from stock_agent.personal_workspace import acknowledge_completed_research, create_personal_research
+from stock_agent.personal_workspace import (
+    WorkspaceError,
+    acknowledge_completed_research,
+    cancel_personal_task,
+    create_personal_research,
+)
 from stock_agent.research_worker import run_research_task
 from stock_agent.role_execution import (
     FlowRegistry,
@@ -62,7 +67,10 @@ from stock_agent.subtask_graph import (
     propose_subtasks,
 )
 from stock_agent.task_runtime import TaskStore
-from stock_agent.task_runtime.store import TERMINAL_STATUSES
+from stock_agent.task_runtime.store import (
+    TERMINAL_STATUSES,
+    TaskVersionConflictError,
+)
 from stock_agent.task_supply import build_task_spec
 from stock_agent.workflow_service import cancel_task as workflow_cancel_task
 
@@ -860,6 +868,149 @@ class CancelAndPartialFailureTests(R22IntegrationCase):
             sum(event["event_type"] in {"task_cancelled", "task_cancel_requested"}
                 for event in self.store.events(child_id)), 1)
 
+    def test_proposal_refused_after_cancel_request_on_a_running_parent(self):
+        root = self.create_root()
+        claim = self.store.claim_task(root["task_id"], "cancel-worker")
+        running = self.store.mark_running(
+            root["task_id"], worker_id="cancel-worker",
+            fencing_token=claim["fencing_token"], expected_version=claim["version"])
+        requested = workflow_cancel_task(
+            str(self.db_path), root["task_id"], actor="operator",
+            reason="取消", expected_version=running["version"])
+        self.assertEqual(requested["status"], "running")
+        self.assertTrue(requested["cancel_requested"],
+                        "a leased/running task records the request, not a status")
+        with self.assertRaises(SubtaskGraphError) as caught:
+            propose_subtasks(self.store, parent_task_id=root["task_id"],
+                             proposals=[{"role_id": "event_analyst",
+                                         "question": "late work"}])
+        self.assertIn("parent_cancel_requested", str(caught.exception))
+        self.assertEqual(self.children(root["task_id"]), [],
+                         "a pending cancellation admits no new work")
+        terminal = self.store.cancel_if_requested(
+            root["task_id"], worker_id="cancel-worker",
+            fencing_token=claim["fencing_token"])
+        self.assertEqual(terminal["status"], "cancelled")
+        self.assertEqual(self.children(root["task_id"]), [],
+                         "nothing appears after the worker's checkpoint either")
+
+    def test_proposal_refused_under_a_cancelled_ancestor(self):
+        root = self.create_root()
+        middle = propose_subtasks(self.store, parent_task_id=root["task_id"],
+                                  max_depth=3,
+                                  proposals=[{"role_id": "event_analyst",
+                                              "question": "middle"}])
+        middle_id = middle["created"][0]["task_id"]
+        claim = self.store.claim_task(middle_id, "ancestor-worker")
+        self.store.mark_running(middle_id, worker_id="ancestor-worker",
+                                fencing_token=claim["fencing_token"],
+                                expected_version=claim["version"])
+        # Cancel ONLY the root through the raw store entry: the middle node
+        # carries no flag of its own, its ANCESTOR is cancelled.
+        self.store.request_cancel(
+            root["task_id"], actor="operator", reason="取消",
+            expected_version=self.store.get_task(root["task_id"])["version"])
+        with self.assertRaises(SubtaskGraphError) as caught:
+            propose_subtasks(self.store, parent_task_id=middle_id, max_depth=3,
+                             proposals=[{"role_id": "counter_evidence",
+                                         "question": "grandchild"}])
+        self.assertIn("parent_cancel_requested", str(caught.exception),
+                      "an ancestor's cancellation blocks fan-out below it")
+        self.assertEqual(self.children(middle_id), [])
+
+    def test_partial_cancellation_resumes_with_the_current_root_version(self):
+        root = self.create_root()
+        child = propose_subtasks(
+            self.store, parent_task_id=root["task_id"],
+            proposals=[{"role_id": "event_analyst", "question": "leased child"}])
+        child_id = child["created"][0]["task_id"]
+        claim = self.store.claim_task(child_id, "renewing-worker")
+        original = TaskStore.request_cancel
+        renewals = [0]
+
+        def renew_before_cancel(connection, task_id, **values):
+            if task_id == child_id:
+                renewals[0] += 1
+                self.store.renew_lease(child_id, worker_id="renewing-worker",
+                                       fencing_token=claim["fencing_token"])
+            return original(connection, task_id, **values)
+
+        with patch.object(TaskStore, "request_cancel", renew_before_cancel):
+            with self.assertRaises(SubtaskGraphError) as caught:
+                workflow_cancel_task(
+                    str(self.db_path), root["task_id"], actor="operator",
+                    reason="取消", expected_version=root["version"])
+        self.assertIn("cancel_conflict", str(caught.exception))
+        self.assertGreaterEqual(renewals[0], 8)
+        partial_root = self.store.get_task(root["task_id"])
+        self.assertEqual(partial_root["status"], "cancelled",
+                         "the authorized root transition commits first")
+        self.assertFalse(self.store.get_task(child_id)["cancel_requested"],
+                         "the descendant pass did not get through")
+        resumed = workflow_cancel_task(
+            str(self.db_path), root["task_id"], actor="operator",
+            reason="取消", expected_version=partial_root["version"])
+        self.assertEqual(resumed["status"], "cancelled")
+        child_after = self.store.get_task(child_id)
+        self.assertTrue(child_after["cancel_requested"])
+        self.assertEqual(
+            sum(event["event_type"] in {"task_cancelled", "task_cancel_requested"}
+                for event in self.store.events(child_id)), 1,
+            "the resumed pass is idempotent — one event per descendant")
+        self.assertEqual(
+            sum(event["event_type"] == "task_cancelled"
+                for event in self.store.events(root["task_id"])), 1,
+            "the resume never re-emits the root cancellation")
+
+    def test_personal_workspace_cancel_cancels_the_children(self):
+        created = create_personal_research(
+            self.store, actor=OWNER, question="个人工作台取消整棵树 600519",
+            symbols=["600519"], execution_mode="replay", config=self.config)
+        root = created["task"]
+        child = propose_subtasks(
+            self.store, parent_task_id=root["task_id"],
+            proposals=[{"role_id": "event_analyst", "question": "个人子任务"}])
+        child_id = child["created"][0]["task_id"]
+        with self.assertRaises(TaskVersionConflictError):
+            cancel_personal_task(self.store, actor=OWNER, task_id=root["task_id"],
+                                 expected_version=0, reason="版本不符")
+        self.assertEqual(self.store.get_task(root["task_id"])["status"], "queued",
+                         "a stale version cancels nothing")
+        cancelled = cancel_personal_task(
+            self.store, actor=OWNER, task_id=root["task_id"],
+            expected_version=self.store.get_task(root["task_id"])["version"],
+            reason="用户取消")
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(self.store.get_task(child_id)["status"], "cancelled",
+                         "the workspace entry cannot leave a child queued")
+        self.assertEqual(
+            sum(event["event_type"] == "task_cancelled"
+                for event in self.store.events(child_id)), 1)
+        with self.assertRaises(WorkspaceError) as caught:
+            cancel_personal_task(self.store, actor=OWNER, task_id=root["task_id"],
+                                 expected_version=cancelled["version"], reason="再次取消")
+        self.assertIn("cancel_terminal", str(caught.exception),
+                      "the entry's terminal guard stays in front")
+
+    def test_single_task_cancel_survives_missing_fcntl(self):
+        root = self.create_root()
+        other = self.create_root()
+        with patch.object(subtask_graph, "fcntl", None):
+            cancelled = workflow_cancel_task(
+                str(self.db_path), root["task_id"], actor="operator",
+                reason="无 fcntl 取消", expected_version=root["version"])
+            with self.assertRaises(SubtaskGraphError) as caught:
+                propose_subtasks(
+                    self.store, parent_task_id=other["task_id"],
+                    proposals=[{"role_id": "event_analyst", "question": "no lock"}])
+        self.assertEqual(cancelled["status"], "cancelled",
+                         "cancellation must not depend on the graph file lock")
+        self.assertIn("graph_lock_unavailable", str(caught.exception),
+                      "creation still refuses without cross-process exclusion")
+        self.assertEqual(
+            sum(event["event_type"] == "task_cancelled"
+                for event in self.store.events(root["task_id"])), 1)
+
     def test_partial_step_failure_keeps_sibling_parent_and_audit(self):
         root, flow = self.bound_root()
         self.run_step(root, flow, "event_analyst", "兄弟步骤的成功结果")
@@ -914,6 +1065,93 @@ class CancelAndPartialFailureTests(R22IntegrationCase):
 # ---------------------------------------------------------------------- #
 
 class SignoffAndDeliveryTests(R22IntegrationCase):
+    def attempt_fixture(self, test_name):
+        """A live-worker fixture (R02) so the invocation ledger is real."""
+        from test_refactor_r02 import AttemptChainTests
+
+        fixture = AttemptChainTests(test_name)
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        return fixture
+
+    def test_projection_uses_the_invocation_ledger_on_a_known_failure(self):
+        fixture = self.attempt_fixture("test_known_provider_failure_is_not_auto_retried")
+        task = fixture.create_live_task()
+        with patch("stock_agent.pi_runtime.call_pi_agent",
+                   side_effect=OSError("HTTP Error 401: Unauthorized")) as stub:
+            fixture.run_worker(task)
+        self.assertEqual(stub.call_count, 1)
+        attempts = fixture.store.invocation_attempts(task["task_id"])
+        self.assertEqual([(item["state"], item["sent"]) for item in attempts],
+                         [("failed_known", "yes")])
+        review = project_review(fixture.store, identity=self.identity(),
+                                task_ids=[task["task_id"]])
+        sources = review["tasks"][0]["sources"]
+        self.assertEqual(sources["delivery_state"], "sent",
+                         "a deterministic 401 still DELIVERED the outbound context")
+        self.assertTrue(sources["delivery_authoritative"])
+        self.assertEqual([(item["round"], item["sent"], item["state"])
+                          for item in sources["delivery_rounds"]],
+                         [(1, "yes", "sent")])
+        self.assertTrue(sources["delivery_rounds"][0]["attempt_id"],
+                        "the context summary is bound to the round's attempt row")
+
+    def test_latest_unknown_send_survives_an_earlier_successful_round(self):
+        from test_refactor_r02 import _pi_error
+
+        fixture = self.attempt_fixture(
+            "test_a07_timeout_after_send_is_unknown_and_never_auto_requeued")
+        task = fixture.create_live_task()
+        first_round = dict(fixture.final_output(task["task_id"]), requested_intents=[{
+            "schema_version": "1.0", "task_id": task["task_id"],
+            "action": "read_public_quote_snapshot", "parameters": {"symbol": "600519"},
+            "reason_summary": "synthetic round continuation",
+        }])
+        timeout = _pi_error("synthetic timeout", stage="process", sent_hint="unknown")
+        with patch("stock_agent.pi_runtime.call_pi_agent",
+                   side_effect=[fixture.response(first_round), timeout]) as stub:
+            result = fixture.run_worker(task)
+        self.assertEqual(stub.call_count, 2)
+        self.assertEqual(result["status"], "blocked")
+        attempts = sorted(fixture.store.invocation_attempts(task["task_id"]),
+                          key=lambda item: item["round_index"])
+        self.assertEqual([item["sent"] for item in attempts], ["yes", "unknown"])
+        review = project_review(fixture.store, identity=self.identity(),
+                                task_ids=[task["task_id"]])
+        sources = review["tasks"][0]["sources"]
+        self.assertEqual(sources["delivery_state"], "send_unknown",
+                         "the global called flag must not turn the LAST send into 'sent'")
+        self.assertFalse(sources["delivery_authoritative"])
+        self.assertEqual(sources["delivered_evidence"], {},
+                         "an unknown send never admits evidence as delivered")
+        self.assertEqual([(item["round"], item["sent"], item["state"])
+                          for item in sources["delivery_rounds"]],
+                         [(1, "yes", "sent"), (2, "unknown", "send_unknown")])
+
+    def test_context_round_never_pairs_with_an_earlier_runs_attempt(self):
+        from stock_agent.personal_review import _delivery
+
+        payload = {"public_context": {"evidence_summaries": {
+            "doc-1": {"summary": "synthetic", "sha256": "0" * 64}}}}
+        model_call = {
+            "mode": "live",
+            "error": "ModelCallNotSent: synthetic preflight failure",
+            "context_rounds": [{
+                "round": 1, "prepared_at": "2026-11-24T10:00:10+08:00",
+                "delivery": {"delivered_evidence": ["doc-1"]}}],
+            "context_delivery": {"delivered_evidence": ["doc-1"]},
+            "outbound_context": {"evidence_summaries": {
+                "doc-1": {"summary": "synthetic", "sha256": "0" * 64}}},
+        }
+        earlier_run = [{
+            "attempt_id": "att-previous-run", "round_index": 1, "sent": "yes",
+            "started_at": "2026-11-24T10:00:00+08:00"}]
+        delivery = _delivery(payload, model_call, earlier_run)
+        self.assertEqual(delivery["state"], "prepared_only",
+                         "an older run's attempt cannot vouch for a new context")
+        self.assertEqual(delivery["delivered"], {})
+        self.assertFalse(delivery["authoritative"])
+
     def test_review_uses_worker_delivery_ledger_not_input_payload(self):
         undelivered = "synthetic-not-in-vault"
         spec = self.spec()

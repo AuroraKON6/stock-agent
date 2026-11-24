@@ -47,9 +47,11 @@ except ImportError:  # pragma: no cover - Windows hosts fall back to the RLock
     fcntl = None  # type: ignore[assignment]
 
 from .task_runtime.store import (
+    STATUS_CANCELLED,
     TERMINAL_STATUSES,
     TaskRuntimeError,
     TaskStore,
+    TaskTransitionError,
     TaskVersionConflictError,
 )
 
@@ -189,6 +191,11 @@ def propose_subtasks(
     if preliminary["status"] in TERMINAL_STATUSES:
         raise SubtaskGraphError(
             "parent_terminal: {0} is {1}".format(parent_task_id, preliminary["status"]))
+    requested_in = _cancel_requested_in_chain(store, preliminary)
+    if requested_in is not None:
+        raise SubtaskGraphError(
+            "parent_cancel_requested: {0} (or an ancestor) has a cancellation request".format(
+                requested_in))
     if len(_children_of(store, parent_task_id)) > max_children:
         raise SubtaskGraphError(
             "fanout_exceeded: parent {0} already exceeds cap {1}".format(
@@ -237,6 +244,18 @@ def _propose_locked(
     if parent["status"] in TERMINAL_STATUSES:
         raise SubtaskGraphError(
             "parent_terminal: {0} is {1}".format(parent_task_id, parent["status"]))
+    # A cancelled parent is terminal, but a LEASED/RUNNING parent with a pending
+    # cancellation request is not: the worker only lands the terminal state at
+    # its next checkpoint. From the moment the request is recorded, this task
+    # (or any descendant asked to fan out) may create NO new work — otherwise
+    # children appear after the cancellation and outlive it. The check is made
+    # inside the boundary through the authoritative connection, so it cannot
+    # race the cancellation's own parent read.
+    requested_in = _cancel_requested_in_chain(store, parent)
+    if requested_in is not None:
+        raise SubtaskGraphError(
+            "parent_cancel_requested: {0} (or an ancestor) has a cancellation request".format(
+                requested_in))
     if str(parent.get("parent_task_id") or "") == parent_task_id:
         raise SubtaskGraphError("self_parented: task cannot be its own parent")
 
@@ -446,7 +465,8 @@ def _propose_locked(
             "created": created, "duplicates": duplicates, "rejected": []}
 
 
-def creation_boundary(store: TaskStore) -> "_CreationBoundary":
+def creation_boundary(store: TaskStore,
+                      *, require_file_lock: bool = True) -> "_CreationBoundary":
     """Serialize graph MUTATIONS on one task DB, across threads AND processes.
 
     Creation and cancellation both enter this boundary: a cancellation that
@@ -458,15 +478,24 @@ def creation_boundary(store: TaskStore) -> "_CreationBoundary":
     processes. If the file lock is unavailable, creation is REFUSED rather
     than run without cross-process mutual exclusion.
 
+    ``require_file_lock=False`` is for CANCELLATION on hosts without a
+    working ``fcntl`` (or when the lock file cannot be opened): the caller
+    still takes the in-process RLock and, on a working platform, the same
+    advisory file lock. Refusing there would make cancellation — the one
+    operation that must always stay available — depend on a lock that no
+    competing creator can obtain either (creation keeps requiring it), so
+    there is no cross-process creator to serialize against.
+
     An in-memory store has no file and no cross-process peers, so it uses
     the in-process lock only and never writes a lock sidecar.
     """
-    return _CreationBoundary(store)
+    return _CreationBoundary(store, require_file_lock=require_file_lock)
 
 
 class _CreationBoundary:
-    def __init__(self, store: TaskStore) -> None:
+    def __init__(self, store: TaskStore, *, require_file_lock: bool = True) -> None:
         self._memory = str(store.db_path) == ":memory:"
+        self._require_file_lock = bool(require_file_lock)
         if self._memory:
             self._lock_key = "memory::{0}".format(id(store))
             self._lock_path = None
@@ -487,9 +516,11 @@ class _CreationBoundary:
         try:
             if not self._memory:
                 if fcntl is None:
-                    raise SubtaskGraphError(
-                        "graph_lock_unavailable: this platform has no cross-process "
-                        "file locking; refusing unsafe creation")
+                    if self._require_file_lock:
+                        raise SubtaskGraphError(
+                            "graph_lock_unavailable: this platform has no cross-process "
+                            "file locking; refusing unsafe creation")
+                    return None
                 with _LOCKS_GUARD:
                     entry = _FILE_LOCKS.setdefault(
                         self._lock_path, {"handle": None, "depth": 0})
@@ -504,6 +535,8 @@ class _CreationBoundary:
                     except OSError as exc:
                         if handle is not None:
                             handle.close()
+                        if not self._require_file_lock:
+                            return None
                         raise SubtaskGraphError(
                             "graph_lock_unavailable: cannot take the cross-process "
                             "subtask lock ({0}); refusing to create".format(exc))
@@ -565,7 +598,8 @@ def _cancel_node(store: TaskStore, task_id: str, *, actor: str, reason: str,
 
 
 def cancel_subtree(store: TaskStore, root_task_id: str, *, actor: str,
-                   reason: str, skip_root: bool = False) -> Dict[str, Any]:
+                   reason: str, skip_root: bool = False,
+                   require_file_lock: bool = True) -> Dict[str, Any]:
     """Cancel a subtree, propagating through TERMINAL intermediates.
 
     Every non-terminal task in the subtree gets its own outbox event.
@@ -577,12 +611,66 @@ def cancel_subtree(store: TaskStore, root_task_id: str, *, actor: str,
     be created behind the cancellation's back.
 
     ``skip_root`` is for callers that already cancelled the root through
-    their own governed entry (``workflow_service.cancel_task`` keeps the
-    caller's expected_version and principal verification there); the root
-    is then traversed but not cancelled again."""
-    with creation_boundary(store):
+    their own governed entry (``cancel_task_tree`` keeps the caller's
+    expected_version and principal verification there); the root is then
+    traversed but not cancelled again. ``require_file_lock=False`` lets the
+    descent proceed on a host without a usable ``fcntl`` (see
+    ``creation_boundary``)."""
+    with creation_boundary(store, require_file_lock=require_file_lock):
         return _cancel_subtree_locked(store, root_task_id, actor=actor,
                                       reason=reason, skip_root=skip_root)
+
+
+def cancel_task_tree(store: TaskStore, task_id: str, *, actor: str, reason: str,
+                     expected_version: int,
+                     principal_verification: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The ONE governed cancellation entry: root first, then the subtree.
+
+    Callers that hold a governed root-cancel contract (workflow service,
+    personal workspace, CLI) route here instead of calling
+    ``store.request_cancel`` directly, so no normal entry can cancel a root
+    and leave its children queued.
+
+    **Root authorization stays atomic with the store's own transition.**
+    The root request is performed by the store inside the graph boundary,
+    exactly as before: non-empty actor, optional one-command principal
+    receipt, optimistic ``expected_version``, terminal refusal. Descendant
+    propagation happens only after that request committed, so an
+    unauthorized or stale call mutates nothing anywhere.
+
+    **Partial propagation is resumable and idempotent.** A cancellation
+    that commits the root but fails on a descendant (a live worker kept
+    bumping the child's version, a lock deadline, a crash) leaves the root
+    ``cancelled`` with the descendant's ``cancel_requested`` unset. A repeat
+    call with the root's CURRENT version resumes the descent instead of
+    raising ``TaskTransitionError``: the caller still presents the
+    optimistic token, and only the idempotent descendant pass runs (the
+    root is not written or re-emitted). ``_cancel_node`` skips terminal and
+    already-requested nodes, so a resumed pass emits no duplicate events.
+    """
+    task_id = str(task_id)
+    with creation_boundary(store, require_file_lock=False):
+        try:
+            root = store.request_cancel(
+                task_id, actor=actor, reason=reason,
+                expected_version=expected_version,
+                principal_verification=principal_verification)
+        except TaskTransitionError:
+            root = store.get_task(task_id)
+            if root["status"] != STATUS_CANCELLED:
+                # A finished (succeeded/failed/blocked/expired) root keeps
+                # the store's refusal: cancellation never rewrites history.
+                raise
+            if int(root["version"]) != int(expected_version):
+                raise TaskVersionConflictError(
+                    "expected_version {0} does not match current {1}".format(
+                        expected_version, root["version"]))
+            # Already cancelled, caller proves it holds the current row: resume.
+        # ``cancel_subtree`` re-enters the (reentrant, refcounted) boundary, so
+        # the descent itself stays inside the same exclusion.
+        cancel_subtree(store, task_id, actor=actor, reason=reason,
+                       skip_root=True, require_file_lock=False)
+    return store.get_task(task_id)
 
 
 def _cancel_subtree_locked(store: TaskStore, root_task_id: str, *, actor: str,
@@ -610,6 +698,34 @@ def _cancel_subtree_locked(store: TaskStore, root_task_id: str, *, actor: str,
 def _children_of(store: TaskStore, parent_task_id: str) -> List[Dict[str, Any]]:
     return [task for task in store.list_tasks()
             if str(task.get("parent_task_id") or "") == str(parent_task_id)]
+
+
+def _cancel_requested_in_chain(store: TaskStore, task: Dict[str, Any]) -> Optional[str]:
+    """The nearest task id on ``task``'s ancestor chain with cancel requested.
+
+    A cancellation request is recorded on the task itself (``cancel_requested``
+    is set on a leased/running row too, before the worker checkpoints). It
+    therefore has to be honoured wherever work would be created for that task
+    OR for any of its descendants — a grandchild must not be able to fan out
+    under a cancelled root whose middle node is merely queued. Walks the parent
+    chain and stops on a cycle or a missing parent (defensive only)."""
+    seen = set()
+    current: Optional[Dict[str, Any]] = task
+    while current is not None:
+        task_id = str(current.get("task_id") or "")
+        if task_id in seen:
+            return None
+        seen.add(task_id)
+        if current.get("cancel_requested"):
+            return task_id
+        parent_id = str(current.get("parent_task_id") or "")
+        if not parent_id:
+            return None
+        try:
+            current = store.get_task(parent_id)
+        except TaskRuntimeError:
+            return None
+    return None
 
 
 def _depth_of(store: TaskStore, task: Dict[str, Any]) -> int:

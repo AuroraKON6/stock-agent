@@ -42,7 +42,7 @@ Python 3.12.15，仓库锁定 `pyyaml==6.0.3`。全部在仓库根目录执行�
 | 命令 | 结果 |
 | --- | --- |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22.py` | 9 OK / exit 0 |
-| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 36 OK / exit 0（本单专项） |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 44 OK / exit 0（本单专项，第四轮后） |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17.py` | 12 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17_role_api.py` | 19 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r18.py` | 34 OK / exit 0 |
@@ -180,3 +180,31 @@ sol 在 `c2c22f1` 上以 `followup_checks.py` / `process_check.py` 复现 9 个�
 | C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run6 --port 18190` | PASS 53/53，cleanup 残留 0，端口可重绑 |
 
 边界说明：创建与取消现在全库串行（同一任务库的图变更），这是让预算/扇出/重复/取消在同一持久化边界内成立的代价；跨进程互斥依赖 POSIX `flock`，不可用时拒绝而非降级。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 仍未改动。
+
+## 10. 第四轮复验返工（sol 的 6 个追加反例）
+
+sol 在候选 `872312b` 上用 `acceptance_edges.py` 复现 6 个反例（exit 1）。逐项修复：
+
+| # | 失败项 | 修复 | 回归 / 证据 |
+| --- | --- | --- | --- |
+| 1 | 已 `cancel_requested` 的父（leased/running）仍接受新子任务提案；checkpoint 后子任务仍 `queued`、0 事件 | `propose_subtasks` 的权威入队（边界内新连接）与预检都沿父链向上检查 `cancel_requested`：父或任一祖先已请求取消即 `parent_cancel_requested` 整批零创建；对 leased/running 路径同样生效 | `test_proposal_refused_after_cancel_request_on_a_running_parent`、`test_proposal_refused_under_a_cancelled_ancestor`；acceptance `no_new_work_after_cancel_requested`（children=0） |
+| 2 | 部分取消无法续跑：子节点租约续期让 8 次重试都 `cancel_conflict`；根已终态，带新版本重试只能 `TaskTransitionError` | 统一入口 `subtask_graph.cancel_task_tree`：根取消先由 store 自身事务完成（actor/principal receipt/`expected_version`/终态拒绝不变，未授权或过期调用零变更），再在**同一持久化边界**内传播后代。根已 `cancelled` 且调用方持有当前版本时，重复调用走**恢复路径**继续传播（不再写/重复发根事件）；`_cancel_node` 天然跳过终态与已请求节点 | `test_partial_cancellation_resumes_with_the_current_root_version`（8 次续期冲突后根已取消、子未标；带新版本重试收敛，子 1 事件、根仍 1 事件）；acceptance `cancellation_can_resume_after_partial_failure` |
+| 3 | 个人工作台入口 `cancel_personal_task`（及 CLI `task cancel`）只取消根，子任务仍 `queued`、0 事件 | 两个正常入口改为调用 `cancel_task_tree`；工作台的会话归属、`expected_version`、`cancel_terminal` 前置守卫保持不变 | `test_personal_workspace_cancel_cancels_the_children`（含过期版本零变更、重复取消仍报 `cancel_terminal`）；acceptance `personal_workspace_cancel_propagates`（child cancelled, 1 event） |
+| 4 | 缺少 `fcntl` 时普通单任务取消被 `graph_lock_unavailable` 阻断 | `creation_boundary(require_file_lock=False)` 供取消使用：进程内 RLock 必取，平台有可用 `flock` 时照常取，取不到才退化为进程内互斥。创建仍要求跨进程锁（无 `fcntl` 时创建被拒），因此不存在可竞争的跨进程创建者 | `test_single_task_cancel_survives_missing_fcntl`（无 `fcntl` 取消成功且 1 事件；创建仍 `graph_lock_unavailable`）；acceptance `single_task_cancel_without_fcntl`；process `unavailable_posix_flock` 仍全拒 |
+| 5 | 首轮确定性 401：账本 `failed_known/sent=yes`，复盘却因全局 `called=false` 判为 `prepared_only` | worker 每轮把该轮**实际外发上下文**写入 `model_call.context_rounds`（含 delivery、outbound 与 prompt hash）；复盘按轮把上下文与同名 `round_index` 的 invocation 记录绑定，用结构化 `sent` 判档：`yes`→`sent`、`unknown`→`send_unknown`、无 attempt→`prepared_only` | `test_projection_uses_the_invocation_ledger_on_a_known_failure`（401 后 `delivery_state=sent`，`delivery_rounds` 绑定 attempt_id）；acceptance `delivery_uses_invocation_sent_even_when_no_success_response` |
+| 6 | 首轮成功 + 次轮发送未知：全局 `called=true` 把最后上下文标成 `sent` | 同上：判定取**最新上下文轮**对应的 invocation `sent`，早轮成功不覆盖末轮 `unknown`；未知档不把任何引用计为已投递 | `test_latest_unknown_send_survives_an_earlier_successful_round`（末轮 `send_unknown`，`delivered_evidence={}`，`delivery_rounds=[yes,unknown]`）；acceptance `last_context_keeps_unknown_send_after_successful_round` |
+
+复验命令与结果：
+
+| 命令 | 结果 |
+| --- | --- |
+| sol `acceptance_edges.py`（`PYTHONPATH=.:tests:scripts python3.12 -B <解压目录>/acceptance_edges.py`，仓库根为 cwd） | 6/6 PASS，exit 0（该脚本为 sol 附件，未提交进仓库） |
+| sol `focused_checks.py` / `followup_checks.py` / `process_check.py` | 10/10、8/8、2/2 PASS，均 exit 0 |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 44 OK / exit 0 |
+| R22 / R02 / R03 / R17 / R17 role API / R18 / R15 citation / R10 | 9 / 18 / 14 / 12 / 19 / 34 / 5 / 11 OK，均 exit 0 |
+| 相邻 R01 / R14 / R20 / R20 scope / R15 personal / task detail / first product slice / fault matrix | 21 / 11 / 8 / 40 / OK / 6 / 18 / 6 OK，均 exit 0 |
+| C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run7 --port 18192`（共享锁内串行；run8/18193 为最终代码上的复跑） | PASS 53/53，cleanup 残留 0，端口可重绑 |
+
+环境说明：`test_refactor_r15_w10_skeleton.py` 与 `test_summary_review.py` 在本机默认 `TMPDIR`（`/var/folders/...`，`/var` 为符号链接）下因 `evidence_excerpts` 的 reparse-point 守卫报错；`TMPDIR=/private/tmp` 下分别 1 OK / 23 OK（skipped=1）。`test_acceptance_fixes_20260921*.py` 需要未入库的 `config/watchlist.local.json`，导入即失败。以上均与本单改动无关。
+
+边界说明：取消入口统一为 `cancel_task_tree`（workflow service、个人工作台、CLI），根取消仍是 store 的原子授权与版本检查，后代传播在其后、同一持久化边界内完成；根已取消时重复调用只在调用方持有当前版本时继续传播，且每个后代仍只有 1 条取消事件。取消不再要求可用的 `fcntl`（创建仍要求）。`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 未改动，与 KONM-80 无共享文件冲突。

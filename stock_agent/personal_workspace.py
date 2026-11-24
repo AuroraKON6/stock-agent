@@ -183,11 +183,20 @@ def create_personal_research(store: TaskStore, *, actor: str, question: str,
 
 def cancel_personal_task(store: TaskStore, *, actor: str, task_id: str,
                          expected_version: int, reason: str = "") -> Dict[str, Any]:
+    """Cancel a personally owned task AND its descendants.
+
+    The workspace entry keeps its guards (owner via the session, optimistic
+    version, terminal refusal) and delegates the propagation to the graph's
+    governed cancellation, so one click cannot leave a child queued after
+    its parent is cancelled. A partially propagated call is resumable with
+    the root's current version."""
+    from .subtask_graph import cancel_task_tree  # no module cycle
+
     task = store.get_task(str(task_id or ""))
     if task["status"] in TERMINAL_STATUSES:
         raise WorkspaceError("cancel_terminal: task already finished ({0})".format(task["status"]))
-    return store.request_cancel(
-        str(task_id), actor=actor,
+    return cancel_task_tree(
+        store, str(task_id), actor=actor,
         reason=str(reason or "用户取消")[:500],
         expected_version=int(expected_version))
 

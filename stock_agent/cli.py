@@ -1915,9 +1915,12 @@ def _task_run_next(config_path: str, worker_id: str, ttl_seconds: int) -> None:
 
 
 def _task_cancel(config_path: str, task_id: str, actor: str, reason: str, expected_version: int) -> None:
+    from .subtask_graph import cancel_task_tree
+
     store, _ = _task_store(config_path)
     try:
-        task = store.request_cancel(task_id, actor=actor, reason=reason, expected_version=expected_version)
+        task = cancel_task_tree(store, task_id, actor=actor, reason=reason,
+                                expected_version=expected_version)
     finally:
         store.close()
     print("task {0} -> {1}".format(task_id, task["status"]))

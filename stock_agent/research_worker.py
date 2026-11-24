@@ -499,6 +499,19 @@ def freeze_approved_fact_bundle(task: Dict[str, Any], config: Dict[str, Any],
     return safe_context, delivery, bundle
 
 
+def _link_context_attempt(model_call: Dict[str, Any], exc: BaseException) -> None:
+    """Bind this round's prepared context to the attempt the typed error names.
+
+    The invocation row is the structured delivery credential; the review must
+    never pair a context with an attempt from a previous run. A typed failure
+    carries its ``attempt_id``; the fallback in the projection uses the
+    round's ``prepared_at`` window."""
+    attempt_id = str(getattr(exc, "attempt_id", "") or "")
+    records = model_call.get("context_rounds")
+    if attempt_id and isinstance(records, list) and records:
+        records[-1]["attempt_id"] = attempt_id
+
+
 def run_research_task(
     store: TaskStore,
     task_id: str,
@@ -574,6 +587,11 @@ def run_research_task(
         "duration_seconds": 0.0,
         "prompt_version": RESEARCH_PROMPT_VERSION,
         "rounds": [],
+        # One entry per dispatched round: the EXACT outbound context prepared
+        # for that round (refs + drop reasons) and its hashes. A reviewer binds
+        # each context summary to the invocation attempt of the SAME round
+        # instead of inferring delivery from the global ``called`` flag.
+        "context_rounds": [],
     }
     if approved_role_prompt_sha256:
         model_call["role_prompt_sha256"] = approved_role_prompt_sha256
@@ -841,8 +859,25 @@ def run_research_task(
             renewal_failure = _renew_or_fail()
             if renewal_failure is not None:
                 return renewal_failure
+            # Bind THIS round's outbound context to the invocation attempt the
+            # same round is about to write. The context is what actually left
+            # with this prompt; an earlier round's context must never be read
+            # as evidence of a later (failed) send, and a prepared context with
+            # no attempt row is not a delivery at all.
+            model_call["context_rounds"].append({
+                "round": round_index,
+                "prepared_at": now_iso(),
+                "delivery": delivery,
+                "outbound_context_sha256": hashlib.sha256(
+                    json.dumps(safe_context, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":"), default=str).encode("utf-8")).hexdigest(),
+                "user_prompt_sha256": hashlib.sha256(user_prompt.encode("utf-8")).hexdigest(),
+            })
             try:
                 raw_text, round_record = _invoke_model(user_prompt, round_index)
+                # Exact link from this round's prepared context to the attempt
+                # row the call wrote (the review reads `sent` from it).
+                model_call["context_rounds"][-1]["attempt_id"] = str(round_record["attempt_id"])
                 model_call["called"] = True
                 model_call["model"] = round_record["actual_model"]
                 model_call["budget"] = dict(round_record.get("budget_reservation") or {})
@@ -865,6 +900,7 @@ def run_research_task(
                 # A06: the request provably never left this machine (pre-send
                 # failure). A bounded retry is safe; the attempt chain already
                 # records sent=no.
+                _link_context_attempt(model_call, exc)
                 model_call["error"] = "{0}: {1}".format(type(exc.original).__name__, str(exc.original)[:500])
                 model_call["lease_heartbeat"] = dict(heartbeat_state)
                 return _fail(model_call["error"], retryable=True)
@@ -872,6 +908,7 @@ def run_research_task(
                 # A07/A08: the request may have reached the provider with no
                 # usable answer. Budget stays held, the attempt enters
                 # reconciliation, and the task blocks — NO auto re-dispatch.
+                _link_context_attempt(model_call, exc)
                 model_call["error"] = "{0}: {1}".format(type(exc.original).__name__, str(exc.original)[:500])
                 model_call["lease_heartbeat"] = dict(heartbeat_state)
                 return _blocked(
@@ -885,6 +922,7 @@ def run_research_task(
                 # an unusable response). The charge outcome is the provider's
                 # statement; retrying is a deliberate decision above this
                 # layer, so the task does not auto-requeue.
+                _link_context_attempt(model_call, exc)
                 model_call["error"] = "{0}: {1}".format(type(exc.original).__name__, str(exc.original)[:500])
                 model_call["lease_heartbeat"] = dict(heartbeat_state)
                 return _fail(model_call["error"], retryable=False)

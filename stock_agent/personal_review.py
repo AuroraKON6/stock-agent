@@ -178,8 +178,68 @@ def _children(store: TaskStore, parent_id: str) -> List[Dict[str, Any]]:
             if str(item.get("parent_task_id") or "") == str(parent_id)]
 
 
+def _delivery_rounds(model_call: Dict[str, Any],
+                     attempts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Per-round delivery credentials: context round ↔ invocation attempt.
+
+    A context is bound to the round it was prepared for (the worker's
+    ``model_call.context_rounds``), and that round to the invocation row the
+    attempt chain wrote for the same round. ``sent`` is the store's STRUCTURED
+    statement (``yes``/``no``/``unknown``) — never the worker's global
+    ``called`` flag, which only says that SOME round returned."""
+    by_round: Dict[int, List[Dict[str, Any]]] = {}
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for attempt in attempts:
+        by_id[str(attempt.get("attempt_id") or "")] = attempt
+        try:
+            index = int(attempt.get("round_index") or 0)
+        except (TypeError, ValueError):
+            index = 0
+        by_round.setdefault(index, []).append(attempt)
+    records = model_call.get("context_rounds")
+    rounds: List[Dict[str, Any]] = []
+    if isinstance(records, list) and records:
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            try:
+                index = int(record.get("round") or 0)
+            except (TypeError, ValueError):
+                index = 0
+            attempt = by_id.get(str(record.get("attempt_id") or ""))
+            if attempt is None:
+                # No explicit link: accept only an attempt of the SAME round
+                # STARTED after this context was prepared. A previous run's
+                # attempt (even with the same round index) never qualifies.
+                prepared_at = str(record.get("prepared_at") or "")
+                candidates = [item for item in by_round.get(index, [])
+                              if not prepared_at
+                              or str(item.get("started_at") or "") >= prepared_at]
+                attempt = candidates[-1] if candidates else None
+            rounds.append({"round": index, "context": record, "attempt": attempt})
+        return rounds
+    # Legacy/other writers: no per-round context records. The ledger alone is
+    # still more trustworthy than ``called``; the newest attempt stands for the
+    # context the worker reports (top-level delivery/outbound_context).
+    if attempts:
+        rounds.append({"round": int(attempts[-1].get("round_index") or 0),
+                       "context": None, "attempt": attempts[-1]})
+    return rounds
+
+
+def _sent_state(sent: str) -> Tuple[str, bool]:
+    """Map the structured ledger value to (delivery_state, authoritative)."""
+    value = str(sent or "")
+    if value == "yes":
+        return "sent", True
+    if value == "unknown":
+        return "send_unknown", False
+    return "prepared_only", False
+
+
 def _delivery(payload: Dict[str, Any],
-              model_call: Dict[str, Any]) -> Dict[str, Any]:
+              model_call: Dict[str, Any],
+              attempts: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """What the worker ACTUALLY delivered to the model, not what was configured.
 
     The authoritative record is the worker's own outbox ledger
@@ -187,32 +247,45 @@ def _delivery(payload: Dict[str, Any],
     that entered the outbound context, ``dropped_evidence`` records the refs
     refused before egress (``<ref>:<reason>``). But a PREPARED context is not
     a delivery: the ledger exists from the moment egress is built, including
-    on attempts that never produced an answer. The allowlist therefore counts
-    only when an execution credential backs it — a live call that returned
-    (``called``) or a consumed recorded replay (``replay_source``). A send
-    whose outcome is unknown, and an attempt that only prepared context, are
-    reported as such with NO delivered refs.
+    on attempts that never produced an answer.
+
+    The execution credential is therefore read from the PER-ROUND invocation
+    ledger, not from the global ``called`` flag: a round whose attempt is
+    recorded ``sent=yes`` delivered its context even when it ended in a
+    deterministic provider failure (401), and the LAST round that may have
+    reached the provider with no answer stays ``send_unknown`` even though an
+    earlier round succeeded. A context prepared for a round with no attempt
+    row never left, and is reported ``prepared_only``.
 
     When the task never executed there is no ledger; then nothing counts as
     delivered and the configured refs are listed as unverified."""
     context = payload.get("public_context") if isinstance(payload.get("public_context"), dict) else {}
     evidence = context.get("evidence_summaries")
     configured = sorted(str(ref) for ref in evidence) if isinstance(evidence, dict) else []
-    delivery = model_call.get("context_delivery")
+    rounds = _delivery_rounds(model_call, list(attempts or []))
+    latest = rounds[-1] if rounds else None
+    if latest is not None and isinstance(latest.get("context"), dict):
+        delivery = latest["context"].get("delivery")
+    else:
+        delivery = model_call.get("context_delivery")
     delivery = delivery if isinstance(delivery, dict) else {}
     delivered_refs = delivery.get("delivered_evidence")
     error = str(model_call.get("error") or "").lower()
-    if bool(model_call.get("called")):
-        state = "sent"
+    if latest is not None and latest.get("attempt") is not None:
+        state, authoritative = _sent_state(str(latest["attempt"].get("sent") or ""))
+    elif latest is not None:
+        # The latest prepared context has no invocation row: nothing was sent.
+        state, authoritative = "prepared_only", False
     elif str(model_call.get("replay_source") or ""):
-        state = "replayed"
+        state, authoritative = "replayed", True
+    elif bool(model_call.get("called")):
+        state, authoritative = "sent", True
     elif "outcome unknown" in error:
-        state = "send_unknown"
+        state, authoritative = "send_unknown", False
     elif model_call:
-        state = "prepared_only"
+        state, authoritative = "prepared_only", False
     else:
-        state = "no_execution_record"
-    authoritative = state in {"sent", "replayed"}
+        state, authoritative = "no_execution_record", False
     outbound = model_call.get("outbound_context")
     outbound = outbound if isinstance(outbound, dict) else {}
     outbound_evidence = outbound.get("evidence_summaries")
@@ -247,9 +320,25 @@ def _delivery(payload: Dict[str, Any],
         else:
             reason = "not_delivered_by_execution"
         undelivered.append({"ref": ref, "reason": reason})
+    per_round = []
+    for item in rounds:
+        attempt = item.get("attempt") or {}
+        round_state, round_authoritative = (
+            _sent_state(str(attempt.get("sent") or "")) if attempt
+            else ("prepared_only", False))
+        record = item.get("context") if isinstance(item.get("context"), dict) else {}
+        per_round.append({
+            "round": item["round"],
+            "attempt_id": str(attempt.get("attempt_id") or ""),
+            "sent": str(attempt.get("sent") or ""),
+            "state": round_state,
+            "authoritative": round_authoritative,
+            "outbound_context_sha256": str(record.get("outbound_context_sha256") or ""),
+        })
     return {"delivered": delivered, "configured": configured,
             "undelivered": undelivered, "authoritative": authoritative,
             "state": state,
+            "rounds": per_round,
             "source": "worker_context_delivery" if authoritative else state}
 
 
@@ -311,7 +400,8 @@ def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
     root = _root_task(store, task)
     children = _children(store, task_id)
     origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
-    delivery = _delivery(payload, model_call)
+    attempts = store.invocation_attempts(task_id)
+    delivery = _delivery(payload, model_call, attempts)
     delivered = delivery["delivered"]
     citations = sorted({str(item) for item in output.get("evidence_refs") or []})
     allowed = sorted(delivered)
@@ -322,7 +412,6 @@ def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
         "reason": str(item.get("reason") or ""),
         "at": str(item.get("created_at") or ""),
     } for item in store.input_snapshots(task_id)]
-    attempts = store.invocation_attempts(task_id)
     failures = []
     for event in store.events(task_id, limit=500):
         event_type = str(event.get("event_type") or "")
@@ -376,6 +465,7 @@ def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
             "delivery_source": delivery["source"],
             "delivery_state": delivery["state"],
             "delivery_authoritative": delivery["authoritative"],
+            "delivery_rounds": delivery["rounds"],
             "citations_outside_allowlist": sorted(set(citations) - set(allowed)),
         },
         "result": {
