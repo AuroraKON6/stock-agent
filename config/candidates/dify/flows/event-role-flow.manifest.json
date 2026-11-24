@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "dify_release": "1.17.1",
+  "dify_release_commit": "8387590ace4a094de812b7847fc6a4c3a27cd52b",
+  "execution_mode": "replay",
+  "artifact": "event-role-flow.yml",
+  "flow_artifact": "event-role-flow.flow.json",
+  "flow_sha256": "d80fdd32189403a03253c0de42130dd7b5abba34638d360b568bdf128e2045ed",
+  "workflow_version": "sha256:5634dca65dcbeceba7ee0265083032ecd5a52d725fd2690d174ef7f499987282"
+}

@@ -1,0 +1,14 @@
+{
+  "actor": "r17-candidate-review",
+  "approved_at": "2026-11-24",
+  "flow_id": "event_draft_flow",
+  "flow_sha256": "d80fdd32189403a03253c0de42130dd7b5abba34638d360b568bdf128e2045ed",
+  "note": "Candidate approval for isolated acceptance only; production use needs the human owner's sign-off.",
+  "role_prompt_sha256": {
+    "counter_evidence": "cedbef275667a29dbaa6e006b718886c959a194a3f6e253391ac604e6170c472",
+    "event_analyst": "4274a9fc4184cee10c61819ea15792cb1a107270f5e0889a64621eb5826b1065",
+    "synthesis_drafter": "dd6407f9cfa46ef82c3e9e43909e8d281857af0d5ad035bb87f4f436a960cea3"
+  },
+  "schema_version": 1,
+  "version": 1
+}

@@ -248,7 +248,8 @@ class StepExecutionTests(R17RoleTestCase):
             self.store, parent_task_id=root_id,
             proposals=[{"role_id": "event_analyst", "question": "失败的步骤"}])
         subtask_id = proposal["created"][0]["task_id"]
-        claimed = self.store.claim_next("w", exclude_role_bound=True)
+        self.assertIsNone(self.store.claim_next("w", exclude_role_bound=True))
+        claimed = self.store.claim_task(subtask_id, "w")
         self.assertEqual(claimed["task_id"], subtask_id)
         self.store.mark_running(subtask_id, worker_id="w",
                                 fencing_token=claimed["fencing_token"],

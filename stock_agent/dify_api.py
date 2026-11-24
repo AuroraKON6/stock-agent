@@ -27,13 +27,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import copy, deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import dify_access
 from . import workflow_service
+from .role_api import RoleGatewayMixin
 from .task_runtime.store import (
+    TaskStore,
     TERMINAL_STATUSES,
     STATUS_CANCELLED,
     STATUS_SUCCEEDED,
@@ -50,6 +53,7 @@ LEDGER_FACT_BUNDLES = "data/dify/fact_bundles.jsonl"
 LEDGER_CANDIDATE_RESULTS = "data/dify/candidate_results.jsonl"
 LEDGER_PENDING_FEEDBACK = "data/dify/pending_feedback.jsonl"
 LEDGER_PRINCIPAL_VERIFICATIONS = "data/dify/principal_verifications.jsonl"
+LEDGER_ROLE_FLOW = "data/dify/role_flow.jsonl"
 
 _MAX_SUMMARY_CHARS = 4000
 _MAX_DRAFT_CHARS = 20000
@@ -101,11 +105,23 @@ def _canonical_sha256(payload: Any) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-class DifyGateway:
+class DifyGateway(RoleGatewayMixin):
     """The Dify-facing service layer. Construct with the authoritative store."""
 
     def __init__(self, store: Any, config: Dict[str, Any], *,
-                 credentials: Optional[Dict[str, Any]] = None):
+                 credentials: Optional[Dict[str, Any]] = None,
+                 role_flows: Any = None, role_replay_dir: Any = None,
+                 role_execution_mode: str = "replay", role_workflow_version: str = "",
+                 role_bind_enabled: bool = True, role_flow_sha256: str = ""):
+        # R17: with a role-flow registry the gateway also serves the role
+        # entry (bind / step / finish); without one those methods fail closed
+        # — which is also how a rollback stops NEW role triggers.
+        self.role_flows = role_flows
+        self.role_bind_enabled = role_bind_enabled
+        self.role_flow_sha256 = role_flow_sha256
+        self.role_workflow_version = str(role_workflow_version or "")
+        self.role_replay_dir = Path(role_replay_dir) if role_replay_dir else None
+        self.role_execution_mode = str(role_execution_mode)
         self.store = store
         self._db_path = Path(getattr(store, "db_path"))
         self.config = config or {}
@@ -126,14 +142,13 @@ class DifyGateway:
         self._ledger_paths = {name: project_path(name) for name in (
             LEDGER_ACCESS_LOG, LEDGER_FACT_BUNDLES, LEDGER_CANDIDATE_RESULTS,
             LEDGER_PENDING_FEEDBACK, LEDGER_PRINCIPAL_VERIFICATIONS,
+            LEDGER_ROLE_FLOW,
         )}
         # Anchor the credential registry path in THIS thread too: per-request
         # reloads run on HTTP handler threads where the project-path
         # contextvar is absent (same lesson as the ledger paths above). An
         # absolute path bypasses the override entirely.
-        import copy
-
-        self._reload_config = copy.deepcopy(self.config)
+        self._reload_config = deepcopy(self.config)
         reload_dify = dict(self._reload_config.get("dify") or {})
         reload_dify["service_credentials_path"] = str(
             project_path(self.settings["service_credentials_path"]))
@@ -334,20 +349,33 @@ class DifyGateway:
         # pre-create state: a fresh run id landing on an existing task is a
         # newly RECORDED association, only a re-sent run id is a DUPLICATE.
         pre_existing_run = workflow_service.platform_run(self._db_path, "dify", run_id)
-        task, outcome = workflow_service.create_research_task(
-            self._db_path,
-            title=title, input_payload=input_payload, case_id=str(case_id or ""),
-            business_intent_id=intent_id,
-            idempotency_key=str(idempotency_key or ""),
-            prompt_version=str(prompt_version or "research_v1"),
-            execution_mode=str(execution_mode or "live"),
-            actor="dify:{0}".format(identity["credential_id"]),
-            platform_run={
-                "platform": "dify",
-                "run_id": run_id,
-                "workflow_version": str(workflow_version or ""),
-                "actor": "dify:{0}".format(identity["credential_id"]),
-            })
+        platform_run = {
+            "platform": "dify",
+            "run_id": run_id,
+            "workflow_version": str(workflow_version or ""),
+            "actor": "dify:{0}".format(identity["credential_id"]),
+        }
+        try:
+            task, outcome = workflow_service.create_research_task(
+                self._db_path,
+                title=title, input_payload=input_payload, case_id=str(case_id or ""),
+                business_intent_id=intent_id,
+                idempotency_key=str(idempotency_key or ""),
+                prompt_version=str(prompt_version or "research_v1"),
+                execution_mode=str(execution_mode or "live"),
+                actor="dify:{0}".format(identity["credential_id"]),
+                platform_run=platform_run)
+        except TaskIdempotencyConflictError:
+            # R17: binding is a governed input version, not new business
+            # content. A re-sent run for a task bound since the first create
+            # must land on that task, or a replay could never continue past
+            # the first node. Accepted only when the task is role-bound AND
+            # its snapshot for THIS input version is the very same request.
+            task = self._reattach_bound_run(intent_id, input_payload, platform_run,
+                                             int(input_version), str(execution_mode or "live"))
+            if task is None:
+                raise
+            outcome = "existing_role_bound_task"
         run_association = workflow_service.platform_run(self._db_path, "dify", run_id) or {}
         payload = task.get("input_payload") or {}
         origin = payload.get("origin") or {}
@@ -356,6 +384,9 @@ class DifyGateway:
             "case_id": str(task.get("case_id") or ""),
             "status": str(task.get("status") or ""),
             "version": int(task.get("version") or 0),
+            # R17: the authoritative input version — a task bound since an
+            # earlier create is at a later version than the caller's input.
+            "input_version": int(task.get("input_version") or 1),
             "outcome": outcome,
             "idempotency_key": str(task.get("idempotency_key") or ""),
             "business_intent_id": intent_id,
@@ -366,11 +397,41 @@ class DifyGateway:
                 "task_run_count": len(workflow_service.platform_runs(self._db_path, str(task.get("task_id") or ""))),
             },
             "dify": {
-                "dify_run_id": str(origin.get("dify_run_id") or ""),
+                "dify_run_id": run_id,
                 "workflow_version": str(origin.get("workflow_version") or ""),
             },
             "budget": self._budget_view(now=now),
         }
+
+    def dispatch_role_request(self, method: str, token: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Use a separate SQLite connection for each concurrent R17 HTTP request."""
+        store = TaskStore(self._db_path)
+        try:
+            request = copy(self)
+            request.store = store
+            return getattr(request, method)(token, **body)
+        finally:
+            store.close()
+
+    def _reattach_bound_run(self, intent_id: str, input_payload: Dict[str, Any],
+                            platform_run: Dict[str, str], input_version: int,
+                            execution_mode: str) -> Optional[Dict[str, Any]]:
+        from .role_execution import binding_of
+
+        for task in self.store.list_tasks():
+            if (str(task.get("business_intent_id") or "") != str(intent_id)
+                    or binding_of(task) is None
+                    or task.get("execution_mode") != execution_mode):
+                continue
+            wanted = TaskStore._logical_content_fingerprint(input_payload, str(intent_id))
+            for snapshot in self.store.input_snapshots(str(task["task_id"])):
+                payload = snapshot.get("payload")
+                if (int(snapshot.get("input_version") or 0) == input_version
+                        and isinstance(payload, dict)
+                        and TaskStore._logical_content_fingerprint(payload, str(intent_id)) == wanted):
+                    self.store.attach_platform_run(str(task["task_id"]), run=platform_run)
+                    return self.store.get_task(str(task["task_id"]))
+        return None
 
     def _budget_view(self, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         return workflow_service.budget_view(self._db_path, self.config, now=now)

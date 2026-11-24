@@ -160,8 +160,8 @@ def propose_subtasks(
                               "reason": "duplicate_child"})
             continue
         payload = dict(parent["input_payload"])
-        # R17: a role-flow binding belongs to the ROOT only — children are
-        # ordinary worker-claimable steps (their identity rides in role_step).
+        # R17 stores the flow binding only on the root. The orchestrator
+        # manages the children through that parent relationship.
         payload.pop("role_flow", None)
         payload["research_question"] = item["question"]
         payload["symbols"] = item["symbols"]

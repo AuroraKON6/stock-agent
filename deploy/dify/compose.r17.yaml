@@ -1,0 +1,40 @@
+# R17 role-flow acceptance overlay on the pinned R16 stack. Always rendered
+# together with compose.yaml:
+#   docker compose -f deploy/dify/compose.yaml -f deploy/dify/compose.r17.yaml ...
+# It only swaps the replay gateway for the role gateway and widens the two
+# egress proxies from two reviewed routes to five. Images, networks, the
+# loopback UI port and every other service come from compose.yaml unchanged.
+services:
+  nginx:
+    ports: !override
+      - "127.0.0.1:${R17_UI_PORT:-18080}:80"
+
+  web:
+    environment:
+      NEXT_PUBLIC_SOCKET_URL: ws://127.0.0.1:${R17_UI_PORT:-18080}
+
+  stock-agent-r16-gateway:
+    volumes:
+      - ./nginx-role.conf:/etc/nginx/conf.d/default.conf:ro
+
+  ssrf_proxy:
+    volumes:
+      - ./squid-role.conf:/etc/squid/squid.conf:ro
+
+  research_api:
+    command: [python, -B, -u, -m, role_api]
+    environment:
+      R17_APPROVED_WORKFLOW_VERSION: ${R17_APPROVED_WORKFLOW_VERSION:?set an approved role workflow digest}
+      # "disabled" is the rollback position: new role triggers are refused.
+      R17_ROLE_ENTRY: ${R17_ROLE_ENTRY:-enabled}
+    volumes:
+      - ../../stock_agent:/app/stock_agent:ro
+      - ./role_api.py:/app/role_api.py:ro
+      - ./r17_drill.py:/app/r17_drill.py:ro
+      - ../../config/candidates/dify/flows:/srv/r17/flows:ro
+      - type: bind
+        source: ${R17_REPLAY_DIR:?set a replay fixture directory}
+        target: /srv/r17/replay
+        read_only: true
+        bind:
+          create_host_path: false

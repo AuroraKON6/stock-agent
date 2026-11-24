@@ -14,8 +14,8 @@ state checks live. The HTTP layer only maps exceptions to status codes:
 Human-protected actions are NOT special-cased here: the gateway already
 requires a principal verification no Dify credential can mint.
 
-The isolated R16 listener can additionally accept its two native HTTP-node
-forms and expose validated receipt fields as response headers.
+The isolated R16/R17 listener can additionally accept the native HTTP-node
+forms of the replay and role routes and expose validated receipt fields as response headers.
 """
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from urllib.parse import parse_qsl
 
 from . import dify_access
 from .dify_api import DifySubmissionError
+from .role_execution import RoleFlowError
 from .task_runtime.store import (
     ALLOWED_TRANSITIONS,
     TaskRuntimeError,
@@ -41,6 +42,18 @@ _MAX_BODY_BYTES = 1024 * 1024
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _REPLAY_CREATE = "/api/dify/v1/create-research"
 _REPLAY_STATUS = "/api/dify/v1/research-status"
+# R17: the role entry. Native HTTP nodes send the same reviewed forms.
+_ROLE_BIND = "/api/dify/v1/role-bind"
+_ROLE_STEP = "/api/dify/v1/role-step"
+_ROLE_FINISH = "/api/dify/v1/role-finish"
+_ROLE_FORMS = {
+    _ROLE_BIND: ("role_bind", {"task_id", "case_id", "dify_run_id", "workflow_version",
+                               "flow_sha256", "input_version"}),
+    _ROLE_STEP: ("role_step", {"task_id", "case_id", "dify_run_id", "workflow_version",
+                               "flow_sha256", "input_version", "role_id"}),
+    _ROLE_FINISH: ("role_finish", {"task_id", "case_id", "dify_run_id", "workflow_version",
+                                   "flow_sha256", "input_version"}),
+}
 
 # path -> (gateway method name, required keyword arguments)
 _ROUTES: Dict[str, Tuple[str, Tuple[str, ...]]] = {
@@ -49,6 +62,12 @@ _ROUTES: Dict[str, Tuple[str, Tuple[str, ...]]] = {
         ("title", "case_id", "input_version", "research_question",
          "dify_run_id", "workflow_version")),
     _REPLAY_STATUS: ("research_status", ("task_id",)),
+    _ROLE_BIND: ("role_bind", ("task_id", "case_id", "dify_run_id", "workflow_version",
+                               "flow_sha256", "input_version")),
+    _ROLE_STEP: ("role_step", ("task_id", "case_id", "dify_run_id", "workflow_version",
+                               "flow_sha256", "input_version", "role_id")),
+    _ROLE_FINISH: ("role_finish", ("task_id", "case_id", "dify_run_id", "workflow_version",
+                                   "flow_sha256", "input_version")),
     "/api/dify/v1/fact-bundle": ("read_fact_bundle", ("case_id", "input_version")),
     "/api/dify/v1/submit-result": (
         "submit_candidate_result",
@@ -73,13 +92,20 @@ def _is_loopback_host(host: str) -> bool:
 
 def _replay_form_body(path: str, raw: bytes) -> dict:
     pairs = parse_qsl(raw.decode("ascii"), keep_blank_values=True, strict_parsing=True,
-                      max_num_fields=8, encoding="utf-8", errors="strict")
+                      max_num_fields=16, encoding="utf-8", errors="strict")
     body = dict(pairs)
     if len(pairs) != len(body):
         raise ValueError("duplicate form fields")
     if path == _REPLAY_CREATE:
         if body.keys() != set(_ROUTES[path][1]) | {"business_intent_id", "execution_mode"}:
             raise ValueError("unexpected replay creation fields")
+        version = body["input_version"]
+        if not re.fullmatch(r"[1-9][0-9]{0,18}", version) or int(version) >= 2**63:
+            raise ValueError("input_version must be a positive integer")
+        return {**body, "input_version": int(version)}
+    if path in _ROLE_FORMS:
+        if body.keys() != _ROLE_FORMS[path][1]:
+            raise ValueError("unexpected role entry fields")
         version = body["input_version"]
         if not re.fullmatch(r"[1-9][0-9]{0,18}", version) or int(version) >= 2**63:
             raise ValueError("input_version must be a positive integer")
@@ -100,7 +126,20 @@ def _replay_receipt_headers(path: str, request: dict, payload: dict) -> dict:
                 or platform_run.get("run_id") != request["dify_run_id"]):
             raise ValueError("creation receipt does not match the requested case and Dify run")
         # Graphon's nested template selectors accept underscores in keys.
-        return {"R16_Task_Id": task_id, "R16_Case_Path": "/?task=" + task_id}
+        return {"R16_Task_Id": task_id, "R16_Case_Path": "/?task=" + task_id,
+                "R17_Input_Version": str(payload.get("input_version", ""))}
+    if path in _ROLE_FORMS:
+        if payload.get("task_id") != request["task_id"]:
+            raise ValueError("role receipt does not name the requested task")
+        if path == _ROLE_BIND:
+            return {"R17_Input_Version": str(payload.get("input_version", ""))}
+        if path == _ROLE_FINISH:
+            return {"R17_Root_Status": str(payload.get("status") or "")}
+        if path == _ROLE_STEP:
+            # Whether the canvas continues is the RECORDED step outcome; the
+            # version rides along so the next node addresses the same input.
+            return {"R17_Step_Status": str(payload.get("step_status") or ""),
+                    "R17_Input_Version": str(payload.get("input_version", ""))}
     status = payload.get("status")
     if task_id != request["task_id"] or not isinstance(status, str) or status not in ALLOWED_TRANSITIONS:
         raise ValueError("invalid replay task status receipt")
@@ -214,7 +253,7 @@ def create_dify_api_server(gateway: Any, host: str = "127.0.0.1", port: int = 87
                 return
             raw = self.rfile.read(length)
             use_replay_form = (
-                replay_forms and self.path in {_REPLAY_CREATE, _REPLAY_STATUS}
+                replay_forms and self.path in {_REPLAY_CREATE, _REPLAY_STATUS, *_ROLE_FORMS}
                 and self.headers.get_content_type() == "application/x-www-form-urlencoded"
             )
             try:
@@ -230,15 +269,22 @@ def create_dify_api_server(gateway: Any, host: str = "127.0.0.1", port: int = 87
                 self._reject(400, "missing_fields", ", ".join(missing))
                 return
             token = self._bearer_token()
-            method = getattr(gateway, method_name)
             try:
-                payload = method(token, **body)
+                if getattr(gateway, "role_flows", None) is not None and (
+                        self.path == _REPLAY_CREATE or self.path in _ROLE_FORMS):
+                    payload = gateway.dispatch_role_request(method_name, token, body)
+                else:
+                    payload = getattr(gateway, method_name)(token, **body)
             except dify_access.DifyAccessError as exc:
                 status = 401 if exc.reason == "credential_unknown" else 403
                 self._reject(status, exc.reason, exc.detail)
                 return
             except DifySubmissionError as exc:
                 self._reject(409, exc.reason, exc.detail)
+                return
+            except RoleFlowError as exc:
+                # A state/order/artifact refusal: the canvas must not continue.
+                self._reject(409, str(exc).split(":", 1)[0], str(exc))
                 return
             except (TaskVersionConflictError, TaskIdempotencyConflictError, TaskTransitionError) as exc:
                 self._reject(409, type(exc).__name__, str(exc))

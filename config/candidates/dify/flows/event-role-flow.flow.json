@@ -1,0 +1,45 @@
+{
+  "flow": {
+    "flow_id": "event_draft_flow",
+    "flow_sha256": "d80fdd32189403a03253c0de42130dd7b5abba34638d360b568bdf128e2045ed",
+    "groups": [
+      {
+        "roles": [
+          "event_analyst"
+        ]
+      },
+      {
+        "roles": [
+          "counter_evidence"
+        ]
+      },
+      {
+        "roles": [
+          "synthesis_drafter"
+        ]
+      }
+    ],
+    "prompts": {
+      "counter_evidence": {
+        "role_id": "counter_evidence",
+        "sha256": "cedbef275667a29dbaa6e006b718886c959a194a3f6e253391ac604e6170c472",
+        "text": "你是反证员。针对同一公开事件输入，列出与初步分析相反的证据、口径差异和常见误读，逐条说明来源标识。找不到反证时明确写明“未发现反证”，不得补造。",
+        "version": 1
+      },
+      "event_analyst": {
+        "role_id": "event_analyst",
+        "sha256": "4274a9fc4184cee10c61819ea15792cb1a107270f5e0889a64621eb5826b1065",
+        "text": "你是事件分析员。只依据给定公开事件输入进行分析：说明事件是什么、涉及主体、直接影响与时间范围。不得引入输入之外的数据；无法确认的内容写入 unknowns。引用必须使用输入中给出的来源标识。",
+        "version": 1
+      },
+      "synthesis_drafter": {
+        "role_id": "synthesis_drafter",
+        "sha256": "dd6407f9cfa46ef82c3e9e43909e8d281857af0d5ad035bb87f4f436a960cea3",
+        "text": "你是综合起草员。基于事件分析与反证两部分，起草一份事件草稿：结论、依据、未决问题和需要人工确认的事项。所有具体数字必须带来源标识。",
+        "version": 1
+      }
+    },
+    "version": 1
+  },
+  "schema_version": "1.0"
+}

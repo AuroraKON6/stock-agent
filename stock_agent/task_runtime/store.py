@@ -738,8 +738,23 @@ class TaskStore:
             return False
         return isinstance(payload, dict) and bool(payload.get("role_flow"))
 
+    def _row_is_role_owned(self, row: Any) -> bool:
+        if self._row_is_role_bound(row):
+            return True
+        parent_id = row["parent_task_id"]
+        if not parent_id:
+            return False
+        parent = self._conn.execute(
+            "SELECT input_payload FROM research_tasks WHERE task_id = ?", (parent_id,)).fetchone()
+        return parent is not None and self._row_is_role_bound(parent)
+
+    def is_role_owned(self, task_id: str) -> bool:
+        """Whether a task is a role root or a child of a role root."""
+        return self._row_is_role_owned(self._task_row(task_id))
+
     def bump_input_version(self, task_id: str, *, payload_overrides: Dict[str, Any],
-                           actor: str, reason: str) -> Dict[str, Any]:
+                           actor: str, reason: str,
+                           expected_queued_input_version: Optional[int] = None) -> Dict[str, Any]:
         """R17: apply a governed payload change as a NEW immutable input version.
 
         Merges ``payload_overrides`` into the current payload, bumps the
@@ -755,6 +770,10 @@ class TaskStore:
         self._begin()
         try:
             row = self._task_row(task_id)
+            if expected_queued_input_version is not None and (
+                    row["status"] != STATUS_QUEUED or row["cancel_requested"]
+                    or row["input_version"] != expected_queued_input_version):
+                raise TaskTransitionError("task is no longer queued at the expected input version")
             if row["status"] in TERMINAL_STATUSES:
                 raise TaskTransitionError("task is already terminal: {0}".format(row["status"]))
             current = self._decode(row)
@@ -775,6 +794,24 @@ class TaskStore:
             self._rollback()
             raise
         return self.get_task(task_id)
+
+    def attach_platform_run(self, task_id: str, *, run: Dict[str, str]) -> Dict[str, Any]:
+        """Associate one more platform execution with an EXISTING task.
+
+        R17: a re-sent orchestration run for an already role-bound task lands
+        on the same task; the association is the audit trail of which runs
+        drove it. Same run + same task is a no-op; a run naming another task
+        is a conflict (``_record_platform_run``)."""
+        self._begin()
+        try:
+            row = self._task_row(task_id)
+            record = self._record_platform_run(
+                task_id, str(row["business_intent_id"] or ""), run)
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return record
 
     def list_platform_runs(self, task_id: str) -> List[Dict[str, Any]]:
         rows = self._conn.execute(
@@ -868,7 +905,7 @@ class TaskStore:
             row = self._conn.execute(
                 "SELECT * FROM research_tasks WHERE status = ? ORDER BY created_at LIMIT 1", (STATUS_QUEUED,)
             ).fetchone()
-            if exclude_role_bound and row is not None and self._row_is_role_bound(row):
+            if exclude_role_bound and row is not None and self._row_is_role_owned(row):
                 # R17/A76: the Python full chain must never advance a task
                 # bound to a role flow — those belong to the role orchestrator
                 # alone. Scan past them; their cancellation/recovery is not
@@ -876,7 +913,7 @@ class TaskStore:
                 rows = self._conn.execute(
                     "SELECT * FROM research_tasks WHERE status = ? ORDER BY created_at",
                     (STATUS_QUEUED,)).fetchall()
-                row = next((r for r in rows if not self._row_is_role_bound(r)), None)
+                row = next((r for r in rows if not self._row_is_role_owned(r)), None)
             if row is None or row["cancel_requested"]:
                 self._rollback()
                 if row is not None and row["cancel_requested"]:
@@ -886,6 +923,43 @@ class TaskStore:
                     self._commit()
                 return None
             task_id = row["task_id"]
+            self._touch(
+                task_id,
+                status=STATUS_LEASED,
+                worker_id=worker_id,
+                lease_expires_at=expires,
+                fencing_token=int(row["fencing_token"]) + 1,
+                attempt_count=int(row["attempt_count"]) + 1,
+            )
+            self._emit(task_id, "task_claimed", actor=worker_id, payload={"lease_expires_at": expires, "fencing_token": int(row["fencing_token"]) + 1})
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+        return self.get_task(task_id)
+
+    def claim_task(self, task_id: str, worker_id: str, ttl_seconds: int = 120) -> Optional[Dict[str, Any]]:
+        """Claim ONE named queued task, leaving every other task untouched.
+
+        R17: the role orchestrator (and the full-chain fallback drill) addresses
+        a known task. Scanning ``claim_next`` past unrelated queued tasks would
+        lease them just to release them again and burn their attempts.
+        Returns None when the task is not queued (running, terminal, ...).
+        """
+        if not str(worker_id or "").strip():
+            raise TaskRuntimeError("worker_id must not be empty")
+        expires = (datetime.now().astimezone() + timedelta(seconds=max(5, int(ttl_seconds)))).isoformat(timespec="seconds")
+        self._begin()
+        try:
+            row = self._task_row(task_id)
+            if row["status"] != STATUS_QUEUED:
+                self._rollback()
+                return None
+            if row["cancel_requested"]:
+                self._touch(task_id, status=STATUS_CANCELLED)
+                self._emit(task_id, "task_cancelled", payload={"reason": "cancelled before claim"})
+                self._commit()
+                return None
             self._touch(
                 task_id,
                 status=STATUS_LEASED,
