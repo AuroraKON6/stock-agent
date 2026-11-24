@@ -578,6 +578,59 @@ def run_research_task(
     approved_role_prompt_sha256: str = "",
     prior_role_results: Optional[list] = None,
 ) -> Dict[str, Any]:
+    """Normal worker entry: the research run plus its one observability record.
+
+    R23 sampling hooks the NORMAL run, not a side channel: whatever path the
+    task takes (terminal, blocked, awaiting-human, exception) exactly one
+    structured line is offered to :func:`emit_observability_log`, carrying
+    identifiers and a stable error code only. With sampling off (the
+    default) that call returns None and writes nothing, so the research run
+    and its audit rows are exactly what they were before this wrapper.
+    """
+    try:
+        return _run_research_task(
+            store, task_id, worker_id=worker_id, config=config, ttl_seconds=ttl_seconds,
+            max_rounds=max_rounds, approved_role_prompt_sha256=approved_role_prompt_sha256,
+            prior_role_results=prior_role_results)
+    finally:
+        _emit_task_record(store, task_id, worker_id, config)
+
+
+def _emit_task_record(store: TaskStore, task_id: str, worker_id: str,
+                      config: Optional[Dict[str, Any]]) -> None:
+    """Best effort: an observability record must never change the run."""
+    try:
+        from .observability import emit_observability_log, error_code, observability_settings
+
+        if not isinstance(config, dict) or not observability_settings(config)["sampling_enabled"]:
+            return  # sampling off: no read, no output
+        task = None
+        try:
+            task = store.get_task(task_id)
+        except Exception:  # noqa: BLE001 — the record then carries no state
+            task = None
+        state = str((task or {}).get("status") or "")
+        record = {"task_id": str(task_id), "worker_id": worker_id, "status": state,
+                  "event_type": "research_task_finished",
+                  "count": int((task or {}).get("attempt_count") or 0)}
+        if state == "blocked" or state == "failed":
+            record["error_code"] = error_code((task or {}).get("last_error"))
+        emit_observability_log("research_task_finished", record, config=config)
+    except Exception:  # noqa: BLE001 — never let observation break the run
+        return
+
+
+def _run_research_task(
+    store: TaskStore,
+    task_id: str,
+    *,
+    worker_id: str,
+    config: Optional[Dict[str, Any]] = None,
+    ttl_seconds: int = 120,
+    max_rounds: int = MAX_RESEARCH_ROUNDS,
+    approved_role_prompt_sha256: str = "",
+    prior_role_results: Optional[list] = None,
+) -> Dict[str, Any]:
     """Run one leased task to a terminal, blocked, or awaiting-human state.
 
     Live tasks step in bounded rounds: the model either returns its final

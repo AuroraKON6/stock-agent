@@ -83,7 +83,11 @@ class EngineAndBudgetTests(OpsViewTestCase):
         failures = view["recent_failures"]
         self.assertEqual(len(failures), 2)
         self.assertEqual(failures[0]["title"], "新失败")  # newest first
-        self.assertIn("second error", failures[0]["error"])
+        # R23 (KONM-96): ops carries a stable error CODE, never the message —
+        # the text stays in the task ledger / task detail.
+        self.assertEqual(failures[0]["error"], "other")
+        self.assertTrue(all(set(row) >= {"task_id", "title", "status", "error", "updated_at"}
+                            for row in failures))
 
 
 class SourceRegistryTests(OpsViewTestCase):

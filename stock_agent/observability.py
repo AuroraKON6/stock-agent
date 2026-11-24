@@ -21,7 +21,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .runtime_layout import utc_now
 from .task_runtime.store import (
@@ -81,27 +81,18 @@ def build_observability_status(store: Any, *, now: Optional[datetime] = None) ->
     inflight = [t for t in tasks if t.get("status") in ("leased", "running")]
 
     queue_ages = [age for age in (_age_seconds(t.get("created_at"), moment)
-                                  for t in queued[:MAX_SAMPLE]) if age is not None]
+                                  for t in queued) if age is not None]
     oldest_queued_age_seconds = max(queue_ages) if queue_ages else 0
 
     stale_leases = 0
-    for task in inflight[:MAX_SAMPLE]:
+    for task in inflight:
         expires = _parse(str(task.get("lease_expires_at") or ""))
         if expires is not None and expires <= moment:
             stale_leases += 1
 
-    attempts = {"succeeded": 0, "failed_known": 0, "outcome_unknown": 0,
-                "reconciled": 0, "outstanding": 0}
-    reconciliations_waiting = 0
-    for task in tasks[:MAX_SAMPLE]:
-        for attempt in store.invocation_attempts(str(task.get("task_id") or "")):
-            state = str(attempt.get("state") or "")
-            if state in attempts:
-                attempts[state] += 1
-            elif state in ("prepared", "dispatched"):
-                attempts["outstanding"] += 1
-            if state == "outcome_unknown" and not str(attempt.get("reconciled_at") or ""):
-                reconciliations_waiting += 1
+    # Full ledger, never a sample: an attempt on the 5,001st task counts.
+    ledger = aggregate_attempts(store)
+    attempts, reconciliations_waiting = ledger["states"], ledger["reconciliations_waiting"]
 
     business_gate_counts: Dict[str, int] = {GATE_BUDGET: 0, GATE_EVIDENCE_QUALITY: 0,
                                             GATE_INVOCATION_UNKNOWN: 0,
@@ -115,7 +106,7 @@ def build_observability_status(store: Any, *, now: Optional[datetime] = None) ->
         business_gate_counts[gate] += 1
         if len(blocked_sample) < 20:
             blocked_sample.append({"task_id": str(task.get("task_id") or ""),
-                                   "gate": gate, "error": redact(error),
+                                   "gate": gate, "error_code": error_code(error),
                                    "updated_at": str(task.get("updated_at") or "")})
 
     technical = {
@@ -125,6 +116,7 @@ def build_observability_status(store: Any, *, now: Optional[datetime] = None) ->
         "stale_leases": stale_leases,
         "invocation_attempts": attempts,
         "reconciliations_waiting": reconciliations_waiting,
+        "scope": {"tasks": len(tasks), "attempts": ledger["scope"]},
     }
     business = {
         "blocked_tasks": sum(business_gate_counts.values()),
@@ -141,20 +133,35 @@ def build_observability_status(store: Any, *, now: Optional[datetime] = None) ->
     }
 
 
+
+
 # --------------------------------------------------------------------------- #
 # KONM-96 (R23 continuation): trace, reconciliation, metrics, alert
 # candidates, structured log. Same rules as above: projections over the
 # authoritative ledgers (task store, invocation attempts, platform runs,
-# query ledger); nothing here writes, calls a model or contacts a source.
+# query intake + query ledger). Nothing here writes, calls a model or
+# contacts a source.
+#
+# What a view may carry: identifiers, states, timestamps, counts and STABLE
+# ERROR CODES. Error text, prompts, payloads and model output never leave
+# the ledger through a view; the structured log additionally admits only
+# allow-listed field names with identifier-shaped values.
 # --------------------------------------------------------------------------- #
-TRACE_SCHEMA = "1.0"
-RECONCILIATION_SCHEMA = "1.0"
+TRACE_SCHEMA = "1.1"
+RECONCILIATION_SCHEMA = "1.1"
 METRICS_SCHEMA = "1.0"
 ALERT_SCHEMA = "1.0"
-LOG_SCHEMA = "1.0"
+LOG_SCHEMA = "1.1"
 
 # Sampling (the only new observation that emits anything) is OFF unless the
 # config turns it on; turning it off leaves every ledger and audit row intact.
+ALERT_THRESHOLD_NAMES = (
+    "oldest_queued_age_seconds",
+    "stale_leases",
+    "reconciliations_waiting",
+    "query_outcome_unknown",
+    "dispatched_age_seconds",
+)
 DEFAULT_ALERT_THRESHOLDS = {
     "oldest_queued_age_seconds": 3600,
     "stale_leases": 0,
@@ -166,6 +173,72 @@ DEFAULT_ALERT_THRESHOLDS = {
 # Execution modes that never reach a real supplier.
 REPLAY_EXECUTION_MODES = ("replay", "dry_run", "simulation")
 
+MAX_EVENTS = 100000
+
+# Query-ledger availability — three different facts, never collapsed.
+LEDGER_NOT_CONFIGURED = "not_configured"
+LEDGER_MISSING = "missing"
+LEDGER_UNREADABLE = "unreadable"
+LEDGER_READABLE_EMPTY = "readable_empty"
+LEDGER_READABLE = "readable"
+_LEDGER_READ_STATES = (LEDGER_READABLE, LEDGER_READABLE_EMPTY)
+
+# Stable error codes: ordered, first match wins. A code describes the CLASS of
+# a failure; the message itself stays in the ledger.
+ERROR_CODES = (
+    "budget_exhausted", "evidence_quality", "invocation_outcome_unknown", "governance",
+    "lease_expired", "cancelled", "timeout", "auth_rejected", "rate_limited",
+    "connection_error", "provider_rejected", "model_output_invalid", "other",
+)
+_ERROR_CODE_MARKERS = (
+    ("budget_exhausted", ("budget",)),
+    ("evidence_quality", ("citation", "evidence gap", "specific findings", "evidence")),
+    ("invocation_outcome_unknown", ("outcome unknown", "manual reconciliation", "sent=unknown")),
+    ("governance", ("governance", "egress", "classification", "not public", "restricted")),
+    ("lease_expired", ("lease expired",)),
+    ("cancelled", ("cancel",)),
+    ("timeout", ("timeout", "timed out")),
+    ("auth_rejected", ("auth", "401", "credential", "unauthorized", "api key")),
+    ("rate_limited", ("rate limit", "429", "quota")),
+    ("connection_error", ("connection", "reset", "unreachable", "name resolution", "network")),
+    ("provider_rejected", ("rejected", "provider", "upstream", "http ")),
+    ("model_output_invalid", ("json", "parse", "schema", "invalid response")),
+)
+
+# Structured log: field names a record may carry. Anything else is dropped
+# (counted, never named), so a caller passing ``prompt`` or ``access_token``
+# cannot leak them. Values must then also be identifier-shaped or numeric.
+LOG_FIELDS = frozenset({
+    "task_id", "attempt_id", "case_id", "run_id", "request_id", "intent_id", "event_id",
+    "event_type", "state", "status", "gate", "error_code", "layer", "rule", "worker_id",
+    "round_index", "platform", "provider", "outcome", "stage", "sent", "supply_status",
+    "count", "attempts", "duration_ms", "calls_today", "limit", "allowed", "link",
+})
+_LOG_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:\-]{1,80}$")
+_LOG_NUMBERS = (int, float, bool)
+
+
+def error_code(text: Any) -> str:
+    """Classify an error message into one stable code; never returns text."""
+    value = str(text or "")
+    if not value.strip():
+        return ""
+    lowered = value.lower()
+    for code, markers in _ERROR_CODE_MARKERS:
+        if any(marker in lowered for marker in markers):
+            return code
+    return "other"
+
+
+def redact(value: Any, limit: int = 200) -> str:
+    """Mask credential-shaped fragments. Defense in depth only — views are
+    built from identifiers and codes, not from redacted free text."""
+    text = str(value or "")
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub(_REDACTED, text)
+    return text[:limit]
+
+
 _SECRET_PATTERNS = (
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+"),
     re.compile(r"\b(?:sk|pk|api|key|token|secret)[-_][A-Za-z0-9_-]{12,}"),
@@ -175,21 +248,10 @@ _SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
 )
 _REDACTED = "[REDACTED]"
-_ERROR_EXCERPT = 120
-MAX_EVENTS = 100000
-
-
-def redact(value: Any, limit: int = 200) -> str:
-    """Mask credential-shaped fragments. Deliberately narrow: identifiers
-    (task/attempt/run ids, hashes) must stay traceable."""
-    text = str(value or "")
-    for pattern in _SECRET_PATTERNS:
-        text = pattern.sub(_REDACTED, text)
-    return text[:limit]
 
 
 def contains_secret_marker(text: str, markers=()) -> bool:
-    """True when ``text`` still carries a credential-shaped fragment or any
+    """True when ``text`` carries a credential-shaped fragment or any
     caller-supplied forbidden marker (drills inject synthetic ones)."""
     if any(pattern.search(text) for pattern in _SECRET_PATTERNS):
         return True
@@ -197,62 +259,318 @@ def contains_secret_marker(text: str, markers=()) -> bool:
 
 
 def observability_settings(config: Any = None) -> Dict[str, Any]:
-    """Read the optional ``observability`` config block defensively: a
-    malformed block degrades to OFF, never to a business failure."""
+    """Read the optional ``observability`` config block STRICTLY.
+
+    Each capability is off unless its own block is well formed. A malformed
+    block turns that capability off (fail closed) and flags
+    ``config_valid=false``; it never becomes a business failure.
+    """
     settings = {"sampling_enabled": False, "alerts_enabled": False,
-                "thresholds": dict(DEFAULT_ALERT_THRESHOLDS), "config_valid": True}
-    raw = (config or {}).get("observability") if isinstance(config, dict) else None
-    if raw is None:
+                "thresholds": dict(DEFAULT_ALERT_THRESHOLDS), "config_valid": True,
+                "invalid": []}
+    block = config.get("observability") if isinstance(config, dict) else None
+    if block is None:
         return settings
-    if not isinstance(raw, dict):
+    if not isinstance(block, dict):
         settings["config_valid"] = False
+        settings["invalid"].append("observability")
         return settings
-    settings["sampling_enabled"] = raw.get("sampling", {}).get("enabled") is True \
-        if isinstance(raw.get("sampling", {}), dict) else False
-    alerts = raw.get("alerts", {})
-    if isinstance(alerts, dict):
-        settings["alerts_enabled"] = alerts.get("enabled") is True
-        thresholds = alerts.get("thresholds", {})
+
+    sampling = block.get("sampling", {})
+    if isinstance(sampling, dict) and not (set(sampling) - {"enabled"}) \
+            and sampling.get("enabled", False) in (True, False):
+        settings["sampling_enabled"] = sampling.get("enabled", False) is True
+    else:
+        settings["config_valid"] = False
+        settings["invalid"].append("sampling")
+
+    alerts = block.get("alerts", {})
+    alerts_valid = isinstance(alerts, dict) and not (set(alerts) - {"enabled", "thresholds"}) \
+        and alerts.get("enabled", False) in (True, False)
+    thresholds = alerts.get("thresholds", {}) if isinstance(alerts, dict) else None
+    if alerts_valid:
         if isinstance(thresholds, dict):
             for name, value in thresholds.items():
-                if name in settings["thresholds"] and isinstance(value, (int, float)) \
-                        and not isinstance(value, bool) and value >= 0:
-                    settings["thresholds"][name] = value
-                else:
-                    settings["config_valid"] = False
+                if name not in DEFAULT_ALERT_THRESHOLDS or isinstance(value, bool) \
+                        or not isinstance(value, (int, float)) or value < 0:
+                    alerts_valid = False
+                    break
+                settings["thresholds"][name] = value
         else:
-            settings["config_valid"] = False
+            alerts_valid = False
+    if alerts_valid:
+        settings["alerts_enabled"] = alerts.get("enabled", False) is True
+    else:
+        settings["config_valid"] = False
+        settings["invalid"].append("alerts")
+        settings["thresholds"] = dict(DEFAULT_ALERT_THRESHOLDS)
     return settings
+
+
+# -------- full-ledger aggregates (no sampling) -------- #
+
+def aggregate_attempts(store: Any) -> Dict[str, Any]:
+    """Every invocation attempt in the ledger, in one GROUP BY.
+
+    Falls back to per-task reads only for a store that exposes no SQLite
+    connection; ``scope.complete`` then says so instead of implying a total.
+    """
+    states = {"succeeded": 0, "failed_known": 0, "outcome_unknown": 0,
+              "reconciled": 0, "outstanding": 0}
+    result = {"states": states, "reconciliations_waiting": 0, "providers": {},
+              "with_error": 0, "unrecognized": 0,
+              "scope": {"complete": False, "source": "per_task_fallback"}}
+    conn = getattr(store, "_conn", None)
+    rows = None
+    if conn is not None:
+        try:
+            rows = conn.execute(
+                "SELECT state, provider, (reconciled_at <> '') AS reconciled, COUNT(*) AS n, "
+                "SUM(CASE WHEN error <> '' THEN 1 ELSE 0 END) AS with_error "
+                "FROM task_invocation_attempts "
+                "GROUP BY state, provider, (reconciled_at <> '')").fetchall()
+            result["scope"] = {"complete": True, "source": "sqlite_full_ledger"}
+        except Exception:  # noqa: BLE001 — fall through to the per-task reads
+            rows = None
+    if rows is None:
+        collected: Dict[Any, List[Any]] = {}
+        for task in store.list_tasks():
+            for attempt in store.invocation_attempts(str(task.get("task_id") or "")):
+                collected.setdefault((str(attempt.get("state") or ""),
+                                      str(attempt.get("provider") or ""),
+                                      bool(attempt.get("reconciled_at"))), []).append(attempt)
+        rows = [(key[0], key[1], key[2], len(items),
+                 sum(1 for item in items if item.get("error")))
+                for key, items in collected.items()]
+    for state, provider, reconciled, count, with_error in rows:
+        state = str(state or "")
+        provider = str(provider or "")
+        if state in (ATTEMPT_PREPARED, ATTEMPT_DISPATCHED):
+            states["outstanding"] += count
+        elif state in states:
+            states[state] += count
+        else:
+            result["unrecognized"] += count
+        if state == ATTEMPT_OUTCOME_UNKNOWN and not reconciled:
+            result["reconciliations_waiting"] += count
+        if provider:
+            result["providers"][provider] = result["providers"].get(provider, 0) + count
+        result["with_error"] += int(with_error or 0)
+    result["providers"] = dict(sorted(result["providers"].items()))
+    return result
+
+
+def event_type_counts(store: Any) -> Dict[str, Any]:
+    """Outbox event counts by type over the WHOLE outbox."""
+    conn = getattr(store, "_conn", None)
+    if conn is not None:
+        try:
+            rows = conn.execute(
+                "SELECT event_type, COUNT(*) AS n FROM task_outbox GROUP BY event_type").fetchall()
+            return {"counts": {str(r[0]): int(r[1]) for r in rows},
+                    "scanned": sum(int(r[1]) for r in rows), "complete": True}
+        except Exception:  # noqa: BLE001
+            pass
+    events = store.events(limit=MAX_EVENTS)
+    counts: Dict[str, int] = {}
+    for event in events:
+        name = str(event.get("event_type") or "")
+        counts[name] = counts.get(name, 0) + 1
+    summary = getattr(store, "summary", None)
+    total = int((summary() or {}).get("outbox_events") or 0) if callable(summary) else None
+    # Without a total to compare against the scan cannot claim completeness.
+    return {"counts": counts, "scanned": len(events),
+            "complete": total is not None and len(events) >= total and total < MAX_EVENTS}
+
+
+# -------- query ledgers (intake binding + JSONL audit projection) -------- #
+
+def read_query_ledgers(config: Any = None) -> Dict[str, Any]:
+    """Read both query records ONCE, reporting exactly what was found.
+
+    - ``state``: the JSONL audit ledger — not_configured / missing /
+      unreadable / readable_empty / readable. Only the last two mean the
+      query counts below mean anything.
+    - ``intake_state``: the connector intake (reservation -> consumption
+      binding). It is the authority that ties a query to the task that
+      consumed it; without it only legacy ``task_id`` links can be used.
+
+    The intake is opened with ``mode=ro``: a missing intake is reported, never
+    created (the production ``ConnectorQueryStore`` would create the schema).
+    """
+    read: Dict[str, Any] = {"state": LEDGER_NOT_CONFIGURED, "detail": "",
+                            "records": [], "unreadable_lines": 0,
+                            "intake_state": LEDGER_NOT_CONFIGURED, "intake_detail": "",
+                            "consumptions": [], "intents": {}}
+    if not isinstance(config, dict):
+        return read
+    import sqlite3
+
+    from .sources import kimi_adapter
+
+    ledger_path = kimi_adapter._ledger_path(config)
+    if not ledger_path.is_file():
+        read["state"] = LEDGER_MISSING
+        read["detail"] = "query ledger file absent"
+    else:
+        try:
+            with open(ledger_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        read["unreadable_lines"] += 1
+                        continue
+                    if isinstance(record, dict):
+                        read["records"].append(record)
+            read["state"] = LEDGER_READABLE if read["records"] else LEDGER_READABLE_EMPTY
+        except (OSError, UnicodeDecodeError) as exc:
+            read["state"] = LEDGER_UNREADABLE
+            read["detail"] = "query ledger unreadable: {0}".format(type(exc).__name__)
+
+    intake_path = kimi_adapter._query_store_path(config)
+    if not intake_path.is_file():
+        read["intake_state"] = LEDGER_MISSING
+        read["intake_detail"] = "query intake file absent"
+        return read
+    try:
+        conn = sqlite3.connect(intake_path.resolve().as_uri() + "?mode=ro", uri=True,
+                               timeout=30, isolation_level=None, check_same_thread=False)
+        try:
+            conn.row_factory = sqlite3.Row
+            names = {str(r[0]) for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if not {"query_intents", "query_consumptions"} <= names:
+                read["intake_state"] = LEDGER_READABLE_EMPTY
+                read["intake_detail"] = "intake has no query tables yet"
+            else:
+                read["intents"] = {str(r["intent_id"]): dict(r) for r in conn.execute(
+                    "SELECT * FROM query_intents")}
+                read["consumptions"] = [dict(r) for r in conn.execute(
+                    "SELECT * FROM query_consumptions ORDER BY consumed_at, intent_id")]
+                read["intake_state"] = LEDGER_READABLE if read["intents"] else LEDGER_READABLE_EMPTY
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        read["intake_state"] = LEDGER_UNREADABLE
+        read["intake_detail"] = "query intake unreadable: {0}".format(type(exc).__name__)
+    return read
+
+
+def queries_for_task(task_id: str, read: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The queries a task consumed, by stable correlation.
+
+    ``consumption_binding`` — the intake row that binds intent -> task (the
+    authority written by the governed query path); enriched with the JSONL
+    audit projection by ``intent_id`` / ``request_id``.
+    ``ledger_task_id`` — legacy JSONL records that carry the task id
+    directly and predate the intake binding.
+    """
+    task_id = str(task_id or "")
+    records = read.get("records") or []
+    intents = {str(r.get("request_id") or ""): r for r in records
+               if r.get("record_type") == "query_intent"}
+    results: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        if record.get("record_type") == "query_result":
+            for key in (str(record.get("request_id") or ""), str(record.get("intent_id") or "")):
+                if key:
+                    results[key] = record
+    intake_intents = read.get("intents") or {}
+    queries: List[Dict[str, Any]] = []
+    seen = set()
+
+    for binding in read.get("consumptions") or []:
+        if str(binding.get("task_id") or "") != task_id:
+            continue
+        intent_id = str(binding.get("intent_id") or "")
+        intake = intake_intents.get(intent_id) or {}
+        request_id = str(intake.get("request_id") or "")
+        audit = intents.get(request_id) or {}
+        result = results.get(intent_id) or results.get(request_id) or {}
+        seen.add(intent_id)
+        seen.add(request_id)
+        queries.append({
+            "request_id": request_id, "intent_id": intent_id, "link": "consumption_binding",
+            "source_id": str(intake.get("source_id") or audit.get("source_id") or ""),
+            "api_id": str(audit.get("api_id") or ""),
+            "data_kind": str(audit.get("data_kind") or ""),
+            "supply_status": str(binding.get("supply_status") or ""),
+            "outcome": str(result.get("outcome") or intake.get("outcome") or "unknown"),
+            "cost_status": str(result.get("cost_status") or "unknown"),
+            "created_at": str(intake.get("created_at") or audit.get("created_at") or ""),
+            "consumed_at": str(binding.get("consumed_at") or ""),
+        })
+
+    for request_id, audit in intents.items():
+        if request_id in seen or str(audit.get("task_id") or "") != task_id:
+            continue
+        result = results.get(request_id) or {}
+        queries.append({
+            "request_id": request_id,
+            "intent_id": str(result.get("intent_id") or ""),
+            "link": "ledger_task_id",
+            "source_id": str(audit.get("source_id") or ""),
+            "api_id": str(audit.get("api_id") or ""),
+            "data_kind": str(audit.get("data_kind") or ""),
+            "supply_status": "",
+            "outcome": str(result.get("outcome") or "unknown") if result else "unknown",
+            "cost_status": str(result.get("cost_status") or "unknown") if result else "unknown",
+            "created_at": str(audit.get("created_at") or ""),
+            "consumed_at": "",
+        })
+    return queries
+
+
+def ledger_unknown_items(read: Dict[str, Any]) -> List[str]:
+    unknown = []
+    if read.get("state") not in _LEDGER_READ_STATES:
+        unknown.append("data_query_ledger")
+    if read.get("intake_state") not in _LEDGER_READ_STATES:
+        unknown.append("query_consumption_binding")
+    return unknown
 
 
 # -------- trace -------- #
 
-def _load_query_ledger(config: Any) -> List[Dict[str, Any]]:
-    if config is None:
-        return []
-    from .sources import kimi_adapter
+def _attempt_order(attempt: Dict[str, Any]) -> tuple:
+    """Execution order of one task's attempts.
 
-    try:
-        return list(kimi_adapter.load_query_ledger(config, limit=100000))
-    except Exception:  # noqa: BLE001 — a trace degrades to "ledger unreadable"
-        return []
+    The store reader orders by ``started_at`` (whole seconds) and then by a
+    random id, so two attempts started in the same second come back in
+    arbitrary order. The fencing token increases with every claim, so
+    (claim, round, start, id) is the real sequence across worker runs.
+    """
+    return (int(attempt.get("fencing_token") or 0), int(attempt.get("round_index") or 0),
+            str(attempt.get("started_at") or ""), str(attempt.get("attempt_id") or ""))
 
 
 def build_trace(store: Any, task_id: str, *, config: Any = None,
-                ledger: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                ledger: Optional[List[Dict[str, Any]]] = None,
+                query_read: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One task's stable correlation chain, read from the authoritative rows.
 
     Business identity (``case_id`` / ``business_intent_id`` — what was asked)
     is reported apart from platform execution ids (``task_platform_runs`` —
     which Dify/n8n runs drove it), so a retried or replayed platform run is
-    seen as the same intent with a second execution. Payloads, prompts,
-    model output and raw errors are never included: identifiers, states and
-    timestamps only.
+    seen as the same intent with a second execution. Carries identifiers,
+    states, timestamps and error codes only — never payloads, prompts, model
+    output or error text.
+
+    ``ledger`` (a raw record list) is the pre-intake call form: it supplies
+    the JSONL audit projection and leaves the intake binding unread.
+    ``query_read`` (from :func:`read_query_ledgers`) is shared with the
+    reconciliation so both report the same availability.
     """
     task = store.get_task(str(task_id))
-    records = _load_query_ledger(config) if ledger is None else list(ledger)
-    intents = {str(r.get("request_id") or ""): r for r in records if r.get("record_type") == "query_intent"}
-    results = {str(r.get("request_id") or ""): r for r in records if r.get("record_type") == "query_result"}
+    read = dict(query_read) if query_read is not None else (
+        {"state": LEDGER_READABLE if ledger else LEDGER_READABLE_EMPTY, "records": list(ledger or []),
+         "intake_state": LEDGER_MISSING, "consumptions": [], "intents": {}}
+        if ledger is not None else read_query_ledgers(config))
+    queries = queries_for_task(task_id, read)
 
     attempts = [{
         "attempt_id": str(a.get("attempt_id") or ""),
@@ -267,26 +585,9 @@ def build_trace(store: Any, task_id: str, *, config: Any = None,
         "reconciliation": str(a.get("reconciliation") or ""),
         "started_at": str(a.get("started_at") or ""),
         "ended_at": str(a.get("ended_at") or ""),
-        "error_excerpt": redact(a.get("error"), _ERROR_EXCERPT),
-    } for a in sorted(store.invocation_attempts(str(task_id)),
-                       key=lambda a: (int(a.get("round_index") or 0),
-                                      str(a.get("started_at") or ""), str(a.get("attempt_id") or "")))]
+        "error_code": error_code(a.get("error")),
+    } for a in sorted(store.invocation_attempts(str(task_id)), key=_attempt_order)]
 
-    queries = []
-    for request_id, intent in intents.items():
-        if str(intent.get("task_id") or "") != str(task_id):
-            continue
-        result = results.get(request_id) or {}
-        queries.append({
-            "request_id": request_id,
-            "source_id": str(intent.get("source_id") or ""),
-            "api_id": str(intent.get("api_id") or ""),
-            "data_kind": str(intent.get("data_kind") or ""),
-            "created_at": str(intent.get("created_at") or ""),
-            "result_present": bool(result),
-            "outcome": str(result.get("outcome") or "unknown") if result else "unknown",
-            "cost_status": str(result.get("cost_status") or "unknown") if result else "unknown",
-        })
 
     events = [{"sequence": e.get("sequence"), "event_id": str(e.get("event_id") or ""),
                "event_type": str(e.get("event_type") or ""),
@@ -333,7 +634,7 @@ def build_trace(store: Any, task_id: str, *, config: Any = None,
             "lease_expires_at": str(task.get("lease_expires_at") or ""),
             "created_at": str(task.get("created_at") or ""),
             "updated_at": str(task.get("updated_at") or ""),
-            "last_error_excerpt": redact(task.get("last_error"), _ERROR_EXCERPT),
+            "last_error_code": error_code(task.get("last_error")),
         },
         # What was asked: stable across retries and platform replays.
         "business_identity": {
@@ -351,10 +652,13 @@ def build_trace(store: Any, task_id: str, *, config: Any = None,
             "attempts": len(attempts), "queries": len(queries),
             "events": len(events),
             "outcomes": sorted(set(kinds)),
-            "query_ledger_available": config is not None or ledger is not None,
+            "query_ledger_state": read.get("state"),
+            "query_ledger_available": read.get("state") in _LEDGER_READ_STATES,
+            "query_intake_state": read.get("intake_state"),
+            "unknown_items": ledger_unknown_items(read),
         },
         "side_effects": "none",
-        "redaction_note": "仅标识/状态/时间；不含输入输出正文、提示词或完整错误文本",
+        "projection_note": "仅标识/状态/时间/稳定错误码；不含输入输出正文、提示词或错误原文",
     }
 
 
@@ -362,7 +666,8 @@ def build_trace(store: Any, task_id: str, *, config: Any = None,
 
 def build_reconciliation(store: Any, *, config: Any = None,
                          now: Optional[datetime] = None,
-                         ledger: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                         ledger: Optional[List[Dict[str, Any]]] = None,
+                         query_read: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Line up the observation view with the ledgers it claims to describe.
 
     Every number carries its evidence class: ``ledger`` (counted from an
@@ -375,14 +680,17 @@ def build_reconciliation(store: Any, *, config: Any = None,
     technical, business = status["technical"], status["business"]
     tasks = list(store.list_tasks())
     summary = store.summary() or {}
-    records = _load_query_ledger(config) if ledger is None else list(ledger)
-    ledger_available = config is not None or ledger is not None
+    if query_read is None:
+        query_read = ({"state": LEDGER_READABLE if ledger else LEDGER_READABLE_EMPTY,
+                       "records": list(ledger or []), "intake_state": LEDGER_MISSING,
+                       "consumptions": [], "intents": {}} if ledger is not None
+                      else read_query_ledgers(config))
+    records = query_read.get("records") or []
+    ledger_available = query_read.get("state") in _LEDGER_READ_STATES
+    intake_available = query_read.get("intake_state") in _LEDGER_READ_STATES
 
-    events = store.events(limit=MAX_EVENTS)
-    event_counts: Dict[str, int] = {}
-    for event in events:
-        name = str(event.get("event_type") or "")
-        event_counts[name] = event_counts.get(name, 0) + 1
+    events = event_type_counts(store)
+    event_counts = events["counts"]
     outbox_total = int(summary.get("outbox_events") or 0)
 
     query_results = [r for r in records if r.get("record_type") == "query_result"]
@@ -390,21 +698,20 @@ def build_reconciliation(store: Any, *, config: Any = None,
     for result in query_results:
         outcome = str(result.get("outcome") or "unknown")
         query_outcomes[outcome] = query_outcomes.get(outcome, 0) + 1
+    result_keys = {str(r.get("request_id") or "") for r in query_results} | \
+                  {str(r.get("intent_id") or "") for r in query_results}
     intents_without_result = sum(
         1 for r in records if r.get("record_type") == "query_intent"
-        and not any(x.get("request_id") == r.get("request_id") for x in query_results))
+        and str(r.get("request_id") or "") not in result_keys)
+    consumptions = query_read.get("consumptions") or []
 
     by_mode: Dict[str, int] = {}
     for task in tasks:
         mode = str(task.get("execution_mode") or "live")
         by_mode[mode] = by_mode.get(mode, 0) + 1
 
+    attempt_ledger = aggregate_attempts(store)
     attempt_states = technical["invocation_attempts"]
-    providers: Dict[str, int] = {}
-    for task in tasks[:MAX_SAMPLE]:
-        for attempt in store.invocation_attempts(str(task.get("task_id") or "")):
-            key = redact(attempt.get("provider"), 60) or "(none)"
-            providers[key] = providers.get(key, 0) + 1
     replay_tasks = sum(n for mode, n in by_mode.items() if mode in REPLAY_EXECUTION_MODES)
 
     budget = {"calls_today": "unknown", "limit": "unknown", "allowed": "unknown"}
@@ -417,7 +724,14 @@ def build_reconciliation(store: Any, *, config: Any = None,
     except Exception:  # noqa: BLE001 — budget unreadable stays visible as unknown
         pass
 
-    reconciliation = {
+    unknown_items = {"estimated_usage", "real_supplier_usage"}
+    unknown_items.update(ledger_unknown_items(query_read))
+    if not attempt_ledger["scope"]["complete"]:
+        unknown_items.add("invocation_attempts_total")
+    if not events["complete"]:
+        unknown_items.add("outbox_event_type_counts")
+
+    return {
         "schema_version": RECONCILIATION_SCHEMA,
         "generated_at": moment.isoformat(timespec="seconds"),
         "technical": technical,
@@ -426,9 +740,9 @@ def build_reconciliation(store: Any, *, config: Any = None,
             "task_status_counts": dict(summary.get("task_counts") or {}),
             "outbox_events": outbox_total,
             "consumption": store.consumption_summary(),
-            "event_type_counts": event_counts,
-            "event_scan": {"scanned": len(events), "total": outbox_total,
-                           "complete": len(events) >= outbox_total},
+            "event_type_counts": dict(sorted(event_counts.items())),
+            "event_scan": {"scanned": events["scanned"], "total": outbox_total,
+                           "complete": events["complete"]},
         },
         "queue": {
             "depth": {"value": technical["queue_depth"], "evidence": "ledger"},
@@ -439,25 +753,24 @@ def build_reconciliation(store: Any, *, config: Any = None,
         },
         "invocations": {
             "states": attempt_states,
-            "by_provider": providers,
+            "by_provider": attempt_ledger["providers"],
             "reconciliations_waiting": technical["reconciliations_waiting"],
             "known_failures": attempt_states["failed_known"],
             "unknown_open": attempt_states["outcome_unknown"],
             "unknown_reconciled": attempt_states["reconciled"],
+            "scope": attempt_ledger["scope"],
         },
         "rejections": {
             "budget_blocked_tasks": business["gate_counts"][GATE_BUDGET],
             "governance_blocked_tasks": business["gate_counts"][GATE_GOVERNANCE],
             "query_artifact_rejections": sum(
                 1 for r in query_results for p in (r.get("artifact_plans") or [])
-                if p.get("remote_name_rejected")),
+                if isinstance(p, dict) and p.get("remote_name_rejected")),
             "rejected_events": {k: v for k, v in sorted(event_counts.items()) if "reject" in k},
         },
         "evidence": {
             "missing_evidence_blocked_tasks": business["gate_counts"][GATE_EVIDENCE_QUALITY],
-            "failed_attempts_with_error": sum(
-                1 for t in tasks[:MAX_SAMPLE] for a in store.invocation_attempts(str(t.get("task_id") or ""))
-                if a.get("error")),
+            "attempts_with_error": attempt_ledger["with_error"],
             "quarantined_evidence_events": event_counts.get("evidence_quarantined", 0),
         },
         "usage": {
@@ -467,7 +780,8 @@ def build_reconciliation(store: Any, *, config: Any = None,
                 "budget_allows_next_call": budget["allowed"],
                 "attempts_by_state": attempt_states,
                 "data_query_intents": sum(1 for r in records if r.get("record_type") == "query_intent"),
-                "data_query_results": len(query_results),
+                "data_query_results": len(query_results) if ledger_available else "unknown",
+                "query_consumptions_bound": len(consumptions) if intake_available else "unknown",
                 "cost_unknown_results": sum(
                     1 for r in query_results if str(r.get("cost_status") or "") in ("", "unknown")),
             },
@@ -478,8 +792,7 @@ def build_reconciliation(store: Any, *, config: Any = None,
                           "reason": "仓库没有估算账本；不编造数字，保持 unknown"},
             "real_supplier": {
                 "status": "unknown",
-                "reason": "真实供应商用量需供应商回执；本次仅合成/回放，保持 unknown",
-            },
+                "reason": "真实供应商用量需供应商回执；本次仅合成/回放，保持 unknown"},
         },
         "resources": {
             "task_db_bytes": _db_bytes(store),
@@ -487,16 +800,21 @@ def build_reconciliation(store: Any, *, config: Any = None,
             "store_read_only": bool(getattr(store, "read_only", False)),
         },
         "queries": {
+            "ledger_state": query_read.get("state"),
             "ledger_available": ledger_available,
-            "outcome_counts": query_outcomes,
-            "intents_without_result": intents_without_result,
-            "note": "query 账本不可读或未提供时计数为 0 且 ledger_available=false，不代表没有查询",
+            "ledger_detail": query_read.get("detail") or "",
+            "ledger_unreadable_lines": query_read.get("unreadable_lines", 0),
+            "intake_state": query_read.get("intake_state"),
+            "intake_available": intake_available,
+            "intake_detail": query_read.get("intake_detail") or "",
+            "outcome_counts": query_outcomes if ledger_available else {},
+            "intents_without_result": intents_without_result if ledger_available else "unknown",
+            "consumptions_bound": len(consumptions) if intake_available else "unknown",
+            "note": "ledger_available=false 表示账本未配置/缺失/不可读：计数为 0 不代表没有查询",
         },
-        "unknown_items": sorted({"estimated_usage", "real_supplier_usage"}
-                                | ({"data_query_ledger"} if not ledger_available else set())),
+        "unknown_items": sorted(unknown_items),
         "side_effects": "none",
     }
-    return reconciliation
 
 
 def _db_bytes(store: Any) -> Optional[int]:
@@ -560,14 +878,16 @@ def build_alert_candidates(status: Dict[str, Any], reconciliation: Optional[Dict
     technical = status.get("technical") or {}
     business = status.get("business") or {}
     recon = reconciliation or {}
-    queries = (recon.get("queries") or {}).get("outcome_counts") or {}
+    queries = recon.get("queries") or {}
 
     def candidate(rule: str, layer: str, value: Any, threshold: Any, evidence: str,
                   severity: str = "warning") -> Dict[str, Any]:
         return {"rule": rule, "layer": layer, "severity": severity,
                 "observed": value, "threshold": threshold, "evidence": evidence,
-                "candidate": value > threshold}
+                "candidate": isinstance(value, (int, float)) and value > threshold}
 
+    # A missing ledger is NOT a zero: the rule cannot fire and says so.
+    unknown_queries = not queries.get("ledger_available", False)
     rows = [
         candidate("queue_oldest_age", "technical",
                   technical.get("oldest_queued_age_seconds", 0),
@@ -578,11 +898,12 @@ def build_alert_candidates(status: Dict[str, Any], reconciliation: Optional[Dict
                   technical.get("reconciliations_waiting", 0),
                   limits["reconciliations_waiting"], "ledger"),
         candidate("query_outcome_unknown", "technical",
-                  queries.get("outcome_unknown", 0), limits["query_outcome_unknown"], "ledger"),
+                  "unknown" if unknown_queries else (queries.get("outcome_counts") or {}).get(
+                      "outcome_unknown", 0),
+                  limits["query_outcome_unknown"], "unknown" if unknown_queries else "ledger"),
         candidate("blocked_tasks", "business", business.get("blocked_tasks", 0), 0,
                   "ledger", "info"),
     ]
-    fired = [row for row in rows if row["candidate"]]
     return {
         "schema_version": ALERT_SCHEMA,
         "generated_at": utc_now().isoformat(timespec="seconds"),
@@ -596,39 +917,65 @@ def build_alert_candidates(status: Dict[str, Any], reconciliation: Optional[Dict
     }
 
 
+# -------- structured log -------- #
+
+def project_log_fields(fields: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], int]:
+    """Keep only allow-listed fields whose value is a number or an
+    identifier-shaped string; everything else is dropped and only COUNTED."""
+    kept: Dict[str, Any] = {}
+    dropped = 0
+    for name, value in (fields or {}).items():
+        try:
+            name = str(name)
+        except Exception:  # noqa: BLE001
+            dropped += 1
+            continue
+        if name not in LOG_FIELDS:
+            dropped += 1
+            continue
+        if isinstance(value, bool) or isinstance(value, int):
+            kept[name] = value
+        elif isinstance(value, float):
+            kept[name] = value
+        elif isinstance(value, str) and _LOG_IDENTIFIER.match(value) \
+                and not contains_secret_marker(value):
+            kept[name] = value
+        else:
+            dropped += 1
+    return kept, dropped
+
+
 def emit_observability_log(event: str, fields: Optional[Dict[str, Any]] = None,
                            *, config: Any = None, sink: Any = None) -> Optional[Dict[str, Any]]:
-    """One structured JSON line, redacted. Returns the record (or None when
-    sampling is off); writes only to ``sink`` (default: stderr) and only
-    when ``observability.sampling.enabled`` is true. With sampling off the
-    caller's business flow is untouched and no audit row is removed."""
-    settings = observability_settings(config)
-    if not settings["sampling_enabled"]:
+    """One structured JSON line, or None when sampling is off.
+
+    Writes only to ``sink`` (default: stderr) and only when
+    ``observability.sampling.enabled`` is true and well formed. The record
+    carries the event name plus allow-listed, identifier-shaped fields (see
+    :func:`project_log_fields`); dropped fields are counted, never named.
+    With sampling off nothing is written and no audit row is touched.
+    """
+    if not observability_settings(config)["sampling_enabled"]:
         return None
-    record = {"schema_version": LOG_SCHEMA, "event": str(event),
+    name = event if isinstance(event, str) and _LOG_IDENTIFIER.match(event) else "invalid_event"
+    kept, dropped = project_log_fields(fields)
+    record = {"schema_version": LOG_SCHEMA, "event": name,
               "generated_at": utc_now().isoformat(timespec="seconds"),
-              "fields": _redact_tree(fields or {})}
+              "fields": kept, "dropped_fields": dropped}
     if sink is None:
         sink = sys.stderr
     sink.write(json.dumps(record, ensure_ascii=False) + "\n")
     return record
 
 
-def _redact_tree(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(k): _redact_tree(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact_tree(v) for v in value]
-    if isinstance(value, str):
-        return redact(value, 4000)
-    return value
-
-
 def build_observability_report(store: Any, *, config: Any = None,
                                task_id: str = "", now: Optional[datetime] = None) -> Dict[str, Any]:
-    """Status + reconciliation + metrics + alert candidates in one read."""
+    """Status + reconciliation + metrics + alert candidates (+ one trace)
+    from a single read of every ledger, so all parts report the same
+    availability."""
     settings = observability_settings(config)
-    reconciliation = build_reconciliation(store, config=config, now=now)
+    query_read = read_query_ledgers(config)
+    reconciliation = build_reconciliation(store, config=config, now=now, query_read=query_read)
     report = {
         "schema_version": RECONCILIATION_SCHEMA,
         "generated_at": reconciliation["generated_at"],
@@ -639,7 +986,7 @@ def build_observability_report(store: Any, *, config: Any = None,
         "alert_candidates": build_alert_candidates(
             reconciliation, reconciliation, thresholds=settings["thresholds"],
             alerts_enabled=settings["alerts_enabled"]),
-        "trace": build_trace(store, task_id, config=config) if task_id else None,
+        "trace": build_trace(store, task_id, query_read=query_read) if task_id else None,
         "settings": settings,
         "side_effects": "none",
     }
