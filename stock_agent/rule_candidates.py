@@ -13,6 +13,7 @@ a new digest never even becomes runnable until a human approves it.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 
 from .models import now_iso
@@ -24,6 +25,13 @@ from .role_execution import (
 )
 
 RULE_CANDIDATE_SCHEMA = "1.0"
+
+
+def _deep(value: Any) -> Any:
+    """Copy through JSON — a candidate artifact is plain JSON data, and no
+    caller may hold a reference into the ledger's frozen copy."""
+    return json.loads(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                 default=str))
 
 
 class RuleCandidateError(ValueError):
@@ -74,8 +82,8 @@ def _candidate_flow(base_flow: Dict[str, Any],
     return define_role_flow(
         flow_id=str(base_flow.get("flow_id") or ""),
         version=int(base_flow.get("version") or 0) + 1,
-        groups=groups,
-        prompts=prompts,
+        groups=_deep(groups),
+        prompts=_deep(prompts),
     )
 
 
@@ -127,31 +135,40 @@ class RuleCandidateBook:
     def propose(self, base_flow: Dict[str, Any], *, changes: Dict[str, Any],
                 actor: str) -> Dict[str, Any]:
         record = propose_rule_change(base_flow, changes=changes, actor=actor)
-        stored = dict(record)
-        stored.pop("flow", None)  # the live artifact stays internal to the book
-        self._items[str(record["candidate_id"])] = {"record": stored, "flow": record["flow"]}
-        return dict(stored)
+        flow = _deep(record.pop("flow"))
+        stored = _deep(record)
+        self._items[str(record["candidate_id"])] = {"record": stored, "flow": flow}
+        return _deep(stored)
 
     def get(self, candidate_id: str) -> Dict[str, Any]:
         entry = self._items.get(str(candidate_id))
         if entry is None:
             raise RuleCandidateError("candidate_not_found: {0}".format(candidate_id))
-        return dict(entry["record"])
+        return _deep(entry["record"])
 
     def candidate_flow(self, candidate_id: str) -> Dict[str, Any]:
-        """The unapproved artifact (for registry checks; never auto-approved)."""
+        """The unapproved artifact (for registry checks; never auto-approved).
+
+        Returned as a deep copy: editing it cannot change the frozen
+        candidate, and approval re-derives the artifact from the prompt
+        TEXT and checks the recomputed digest against the recorded one."""
         entry = self._items.get(str(candidate_id))
         if entry is None:
             raise RuleCandidateError("candidate_not_found: {0}".format(candidate_id))
-        return dict(entry["flow"])
+        return _deep(entry["flow"])
 
     def pending(self) -> List[Dict[str, Any]]:
-        return [dict(entry["record"]) for entry in self._items.values()
+        return [_deep(entry["record"]) for entry in self._items.values()
                 if entry["record"]["status"] == "pending_review"]
 
     def approve(self, candidate_id: str, *, registry: FlowRegistry,
                 reviewer: str) -> Dict[str, Any]:
-        """Register + approve the candidate — human reviewer only."""
+        """Register + approve the candidate — human reviewer only.
+
+        The artifact is re-derived from its stored prompt text and compared
+        with the digest recorded at proposal time. A candidate whose stored
+        bytes no longer hash to the recorded digest is REFUSED rather than
+        approved as if the human had reviewed those bytes."""
         entry = self._items.get(str(candidate_id))
         if entry is None:
             raise RuleCandidateError("candidate_not_found: {0}".format(candidate_id))
@@ -160,10 +177,26 @@ class RuleCandidateBook:
             raise RuleCandidateError(
                 "not_pending: {0} is {1}".format(candidate_id, record["status"]))
         name = _human_reviewer(reviewer)
-        flow = entry["flow"]
-        registry.register(flow)
-        registry.approve(flow, actor=name)
+        recorded = record["candidate"]
+        flow = _deep(entry["flow"])
+        rebuilt = define_role_flow(
+            flow_id=str(flow.get("flow_id") or ""),
+            version=int(flow.get("version") or 0),
+            groups=_deep(flow.get("groups")),
+            prompts=_deep(flow.get("prompts")),
+        )
+        prompt_digests = {str(role): str(artifact.get("sha256") or "")
+                          for role, artifact in (rebuilt.get("prompts") or {}).items()}
+        if (str(rebuilt.get("flow_sha256") or "") != str(recorded.get("flow_sha256") or "")
+                or str(flow.get("flow_sha256") or "") != str(rebuilt.get("flow_sha256") or "")
+                or prompt_digests != dict(recorded.get("prompt_sha256") or {})):
+            raise RuleCandidateError(
+                "candidate_tampered: {0} no longer matches the digest recorded "
+                "at proposal time".format(candidate_id))
+        registry.register(rebuilt)
+        registry.approve(rebuilt, actor=name)
+        entry["flow"] = _deep(rebuilt)
         record.update({"status": "approved", "approved_by": name,
                        "approved_at": now_iso(), "applies_to_approved": True,
                        "approved_version_unchanged": record["base"]["flow_sha256"]})
-        return dict(record)
+        return _deep(record)

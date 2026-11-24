@@ -166,17 +166,17 @@ def wait_worker(directory: Path):
         raise RuntimeError("the disposable Dify worker was not started")
     started = subprocess.run(["docker", "inspect", "--format", "{{.State.StartedAt}}", worker],
                              check=True, capture_output=True, text=True, timeout=20).stdout.strip()
-    deadline = time.monotonic() + 240
+    deadline = time.monotonic() + 420
     while time.monotonic() < deadline:
         try:
-            logs = subprocess.run(["docker", "logs", "--since", started, "--tail", "80", worker], capture_output=True,
+            logs = subprocess.run(["docker", "logs", "--since", started, "--tail", "200", worker], capture_output=True,
                                   text=True, timeout=20).stdout
         except subprocess.TimeoutExpired:
             continue
         if any("celery@" in line and line.rstrip().endswith(" ready.") for line in logs.splitlines()):
             return
         time.sleep(2)
-    raise TimeoutError("Dify Celery worker did not become ready in 240 seconds")
+    raise TimeoutError("Dify Celery worker did not become ready in 420 seconds")
 
 
 def restart_stack(directory: Path, console):

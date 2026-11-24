@@ -29,6 +29,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 from stock_agent.config import project_path_override
 from stock_agent.personal_review import (
@@ -60,6 +61,7 @@ from stock_agent.subtask_graph import (
 from stock_agent.task_runtime import TaskStore
 from stock_agent.task_runtime.store import TERMINAL_STATUSES
 from stock_agent.task_supply import build_task_spec
+from stock_agent.workflow_service import cancel_task as workflow_cancel_task
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _vault_fixture import import_document, vault_config
@@ -329,6 +331,9 @@ class DualModeTests(R22IntegrationCase):
         self.assertFalse(row["signoff"]["acknowledged_by_human"])
         self.assertEqual(actor_kind("event_analyst"), "automated")
         self.assertEqual(actor_kind("role-orchestrator"), "automated")
+        self.assertEqual(actor_kind("role-orchestrator:synthetic-credential"),
+                         "automated",
+                         "the role API's credential suffix must not launder an orchestrator")
         self.assertEqual(actor_kind(OWNER), "human")
 
     def test_role_step_budget_exhaustion_creates_nothing(self):
@@ -484,6 +489,80 @@ class FanoutReviewTests(R22IntegrationCase):
         self.assertEqual(self.store.get_task(created[0]["task_id"])["attempt_count"], 0)
         self.assertEqual(duplicates[0]["task_id"], created[0]["task_id"])
 
+    def _race(self, parent, left, right, **limits):
+        """Both submitters read the same pre-lock snapshot, then race.
+
+        The hook in ``list_tasks`` forces the interleaving the reviewer used:
+        neither side's first children read may be the one that decides."""
+        barrier = Barrier(2, timeout=10)
+
+        class SynchronizedReadStore(TaskStore):
+            def list_tasks(self, status=""):
+                rows = super().list_tasks(status=status)
+                barrier.wait()
+                return rows
+
+        def submit(proposal):
+            connection = SynchronizedReadStore(self.db_path)
+            try:
+                try:
+                    record = propose_subtasks(
+                        connection, parent_task_id=parent["task_id"],
+                        proposals=[proposal], **limits)
+                    return ("created", len(record["created"]),
+                            len(record["duplicates"]))
+                except SubtaskGraphError as exc:
+                    return ("refused", str(exc).split(":")[0].strip())
+            finally:
+                connection.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            return [future.result() for future in (pool.submit(submit, left),
+                                                    pool.submit(submit, right))]
+
+    def test_concurrent_distinct_roles_respect_cap_and_budget(self):
+        parent = self.parent()
+        results = self._race(
+            parent,
+            {"role_id": "event_analyst", "question": "first", "budget_reserve": 1},
+            {"role_id": "counter_evidence", "question": "second", "budget_reserve": 1},
+            budget_limit=1, max_children=1)
+        self.assertEqual(len(self.children(parent["task_id"])), 1,
+                         "two racing distinct proposals cannot exceed the cap")
+        child = self.children(parent["task_id"])[0]
+        self.assertEqual(child["input_payload"]["budget_reserve"], 1)
+        refused = [result for result in results if result[0] == "refused"]
+        self.assertEqual(len(refused), 1)
+        self.assertIn("fanout_exceeded", refused[0][1])
+
+    def test_concurrent_same_identity_converges_on_one_task(self):
+        parent = self.parent()
+        results = self._race(
+            parent,
+            {"role_id": "event_analyst", "question": "same question"},
+            {"role_id": "event_analyst", "question": "same question!"},
+            budget_limit=1)
+        self.assertEqual([result[0] for result in results], ["created", "created"],
+                         "the loser answers a duplicate, not an idempotency error")
+        self.assertEqual(len(self.children(parent["task_id"])), 1)
+        self.assertEqual(sum(result[1] for result in results), 1)
+        self.assertEqual(sum(result[2] for result in results), 1)
+
+    def test_dependency_refused_even_when_proposal_is_a_duplicate(self):
+        parent = self.parent()
+        propose_subtasks(self.store, parent_task_id=parent["task_id"],
+                         proposals=[{"role_id": "event_analyst", "question": "existing"}])
+        before = len(self.store.list_tasks())
+        with self.assertRaises(SubtaskGraphError) as caught:
+            propose_subtasks(self.store, parent_task_id=parent["task_id"],
+                             proposals=[
+                                 {"role_id": "event_analyst", "question": "existing",
+                                  "depends_on": ["missing-role"]},
+                                 {"role_id": "counter_evidence", "question": "new"}])
+        self.assertIn("dependency_invalid", str(caught.exception))
+        self.assertEqual(len(self.store.list_tasks()), before,
+                         "the invalid dependency vetoes the whole batch, dedupe or not")
+
 
 # ---------------------------------------------------------------------- #
 # 父取消与部分失败                                                        #
@@ -526,6 +605,51 @@ class CancelAndPartialFailureTests(R22IntegrationCase):
         self.assertTrue(any("cancel" in item["event"]
                             for item in rows[pending_id]["failures"]))
         self.assertEqual(rows[analyst["task_id"]]["status"], "succeeded")
+
+    def test_cancel_traverses_a_terminal_intermediate(self):
+        root = self.create_root()
+        middle = propose_subtasks(
+            self.store, parent_task_id=root["task_id"],
+            proposals=[{"role_id": "event_analyst", "question": "middle"}])
+        middle_id = middle["created"][0]["task_id"]
+        leaf = propose_subtasks(
+            self.store, parent_task_id=middle_id, max_depth=2,
+            proposals=[{"role_id": "counter_evidence", "question": "leaf"}])
+        leaf_id = leaf["created"][0]["task_id"]
+        claimed = self.store.claim_task(middle_id, "cancel-worker")
+        token = claimed["fencing_token"]
+        self.store.mark_running(middle_id, worker_id="cancel-worker",
+                                fencing_token=token, expected_version=claimed["version"])
+        self.store.complete(middle_id, worker_id="cancel-worker", fencing_token=token,
+                            output={"summary": "synthetic completed intermediate"})
+        report = cancel_subtree(self.store, root["task_id"], actor="operator",
+                                reason="取消整棵树")
+        cancelled = {entry["task_id"] for entry in report["cancelled"]}
+        self.assertEqual(self.store.get_task(middle_id)["status"], "succeeded")
+        self.assertNotIn(middle_id, cancelled, "the terminal node is not re-cancelled")
+        self.assertIn(leaf_id, cancelled,
+                      "a finished middle node must not shield its child")
+        self.assertEqual(self.store.get_task(leaf_id)["status"], "cancelled")
+        self.assertEqual(
+            sum(event["event_type"] == "task_cancelled"
+                for event in self.store.events(leaf_id)), 1)
+
+    def test_workflow_cancel_entry_propagates_to_children(self):
+        root = self.create_root()
+        child = propose_subtasks(
+            self.store, parent_task_id=root["task_id"],
+            proposals=[{"role_id": "event_analyst", "question": "queued child"}])
+        child_id = child["created"][0]["task_id"]
+        fresh = self.store.get_task(root["task_id"])
+        cancelled_root = workflow_cancel_task(
+            str(self.db_path), root["task_id"], actor="operator",
+            reason="用户取消", expected_version=fresh["version"])
+        self.assertEqual(cancelled_root["status"], "cancelled",
+                         "the normal cancel entry still reports the root")
+        self.assertEqual(self.store.get_task(child_id)["status"], "cancelled")
+        self.assertEqual(
+            sum(event["event_type"] == "task_cancelled"
+                for event in self.store.events(child_id)), 1)
 
     def test_partial_step_failure_keeps_sibling_parent_and_audit(self):
         root, flow = self.bound_root()
@@ -574,6 +698,71 @@ class CancelAndPartialFailureTests(R22IntegrationCase):
         self.assertTrue(any("failed" in item["event"] for item in failed_row["failures"]))
         self.assertEqual(rows[analyst["task_id"]]["result"]["summary"],
                          str(analyst_before[1].get("summary") or ""))
+
+
+# ---------------------------------------------------------------------- #
+# 投递账本与签收语义                                                       #
+# ---------------------------------------------------------------------- #
+
+class SignoffAndDeliveryTests(R22IntegrationCase):
+    def test_review_uses_worker_delivery_ledger_not_input_payload(self):
+        undelivered = "synthetic-not-in-vault"
+        spec = self.spec()
+        spec["public_context"]["evidence_summaries"][undelivered] = {
+            "summary": "synthetic candidate document", "sha256": "0" * 64}
+        self.counter[0] += 1
+        task, _ = self.store.create_task(
+            title="Delivery ledger check", input_payload=spec, case_id="case-delivery",
+            execution_mode="replay", actor="operator")
+        result, completed = self.run_full_chain(task)
+        self.assertEqual(result["status"], "succeeded")
+        delivery = completed["model_call"]["context_delivery"]
+        self.assertTrue(any(str(entry).startswith(undelivered + ":")
+                            for entry in delivery["dropped_evidence"]),
+                        "the worker refused the unverifiable document before egress")
+        review = project_review(self.store, identity=self.identity(),
+                                task_ids=[task["task_id"]])
+        row = review["tasks"][0]
+        self.assertEqual(row["sources"]["allowed_references"],
+                         sorted(delivery["delivered_evidence"]),
+                         "the projection mirrors the worker's delivered set, not the payload")
+        self.assertNotIn(undelivered, row["sources"]["allowed_references"])
+        self.assertEqual(row["sources"]["delivery_source"], "worker_context_delivery")
+        reasons = {item["ref"]: item["reason"]
+                   for item in row["sources"]["undelivered_references"]}
+        self.assertIn(undelivered, reasons)
+        self.assertTrue(reasons[undelivered])
+        self.assertEqual(review["attribution"]["independent_evidence_count"], 1,
+                         "only actually delivered, vault-verified bytes count")
+
+    def test_provide_input_and_reject_are_not_signoffs(self):
+        for decision in ("provide_input", "reject"):
+            with self.subTest(decision=decision):
+                task = self.create_root(case_id="case-{0}".format(decision))
+                task_id = task["task_id"]
+                claimed = self.store.claim_task(task_id, "review-worker")
+                token = claimed["fencing_token"]
+                self.store.mark_running(task_id, worker_id="review-worker",
+                                        fencing_token=token,
+                                        expected_version=claimed["version"])
+                waiting = self.store.request_awaiting_human(
+                    task_id, worker_id="review-worker", fencing_token=token,
+                    human_request={"question": "synthetic feedback request"})
+                self.store.record_human_response(
+                    task_id, actor=OWNER, decision=decision,
+                    expected_version=waiting["version"],
+                    command_id="review-{0}".format(decision),
+                    input_patch=({"research_question": "synthetic supplemental input"}
+                                 if decision == "provide_input" else None))
+                review = project_review(self.store, identity=self.identity(),
+                                        task_ids=[task_id])
+                row = review["tasks"][0]
+                self.assertFalse(row["signoff"]["acknowledged_by_human"])
+                self.assertEqual(row["signoff"]["human"], [])
+                self.assertEqual(review["attribution"]["human_signoffs"], [])
+                self.assertIn(decision, [item["decision"] for item
+                                         in row["signoff"]["human_decisions"]],
+                              "the decision stays visible without becoming sign-off")
 
 
 # ---------------------------------------------------------------------- #
@@ -692,6 +881,30 @@ class RuleCandidateTests(R22IntegrationCase):
         with self.assertRaises(RuleCandidateError) as caught:
             propose_rule_change(base, changes={"nonsense": True}, actor="operator")
         self.assertIn("malformed_change", str(caught.exception))
+
+    def test_candidate_copy_is_isolated_and_digest_reverified_on_approval(self):
+        base = self.approved_flow()
+        book = RuleCandidateBook()
+        record = book.propose(
+            base, changes={"prompts": {"event_analyst": {
+                "version": 2, "text": "事件分析提示词 v2（待审）"}}}, actor="event_analyst")
+        candidate_id = record["candidate_id"]
+        # The reviewer edits the flow they were shown; the frozen candidate
+        # must not change, and approval must bind the recorded bytes.
+        fetched = book.candidate_flow(candidate_id)
+        fetched["prompts"]["event_analyst"]["text"] = "审核后被改写的提示词"
+        approved = book.approve(candidate_id, registry=self.registry,
+                                reviewer="human-approver")
+        self.assertEqual(approved["status"], "approved")
+        flow = book.candidate_flow(candidate_id)
+        prompt = flow["prompts"]["event_analyst"]
+        self.assertEqual(prompt["text"], "事件分析提示词 v2（待审）")
+        self.assertEqual(hashlib.sha256(prompt["text"].encode()).hexdigest(),
+                         prompt["sha256"],
+                         "the approved artifact still carries the recorded digest")
+        self.registry.validate(flow)
+        self.assertEqual(book.get(candidate_id)["candidate"]["flow_sha256"],
+                         flow["flow_sha256"])
 
 
 def tree_copy(value):

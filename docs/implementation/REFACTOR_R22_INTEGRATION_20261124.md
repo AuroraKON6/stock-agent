@@ -10,7 +10,7 @@
 | R18 候选（合入） | `74d17ef7b5d07409215946c07cc28a81f09bf437`（KONM-79） |
 | 合流提交（审查基线） | `08653f3`（`--no-ff`，两父提交，零冲突） |
 | 工作分支 | `agent/claudecode/e405233085d8` |
-| R22 变更 | 合流提交之上的独立提交（SHA 见交付评论） |
+| R22 变更 | 合流提交之上的独立提交（首轮 `279968d`；复验返工提交 SHA 见交付评论） |
 | 来源分支 / `main` | 未改动；未推送任何来源分支 |
 
 合流仅把 R18 的 28 个文件带进专用分支（含 R15 引用契约、R20 scope、R18 连接器）；R22 的代码差异全部位于合流提交之后，便于审查。
@@ -30,8 +30,8 @@
   - 访问沿用既有裁决器：要求 `read_research` scope 与案件范围；根任务有服务端 owner 绑定的个人任务只允许该 owner 读取（`personal_owner_mismatch` / `personal_owner_required`）。只调用 store 的读接口，不写库。
 - `stock_agent/rule_candidates.py`（新）
   - `propose_rule_change` 只派生新的冻结制品并标 `pending_review`，不注册、不批准、不改动基线 digest；`RuleCandidateBook.approve` 是唯一写注册表的路径，且拒绝任何自动化/模型角色审批人。
-- `tests/test_refactor_r22_integration.py`（新，17 例）
-  - 同一冻结合成事件双模式对照、复盘溯源、归因、身份/案件/只读、依赖/环/越案件/深度/扇出、重复与预算、并发提交、父取消、部分失败、规则候选。
+- `tests/test_refactor_r22_integration.py`（新，25 例）
+  - 同一冻结合成事件双模式对照、复盘溯源、归因、身份/案件/只读、依赖/环/越案件/深度/扇出、重复与预算、并发提交（同身份收敛/不同角色争用上限）、终态中间节点的取消穿透、正常取消入口的子任务传播、投递账本对账、`provide_input`/`reject` 非签收、规则候选冻结与 digest 复核、父取消、部分失败。
 - `deploy/dify/r17_drill.py` / `scripts/r17_role_drill.py`
   - 新增容器内探针 `review` / `r22-rule` / `r22-graph` 与 11 条 R22 检查，C 层在同一隔离栈、同一实时任务库上取证。
 
@@ -42,7 +42,7 @@ Python 3.12.15，仓库锁定 `pyyaml==6.0.3`。全部在仓库根目录执行�
 | 命令 | 结果 |
 | --- | --- |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22.py` | 9 OK / exit 0 |
-| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 17 OK / exit 0（本单专项） |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 25 OK / exit 0（本单专项） |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17.py` | 12 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r17_role_api.py` | 19 OK / exit 0 |
 | `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r18.py` | 34 OK / exit 0 |
@@ -65,7 +65,21 @@ python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run2 --port 18185
 
 首次演练（`../r22-claudecode-run1-fail`）在产品行为全部正确的情况下报 1 项 FAIL：验收表达式把三类依赖拒绝（自依赖/环/未知引用）都期望成各自名字，实际稳定返回 `dependency_invalid`。修正的是检查映射，未改产品代码；随后重跑得到上述 53/53。该目录保留作对照。
 
-### 4.1 关键实测（run2）
+### 4.1 复验返工后的独立重跑（run3）
+
+返回 `in_progress` 修复后，用**新的**证据目录与回环端口重跑，仍经共享锁串行：
+
+```sh
+python3.12 -B scripts/r17_role_drill.py all ../r22-claudecode-run3 --port 18186
+```
+
+- `summary.json`: **PASS，53/53**，12 个 Dify run，0 FAIL，exit 0。
+- `cleanup.json`: `down --volumes` exit 0，残留容器/网络/卷均为 0，端口已释放。
+- 证据：`r22-review.json`、`r22-rule.json`、`r22-graph.json`。
+- 同轮把 Celery 就绪探测从 240s/80 行放宽到 420s/200 行（sol 首跑曾遇就绪超时，产品无变化），只影响等待窗口，不放宽任何断言。
+- 该目录中的 R22 取消检查与 O 层回归共同覆盖：正常 `cancel_task` 入口传播、终态中间节点穿透（O 层）。
+
+### 4.2 关键实测（run2）
 
 - 复盘：4 个任务（根 + 三角色），根输入快照版本 `[1,2]`，规则 digest `d80fdd32…` 与演练 flow 一致；三个角色步骤的 prompt digest 与冻结制品逐一相等，attempt 各 1，引用越界集合为空；`model_roles=3`、`human_signoffs=0`、独立证据 0（本样本无投递原文）。
 - 只读：投影前后任务 23→23、事件 119→119。
@@ -101,3 +115,34 @@ python3.12 -B scripts/r17_role_drill.py all <新证据目录> --port <空闲端�
 ```
 
 需要串行容器演练时，用共享锁包装（与本轮一致）：`fcntl.flock(/tmp/stock-agent-konm78-r17-2f18ce9.docker.lock)` 后执行上一条命令。
+
+## 8. 复验返工记录（sol 的 10 项复现）
+
+sol 在 `279968d` 上以 `focused_checks.py` 复现 10 项失败。逐项修复如下，均补了 O 层回归并在 `run3` 重新取证。
+
+| # | 失败项（sol 复现） | 根因 | 修复 |
+| --- | --- | --- | --- |
+| 1 | 并发不同角色可同时越过扇出/预算上限 | 父状态、去重、上限与创建之间没有互斥边界 | `propose_subtasks` 在持锁边界内用**新连接**重读父任务与子任务，再跑全部校验与创建；线程 RLock 按 DB+parent 键控，POSIX 下再加 `<db>.<parent>.subtask.lock` 的 `flock`，跨进程同样串行 |
+| 2 | 同身份并发败者抛 `TaskIdempotencyConflictError` 而非 duplicate | 同上 | 边界内后到者从权威快照看到已创建子任务，按规范化 `(role, question)` 身份收敛为 `duplicate_child`，零新增零计量 |
+| 3 | 重复项携带未知依赖仍被放行 | 依赖校验只覆盖去重后的 `unique_items` | 依赖审查改为遍历**全部规范化提案**（含重复项）；未知/自依赖/多义/环一律 `dependency_invalid` 整批零创建 |
+| 4 | `cancel_subtree` 遇终态中间节点即停止下钻 | `continue` 跳过了子节点 | 终态节点不再取消自身，但仍把其子节点入栈；每个非终态后代各得一条 `task_cancelled` |
+| 5 | 正常入口 `workflow_service.cancel_task` 只取消根 | 只调用一次 `store.request_cancel` | 根仍按调用方 `expected_version`/principal verification 取消，随后 `cancel_subtree(..., skip_root=True)` 传播到后代 |
+| 6 | 复盘允许集合取自输入 payload，投递被丢弃的引用也算可用来源 | `personal_review` 读 `public_context.evidence_summaries` | 改为读 worker 的 `model_call.context_delivery`：`delivered_evidence` 为允许集合，`dropped_evidence`/未执行单列为 `undelivered_references`（带原因）；只有实际投递且 vault 校验通过的字节计入独立证据 |
+| 7 | `provide_input` / `reject` 被计成人类签收 | `_signoffs` 把所有 `human_response_recorded` 当签收 | 仅 `personal_acknowledgement` 是签收；其他人工决定进入 `human_decisions`，`acknowledged_by_human=False` |
+| 8 | `role-orchestrator:<credential>` 被误判为人工 | `actor_kind` 未剥离 `:<credential>` 后缀 | 以冒号前的基础身份判定自动化/人工；新增回归断言 |
+| 9 | 规则候选返回浅拷贝，评审改副本即可改变已批准内容 | `candidate_flow`/`get`/`pending` 返回 `dict(...)` 共享嵌套对象 | 全部改为 JSON 深拷贝；批准时从冻结文本重算 digest，与提案时记录不一致则 `candidate_tampered` 拒绝 |
+| 10 | C 层首跑 Celery 就绪超时、次跑 53/53 | 探测窗口偏窄 | 就绪探测 240s/80 行 → 420s/200 行；run3 一次通过 |
+
+复验命令与结果：
+
+| 命令 | 结果 |
+| --- | --- |
+| sol `focused_checks.py`（解压到仓库根，`PYTHONPATH=.:tests:scripts python3.12 -B focused_checks.py`） | 10/10 PASS，exit 0（该脚本为 sol 附件，未提交进仓库） |
+| `python3.12 -B scripts/run_isolated_tests.py --pattern test_refactor_r22_integration.py` | 25 OK / exit 0 |
+| R22 / R17 / R17 role API / R18 / R15 citation / R10 既有模式 | 9 / 12 / 19 / 34 / 5 / 11 OK，均 exit 0 |
+| 相邻回归：R03 / R19 / R20 / R15 personal / R16 / R14 browser | 14 / 8 / 40 / 10 / 4 / 24 OK，均 exit 0 |
+| C 层 `scripts/r17_role_drill.py all ../r22-claudecode-run3 --port 18186` | PASS 53/53，cleanup 残留 0 |
+
+新增回归（`tests/test_refactor_r22_integration.py`）：并发不同角色争用上限、同身份并发收敛、重复项未知依赖整批拒绝、终态中间节点取消穿透、正常取消入口传播、投递账本对账、`provide_input`/`reject` 非签收、orchestrator 凭据后缀自动化、候选冻结与 digest 复核。
+
+`workflow_service.cancel_task` 不在 KONM-80（zcode）已推送分支的改动集中（其分支只动 R18 connector / 文档 / R18 测试）；`task_runtime/store.py`、`dify_api.py`、`dify_api_server.py` 本单未改动，因此无共享文件串行冲突。

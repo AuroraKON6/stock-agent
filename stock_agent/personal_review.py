@@ -75,13 +75,19 @@ def actor_kind(actor: Any) -> str:
     """``human`` or ``automated`` — the ONE rule the projection classifies by.
 
     A model role id, an orchestrator, a service prefix and an empty actor are
-    all automated. Only a named actor outside those sets counts as human."""
+    all automated. Only a named actor outside those sets counts as human.
+    Service identities carry a ``:<credential>`` suffix (the role API writes
+    ``role-orchestrator:<credential_id>``), so the BASE identity decides the
+    kind — a suffix must not launder an orchestrator into a human reviewer."""
     normalized = _normalize_actor(actor)
     if not normalized:
         return "automated"
-    if normalized in ALLOWED_SUBTASK_ROLES or normalized in _EXTRA_AUTOMATED_ACTORS:
+    base = normalized.split(":", 1)[0]
+    if normalized in ALLOWED_SUBTASK_ROLES or base in ALLOWED_SUBTASK_ROLES:
         return "automated"
-    if any(normalized.startswith(prefix) for prefix in AUTOMATED_ACTOR_PREFIXES):
+    if normalized in _EXTRA_AUTOMATED_ACTORS or base in _EXTRA_AUTOMATED_ACTORS:
+        return "automated"
+    if any(base.startswith(prefix) for prefix in AUTOMATED_ACTOR_PREFIXES):
         return "automated"
     return "human"
 
@@ -172,32 +178,80 @@ def _children(store: TaskStore, parent_id: str) -> List[Dict[str, Any]]:
             if str(item.get("parent_task_id") or "") == str(parent_id)]
 
 
-def _delivered_evidence(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+def _delivery(payload: Dict[str, Any],
+              model_call: Dict[str, Any]) -> Dict[str, Any]:
+    """What the worker ACTUALLY delivered to the model, not what was configured.
+
+    The authoritative record is the worker's own outbox ledger
+    (``model_call.context_delivery``): ``delivered_evidence`` lists the refs
+    that entered the outbound context, ``dropped_evidence`` records the refs
+    refused before egress (``<ref>:<reason>``). A review that read the input
+    payload instead would present an undelivered document as usable source.
+    When the task never executed there is no ledger; then nothing counts as
+    delivered and the configured refs are listed as unverified."""
     context = payload.get("public_context") if isinstance(payload.get("public_context"), dict) else {}
     evidence = context.get("evidence_summaries")
-    if not isinstance(evidence, dict):
-        return {}
+    configured = sorted(str(ref) for ref in evidence) if isinstance(evidence, dict) else []
+    delivery = model_call.get("context_delivery")
+    delivery = delivery if isinstance(delivery, dict) else {}
+    delivered_refs = delivery.get("delivered_evidence")
+    authoritative = isinstance(delivered_refs, list)
+    outbound = model_call.get("outbound_context")
+    outbound = outbound if isinstance(outbound, dict) else {}
+    outbound_evidence = outbound.get("evidence_summaries")
+    outbound_evidence = outbound_evidence if isinstance(outbound_evidence, dict) else {}
+    namespaces = delivery.get("evidence_namespaces")
+    namespaces = namespaces if isinstance(namespaces, dict) else {}
+    dropped: Dict[str, str] = {}
+    for raw in delivery.get("dropped_evidence") or []:
+        ref, _, reason = str(raw).partition(":")
+        dropped.setdefault(ref, reason or "dropped_before_egress")
     delivered: Dict[str, Dict[str, Any]] = {}
-    for ref, item in evidence.items():
-        if not isinstance(item, dict):
-            continue
-        delivered[str(ref)] = {
-            "sha256": str(item.get("sha256") or ""),
-            "summary": str(item.get("summary") or "")[:200],
-            "vault_verified": bool(item.get("vault_verified")),
-            "namespace_authorized": str(item.get("namespace_authorized") or ""),
+    for raw_ref in delivered_refs or []:
+        ref = str(raw_ref)
+        info = outbound_evidence.get(ref)
+        info = info if isinstance(info, dict) else {}
+        delivered[ref] = {
+            "sha256": str(info.get("sha256") or ""),
+            "summary": str(info.get("summary") or "")[:200],
+            "vault_verified": bool(info.get("vault_verified")),
+            "namespace_authorized": str(info.get("namespace_authorized")
+                                        or namespaces.get(ref) or ""),
         }
-    return delivered
+    undelivered: List[Dict[str, Any]] = []
+    for ref in configured:
+        if ref in delivered:
+            continue
+        if ref in dropped:
+            reason = dropped[ref]
+        elif not authoritative:
+            reason = "no_execution_record"
+        else:
+            reason = "not_delivered_by_execution"
+        undelivered.append({"ref": ref, "reason": reason})
+    return {"delivered": delivered, "configured": configured,
+            "undelivered": undelivered, "authoritative": authoritative,
+            "source": ("worker_context_delivery" if authoritative
+                       else "no_execution_record")}
 
 
-def _signoffs(store: TaskStore, task: Dict[str, Any]) -> Tuple[List[Dict[str, Any]],
-                                                               List[Dict[str, Any]]]:
-    """Human sign-off records vs automated claims refused as such."""
+def _signoffs(store: TaskStore, task: Dict[str, Any]) -> Tuple[
+        List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Human sign-off records vs automated claims refused as such.
+
+    ONLY a ``personal_acknowledgement`` record is a sign-off: that is what
+    the store writes for ``decision == acknowledge`` (on the awaiting-human
+    path) and for the terminal-result acknowledgement path. The other human
+    decisions — ``provide_input`` and ``reject`` — record a
+    ``human_response_recorded`` event but are NOT acknowledgements of the
+    result; they stay in ``human_decisions`` for the audit trail."""
     human: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
+    decisions: List[Dict[str, Any]] = []
     output = task.get("output") if isinstance(task.get("output"), dict) else {}
     acknowledgement = output.get("personal_acknowledgement")
-    if isinstance(acknowledgement, dict):
+    has_output_ack = isinstance(acknowledgement, dict)
+    if has_output_ack:
         actor = acknowledgement.get("actor")
         record = {"actor": str(actor or ""), "at": str(acknowledgement.get("at") or ""),
                   "source": "personal_acknowledgement",
@@ -205,20 +259,23 @@ def _signoffs(store: TaskStore, task: Dict[str, Any]) -> Tuple[List[Dict[str, An
         (human if actor_kind(actor) == "human" else rejected).append(record)
     for event in store.events(str(task["task_id"]), limit=500):
         event_type = str(event.get("event_type") or "")
-        if event_type not in {"personal_acknowledgement", "human_response_recorded"}:
-            continue
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         actor = event.get("actor")
-        record = {"actor": str(actor or ""), "at": str(event.get("created_at") or ""),
-                  "source": event_type,
-                  "decision": str(payload.get("decision") or "")}
-        # De-duplicate the acknowledgement written by the output row above.
-        if any(item["source"] == "personal_acknowledgement" and
-               item["actor"] == record["actor"] and record["source"] == "personal_acknowledgement"
-               for item in human + rejected):
-            continue
-        (human if actor_kind(actor) == "human" else rejected).append(record)
-    return human, rejected
+        if event_type == "personal_acknowledgement":
+            if has_output_ack:
+                continue  # the output row above IS this event's record
+            record = {"actor": str(actor or ""), "at": str(event.get("created_at") or ""),
+                      "source": event_type,
+                      "scope": str(payload.get("on") or "personal_acknowledgement")}
+            (human if actor_kind(actor) == "human" else rejected).append(record)
+        elif event_type == "human_response_recorded":
+            decisions.append({
+                "actor": str(actor or ""),
+                "at": str(event.get("created_at") or ""),
+                "decision": str(payload.get("decision") or ""),
+                "signs_off_result": False,
+            })
+    return human, rejected, decisions
 
 
 def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -231,7 +288,8 @@ def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
     root = _root_task(store, task)
     children = _children(store, task_id)
     origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
-    delivered = _delivered_evidence(payload)
+    delivery = _delivery(payload, model_call)
+    delivered = delivery["delivered"]
     citations = sorted({str(item) for item in output.get("evidence_refs") or []})
     allowed = sorted(delivered)
     snapshots = [{
@@ -251,7 +309,7 @@ def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
                          "at": str(event.get("created_at") or ""),
                          "detail": str((event.get("payload") or {}).get("error")
                                        or (event.get("payload") or {}).get("reason") or "")[:300]})
-    human, rejected = _signoffs(store, task)
+    human, rejected, decisions = _signoffs(store, task)
     kind = producer_kind(task)
     return {
         "schema_version": REVIEW_SCHEMA,
@@ -290,6 +348,10 @@ def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
             "citations": citations,
             "allowed_references": allowed,
             "delivered_evidence": delivered,
+            "configured_references": delivery["configured"],
+            "undelivered_references": delivery["undelivered"],
+            "delivery_source": delivery["source"],
+            "delivery_authoritative": delivery["authoritative"],
             "citations_outside_allowlist": sorted(set(citations) - set(allowed)),
         },
         "result": {
@@ -316,6 +378,7 @@ def review_task(store: TaskStore, task: Dict[str, Any]) -> Dict[str, Any]:
             "budget_reserve": int(payload.get("budget_reserve") or 0),
         },
         "signoff": {"human": human, "rejected_automated_claims": rejected,
+                    "human_decisions": decisions,
                     "acknowledged_by_human": bool(human)},
     }
 
@@ -393,12 +456,22 @@ def project_review(store: TaskStore, *, identity: Dict[str, Any],
         for ref in row["sources"]["citations"]:
             delivered = row["sources"]["delivered_evidence"].get(ref) or {}
             # Independence is about the SOURCE BYTES, not how many roles cite
-            # them: the same sha256 is one evidence source.
+            # them: the same sha256 is one evidence source. A source counts as
+            # independent only when it actually entered the outbound context
+            # (worker ledger) AND was verified against the vault — an input
+            # payload entry that never left the process proves nothing.
+            independent = bool(
+                delivered and delivered.get("vault_verified")
+                and row["sources"]["delivery_authoritative"])
             key = str(delivered.get("sha256") or ref)
             entry = evidence.setdefault(key, {
                 "evidence_ref": ref, "sha256": str(delivered.get("sha256") or ""),
                 "vault_verified": bool(delivered.get("vault_verified")),
+                "delivered": bool(delivered),
+                "independent": independent,
                 "cited_by": []})
+            entry["delivered"] = entry["delivered"] or bool(delivered)
+            entry["independent"] = entry["independent"] or independent
             if row["task_id"] not in entry["cited_by"]:
                 entry["cited_by"].append(row["task_id"])
         for record in row["signoff"]["human"]:
@@ -414,12 +487,15 @@ def project_review(store: TaskStore, *, identity: Dict[str, Any],
             "evidence_sources": sorted(evidence.values(),
                                        key=lambda item: item["evidence_ref"]),
             "human_signoffs": human,
-            "independent_evidence_count": len(evidence),
+            "independent_evidence_count": sum(
+                1 for item in evidence.values() if item["independent"]),
             "distinct_human_actors": sorted({item["actor"] for item in human}),
             "rules": {
                 "model_roles_are_not_human": True,
                 "same_evidence_bytes_count_once": True,
                 "signoff_requires_human_actor": True,
+                "signoff_requires_acknowledgement": True,
+                "delivery_ledger_is_authoritative": True,
                 "automated_actors": sorted(set(AUTOMATED_ACTOR_PREFIXES)
                                            | _EXTRA_AUTOMATED_ACTORS),
             },

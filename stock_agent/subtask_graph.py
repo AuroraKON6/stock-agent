@@ -37,10 +37,17 @@ R17) is NOT_RUN by dependency and stays honestly marked.
 """
 from __future__ import annotations
 
+import hashlib
+import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:  # POSIX advisory lock for cross-process serialization; threads use the RLock.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows hosts fall back to the RLock
+    fcntl = None  # type: ignore[assignment]
+
 from .task_runtime.store import (
-    STATUS_AWAITING_HUMAN,
     TERMINAL_STATUSES,
     TaskRuntimeError,
     TaskStore,
@@ -49,6 +56,9 @@ from .task_runtime.store import (
 SUBTASK_GRAPH_SCHEMA = "1.0"
 DEFAULT_MAX_DEPTH = 1
 DEFAULT_MAX_CHILDREN = 3
+
+_LOCKS_GUARD = threading.Lock()
+_LOCKS: Dict[str, "threading.RLock"] = {}
 
 _ROLES = {"event_analyst", "fundamental_analyst", "counter_evidence",
           "synthesis_drafter", "quality_check"}
@@ -141,12 +151,72 @@ def propose_subtasks(
     Returns {"created": [...], "rejected": [{"index", "reason"}],
     "duplicates": [...]}. A batch with ANY malformed proposal is refused
     whole (fail closed) — partial fan-out is how scope creep starts.
-    Duplicates are resolved BEFORE the fan-out and budget gates, so a retry
-    of an already-accepted proposal never consumes budget a second time."""
+
+    The parent re-read, duplicate resolution, cap/budget gates and the
+    creation loop run inside ONE per-parent exclusion boundary (thread lock
+    plus a POSIX advisory file lock keyed by DB path and parent id), so two
+    orchestrators racing on the same parent cannot both pass the checks and
+    overdraw the budget, exceed fan-out, or create the same child twice.
+    The second submission converges on the first one's task as a duplicate.
+
+    Duplicates are resolved BEFORE the fan-out and budget gates, but the
+    dependency review runs over the WHOLE normalized batch — a duplicate
+    proposal that names an unknown dependency still refuses the batch
+    (``dependency_invalid``) instead of slipping under the dedupe.
+    """
     if not isinstance(proposals, list) or not proposals:
         raise SubtaskGraphError("malformed_proposal: proposals must be a non-empty list")
+    parent_task_id = str(parent_task_id)
+
+    # Preliminary snapshot OUTSIDE the boundary. It can only REFUSE (an
+    # obviously terminal or already-saturated parent) — it never authorizes
+    # a create. The authoritative parent/children read and every gate run
+    # again inside the boundary, through a fresh connection, so a snapshot
+    # taken before another submission committed cannot be acted on.
     try:
-        parent = store.get_task(str(parent_task_id))
+        preliminary = store.get_task(parent_task_id)
+    except TaskRuntimeError:
+        raise SubtaskGraphError("unknown_parent: {0}".format(parent_task_id))
+    if preliminary["status"] in TERMINAL_STATUSES:
+        raise SubtaskGraphError(
+            "parent_terminal: {0} is {1}".format(parent_task_id, preliminary["status"]))
+    if len(_children_of(store, parent_task_id)) > max_children:
+        raise SubtaskGraphError(
+            "fanout_exceeded: parent {0} already exceeds cap {1}".format(
+                parent_task_id, max_children))
+
+    with _creation_boundary(store, parent_task_id):
+        authoritative = _fresh_store(store)
+        try:
+            return _propose_locked(
+                authoritative, parent_task_id=parent_task_id, proposals=proposals,
+                budget_limit=budget_limit, max_depth=max_depth,
+                max_children=max_children)
+        finally:
+            authoritative.close()
+
+
+def _fresh_store(store: TaskStore) -> TaskStore:
+    """A second connection on the same DB — the authoritative view used once
+    the boundary is held. Tests may subclass the caller's store to slow or
+    synchronize reads; those hooks must not sit inside the critical section,
+    and in production a fresh request-scoped connection is the R03 rule."""
+    if str(store.db_path) == ":memory:":
+        return store
+    return TaskStore(store.db_path)
+
+
+def _propose_locked(
+    store: TaskStore,
+    *,
+    parent_task_id: str,
+    proposals: List[Dict[str, Any]],
+    budget_limit: int,
+    max_depth: int,
+    max_children: int,
+) -> Dict[str, Any]:
+    try:
+        parent = store.get_task(parent_task_id)
     except TaskRuntimeError:
         raise SubtaskGraphError("unknown_parent: {0}".format(parent_task_id))
     if parent["status"] in TERMINAL_STATUSES:
@@ -239,27 +309,30 @@ def propose_subtasks(
             "fanout_exceeded: {0}+{1} > cap {2}".format(
                 len(existing_children), len(unique_items), max_children))
 
-    # Dependency review: every ref must name exactly one existing child or
-    # one proposal in this batch, and the batch must be orderable.
-    batch_role_counts: Dict[str, int] = {}
+    # Dependency review over EVERY normalized proposal, duplicates included:
+    # dedupe decides what is created, never what is validated. A ref must
+    # name exactly one existing child or one new proposal in this batch, and
+    # the new proposals must be orderable.
+    new_role_keys: Dict[str, List[str]] = {}
     for _, item in unique_items:
-        batch_role_counts[item["role_id"]] = batch_role_counts.get(item["role_id"], 0) + 1
-    for index, item in unique_items:
+        new_role_keys.setdefault(item["role_id"], []).append(
+            _question_key(item["question"]))
+    for index, item in normalized:
         for ref in item["depends_on"]:
+            new_keys = new_role_keys.get(ref) or []
             existing_ids = existing_roles.get(ref) or []
-            in_batch = ref in batch_role_counts
-            if in_batch and batch_role_counts[ref] > 1:
+            if len(new_keys) > 1:
                 raise SubtaskGraphError(
                     "dependency_invalid: {0!r} names several proposals; "
                     "the dependency target is ambiguous".format(ref))
-            if in_batch and existing_ids:
+            if new_keys and existing_ids:
                 raise SubtaskGraphError(
                     "dependency_invalid: {0!r} exists and is also proposed; "
                     "the dependency target is ambiguous".format(ref))
-            if not in_batch and len(existing_ids) > 1:
+            if not new_keys and len(existing_ids) > 1:
                 raise SubtaskGraphError(
                     "dependency_invalid: {0!r} names several existing children".format(ref))
-            if not in_batch and not existing_ids:
+            if not new_keys and not existing_ids:
                 raise SubtaskGraphError(
                     "dependency_invalid: unknown dependency {0!r} on #{1}".format(ref, index))
     ordered = _dependency_order(unique_items, existing_roles)
@@ -322,28 +395,91 @@ def propose_subtasks(
             "created": created, "duplicates": duplicates, "rejected": []}
 
 
-def cancel_subtree(store: TaskStore, root_task_id: str, *, actor: str,
-                   reason: str) -> Dict[str, Any]:
-    """Cancel a parent and propagate to every non-terminal descendant.
+def _creation_boundary(store: TaskStore, parent_task_id: str) -> "_CreationBoundary":
+    """Serialize check-then-create for one parent, across threads AND processes.
 
-    Each cancelled task gets its own outbox event; already-terminal
-    descendants are left untouched (their history stands)."""
+    The in-process RLock is keyed by the resolved DB path; the advisory file
+    lock (``flock`` on ``<db>.<parent-hash>.subtask.lock``) extends the same
+    exclusion to other processes sharing the store. The order of validation,
+    dedupe, caps and creation is only meaningful if nothing can interleave
+    between them — this is that boundary.
+    """
+    return _CreationBoundary(store, parent_task_id)
+
+
+class _CreationBoundary:
+    def __init__(self, store: TaskStore, parent_task_id: str) -> None:
+        db_key = str(Path(store.db_path).resolve())
+        parent_key = hashlib.sha256(str(parent_task_id).encode()).hexdigest()[:16]
+        self._lock_key = "{0}::{1}".format(db_key, parent_key)
+        self._lock_path = "{0}.{1}.subtask.lock".format(db_key, parent_key)
+
+    def __enter__(self) -> None:
+        with _LOCKS_GUARD:
+            lock = _LOCKS.get(self._lock_key)
+            if lock is None:
+                lock = _LOCKS[self._lock_key] = threading.RLock()
+        lock.acquire()
+        self._thread_lock = lock
+        self._handle = None
+        if fcntl is not None:
+            try:
+                self._handle = open(self._lock_path, "a+")
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+            except OSError:
+                # A read-only state dir cannot host the advisory lock; the
+                # RLock still serializes this process, and the store's own
+                # BEGIN IMMEDIATE keeps individual writes atomic.
+                if self._handle is not None:
+                    self._handle.close()
+                self._handle = None
+        return None
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            if self._handle is not None:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+                self._handle.close()
+                self._handle = None
+        finally:
+            self._thread_lock.release()
+
+
+def cancel_subtree(store: TaskStore, root_task_id: str, *, actor: str,
+                   reason: str, skip_root: bool = False) -> Dict[str, Any]:
+    """Cancel a subtree, propagating through TERMINAL intermediates.
+
+    Every non-terminal task in the subtree gets its own outbox event.
+    Terminal tasks keep their history untouched, but traversal continues
+    INTO their children: a finished middle node must not shield a queued
+    grandchild from the parent's cancellation.
+
+    ``skip_root`` is for callers that already cancelled the root through
+    their own governed entry (``workflow_service.cancel_task`` keeps the
+    caller's expected_version and principal verification there); the root
+    is then traversed but not cancelled again."""
     cancelled: List[Dict[str, Any]] = []
     stack = [str(root_task_id)]
+    seen = set()
     while stack:
         task_id = stack.pop()
-        task = store.get_task(task_id)
-        if task["status"] in TERMINAL_STATUSES:
+        if task_id in seen:
             continue
-        current_version = store.get_task(task_id)["version"]
-        if task["status"] == STATUS_AWAITING_HUMAN or task["status"] == "queued":
-            fresh = store.request_cancel(task_id, actor=actor, reason=reason,
-                                         expected_version=current_version)
-        else:
-            # leased/running: set the flag; the worker's checkpoint lands it.
-            fresh = store.request_cancel(task_id, actor=actor, reason=reason,
-                                         expected_version=current_version)
-        cancelled.append({"task_id": task_id, "status": fresh["status"]})
+        seen.add(task_id)
+        task = store.get_task(task_id)
+        already_root = skip_root and task_id == str(root_task_id)
+        if not already_root and task["status"] not in TERMINAL_STATUSES:
+            try:
+                fresh = store.request_cancel(
+                    task_id, actor=actor, reason=reason,
+                    expected_version=task["version"])
+                cancelled.append({"task_id": task_id, "status": fresh["status"]})
+            except TaskRuntimeError:
+                # A worker may have finished this node between the read and
+                # the write. If it is terminal NOW its history stands and the
+                # traversal still descends; any other error is real.
+                if store.get_task(task_id)["status"] not in TERMINAL_STATUSES:
+                    raise
         stack.extend(child["task_id"] for child in _children_of(store, task_id))
     return {"root_task_id": str(root_task_id), "cancelled": cancelled,
             "count": len(cancelled)}

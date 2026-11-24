@@ -74,10 +74,22 @@ def submit_feedback_task(db_path, task_id: str, *, actor: str, decision: str,
 
 def cancel_task(db_path, task_id: str, *, actor: str, reason: str, expected_version: int,
                 principal_verification: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Cancel a task and propagate the cancellation through its subtree.
+
+    The ROOT cancellation keeps the caller's contract exactly: optimistic
+    version, protected-action principal verification, and the store's
+    transition rules. Descendants are then cancelled through the graph's
+    own governed path, which descends past terminal intermediates so a
+    queued grandchild cannot outlive a finished middle node. Verification
+    authorizes the subtree operation, not each descendant node."""
+    from .subtask_graph import cancel_subtree  # local import: no module cycle
+
     with request_store(db_path) as store:
-        return store.request_cancel(
+        store.request_cancel(
             task_id, actor=actor, reason=reason, expected_version=expected_version,
             principal_verification=principal_verification)
+        cancel_subtree(store, task_id, actor=actor, reason=reason, skip_root=True)
+        return store.get_task(str(task_id))
 
 
 def platform_runs(db_path, task_id: str):
