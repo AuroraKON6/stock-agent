@@ -10,6 +10,10 @@
 #   R25_IMAGE='stock-agent-research:<tag>@sha256:<digest>' \
 #     bash scripts/r25_image_drill.sh <evidence-directory>
 #
+# R25_IMAGE_BINDING optionally names the external binding file of that digest
+# (default: deploy/docker/image_binding.json), so a candidate binding can be
+# verified without touching the repository's deployment binding.
+#
 # R25_IMAGE is the reference recorded in deploy/docker/image_binding.json after
 # scripts/build_image.sh. Every step's command, output and exit code are written
 # to <evidence-directory>; steps.tsv lists them next to the expected exit code.
@@ -19,6 +23,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER="$ROOT/scripts/r25_image_drill.py"
 EV="${1:?usage: R25_IMAGE=<image ref> bash scripts/r25_image_drill.sh <evidence-dir>}"
 IMAGE_REF="${R25_IMAGE:?set R25_IMAGE to stock-agent-research:<tag>@sha256:<digest>}"
+BINDING_FILE="${R25_IMAGE_BINDING:-$ROOT/deploy/docker/image_binding.json}"
 PROJECT="konm38-r25-image-$(date -u +%Y%m%d%H%M%S)-$$"
 DRILL_CONFIG=/drill-config/watchlist.json
 PROBE="$PROJECT-probe"
@@ -183,12 +188,12 @@ step 011-image-platform-manifest 0 docker image inspect --platform "$PLATFORM" "
   '{{json .Id}} {{json .Descriptor}}'
 {
   echo "project=$PROJECT"; echo "image_ref=$IMAGE_REF"; echo "image_id=$IMAGE_ID"; echo "repository_manifest_digest=$REPO_DIGEST"
-  echo "binding=$(tr -d '\n' < "$ROOT/deploy/docker/image_binding.json")"
+  echo "binding=$(tr -d '\n' < "$BINDING_FILE")"
   echo "engine=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}} docker {{.Server.Version}}')"
 } | tee "$EV/image_identity.txt"
 
 echo "== synthetic configs (non-sensitive, replay only)"
-python3 - "$CFG" "$ROOT/deploy/docker/image_binding.json" <<'CONFIG'
+python3 - "$CFG" "$BINDING_FILE" <<'CONFIG'
 import json, shutil, sys
 from pathlib import Path
 

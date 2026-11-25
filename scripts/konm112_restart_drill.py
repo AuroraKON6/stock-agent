@@ -37,6 +37,7 @@ BASELINE = "e1c75a0db07cd12fd766187496cdf427882dca50"
 CONFIG = "data/config/watchlist.drill.json"
 HELPER = "/drills/konm112_restart_helper.py"
 RECEIPTS = Path("/drill-receipts")
+NEGATIVE_DRAINS = ("running", "live-lease")
 NEGATIVES = ("amount", "state", "missing-workflow", "outbox-payload", "missing-object")
 
 
@@ -50,8 +51,9 @@ def require(condition: bool, message: str) -> None:
 
 
 class Drill:
-    def __init__(self, image: str, commit: str, output: Path):
+    def __init__(self, image: str, commit: str, output: Path, negative: str | None = None):
         self.image = image
+        self.negative = negative
         self.commit = commit
         self.output = output
         self.project = "stock-agent-konm112-" + uuid.uuid4().hex[:12]
@@ -144,11 +146,33 @@ class Drill:
         self.service("drain-in-flight", "timeout", "45", "python", "-B", "-m", "stock_agent", "worker-service",
                      "--config", CONFIG, "--worker-id", "w-konm112-drain", "--max-tasks", "20",
                      "--idle-sleep-seconds", "0.2", expected=124)
-        drained = self.helper("ledger-after-drain", "ledger")
-        require(not drained["outbox_summary"]["task_counts"].get("queued")
-                and not drained["outbox_summary"]["task_counts"].get("leased"),
-                f"Queue not drained: {drained['outbox_summary']}")
-        self.service("access-log-quiescent", "cat", "/app/data/dify/access_log.jsonl")
+        settled = self.helper("settle-unsent-prepared", "settle-unsent")
+        if self.negative:
+            # The negative controls leave ONE more reserved-but-unsent task in a
+            # state a quiescent snapshot must refuse.
+            self.helper(f"inject-{self.negative}", "inject", self.negative)
+        # The gate: one read-only statement of the store, and nothing below
+        # (inventory, backup, restore) runs unless it exits 0.
+        self.helper("drain-gate", "drain-gate", expected=0 if not self.negative else 9)
+        gate = json.loads((self.output / "drain-gate.stdout").read_text(encoding="utf-8")
+                          .splitlines()[-1])
+        if self.negative:
+            archive = self.service("negative-archive-empty", "ls", "-A", "/app/drill-archive").split()
+            negatives = self.service("negative-no-snapshot", "ls", "-A", "/app/drill-restore").split()
+            done = [record["step"] for record in self.records]
+            self.summary = {
+                "negative": self.negative, "gate": gate,
+                "settled_before_injection": settled["settled"],
+                "archive_entries": archive, "restore_entries": negatives,
+                "backup_steps": [step for step in done if step.startswith(("backup", "restore", "source-"))],
+            }
+            require(not archive and not negatives and not self.summary["backup_steps"],
+                    "A refused gate was followed by snapshot work")
+            raise RuntimeError(f"drain gate refused the negative control {self.negative!r} "
+                               f"(queued={gate['queued']}, leased={gate['leased']}, running={gate['running']}, "
+                               f"live_leases={gate['live_leases']}); no backup was started")
+        require(gate["drained"], f"Drain gate passed with work in flight: {gate}")
+        self.drain_gate = gate
         window_start = self.stopped("writers-exited")
         before = self.fixture("source-before", "inventory")
         self.service("backup", "python", "-m", "stock_agent", "backup-create", "--config", CONFIG)
@@ -271,6 +295,7 @@ class Drill:
             "compose_project": self.project, "volumes": sorted(volumes),
             "quiescent_start_utc": window_start, "quiescent_end_utc": window_end,
             "stop_write_start_utc": stop_start, "stop_write_end_utc": stop_end,
+            "drain_gate": self.drain_gate, "settled_unsent": settled["settled"],
             "manifest_id": manifest["manifest_id"], "manifest_sha256": backup["manifest_sha256"],
             "restored_root": restored, "source_files_unchanged": len(before) - 1,
             "source_files_total": len(before), "access_audit": access_audit,
@@ -295,6 +320,9 @@ def main() -> None:
     parser.add_argument("--commit", required=True, help="Full candidate SHA, equal to clean checkout HEAD")
     parser.add_argument("--binding", required=True, type=Path, help="External image binding JSON for the digest")
     parser.add_argument("--output", required=True, type=Path, help="New evidence directory outside the checkout")
+    parser.add_argument("--negative", choices=NEGATIVE_DRAINS,
+                        help="negative control: leave one task running with a lapsed lease, or leased with a "
+                             "live lease; the drain gate must refuse it and no backup may start")
     args = parser.parse_args()
     output = args.output.resolve()
     require(not output.is_relative_to(ROOT), "Evidence directory must be outside the checkout")

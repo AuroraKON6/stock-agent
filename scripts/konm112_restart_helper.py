@@ -14,6 +14,21 @@ Subcommands (each prints one JSON object):
     resubmit                      submit the same five business intents again
                                   (four attempt fixtures + the workflow task)
                                   and report task ID / dedup verdict each
+    settle-unsent                 drain step: a task that only RESERVED and
+                                  prepared (nothing dispatched: every attempt
+                                  still prepared, sent='no') is closed through
+                                  the public transitions as not sent — the
+                                  attempt as failed_known/sent='no', the task
+                                  as failed without retry. The budget
+                                  reservation is kept, nothing is consumed.
+    inject <running|live-lease>   negative control for the drain gate: one
+                                  more reserved-but-unsent task left running
+                                  with an already expired lease, or left
+                                  leased with a live lease
+    drain-gate                    read-only, one snapshot of the store: queued,
+                                  leased, running, live leases, open
+                                  prepared/dispatched attempts, read time.
+                                  Exit 0 only when all of them are zero.
     read <data-root> <cursor> <limit>
                                   cursor read through TaskStore.events_after
     consume <data-root> <receipt-db> <label> <cursor>
@@ -29,6 +44,7 @@ import json
 import sqlite3
 import sys
 from contextlib import closing
+import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -125,6 +141,127 @@ def ledger(data_value: str = "") -> int:
         "errors": errors,
     })
     return 0 if not errors and evidence.get("ok") else 7
+
+
+def _status_constants() -> tuple:
+    from stock_agent.task_runtime.store import STATUS_LEASED, STATUS_RUNNING
+
+    return STATUS_LEASED, STATUS_RUNNING
+
+
+def _settled(item: dict) -> bool:
+    return (item["status"] == "failed" and item["attempt_states"] == ["failed_known"]
+            and item["attempt_sent"] == ["no"])
+
+
+def settle_unsent() -> int:
+    """Close what the seed left reserved-but-never-dispatched, before the snapshot.
+
+    Only a task whose every attempt is still prepared / sent='no' is provably
+    unsent; anything dispatched is left alone for the gate to refuse.
+    """
+    from stock_agent.task_runtime.store import ATTEMPT_DISPATCHED, ATTEMPT_PREPARED
+
+    settled = []
+    with closing(r25.open_store()) as store:
+        active = set(_status_constants())
+        for task in store.list_tasks():
+            if task["status"] not in active:
+                continue
+            attempts = store.invocation_attempts(task["task_id"])
+            if not attempts or any(a["state"] != ATTEMPT_PREPARED or a["sent"] != "no" for a in attempts):
+                continue
+            worker = {"worker_id": task["worker_id"], "fencing_token": int(task["fencing_token"])}
+            closed = store.recover_stale_invocation_attempts(
+                task["task_id"], error="drain: reserved and prepared, confirmed not sent")
+            failed = store.fail(task["task_id"], error="drain: invocation never sent; settled before the snapshot",
+                                retryable=False, **worker)
+            attempts = store.invocation_attempts(task["task_id"])
+            settled.append({"task_id": task["task_id"], "intent": task["business_intent_id"],
+                            "closed": closed, "status": failed["status"],
+                            "attempt_states": [a["state"] for a in attempts],
+                            "attempt_sent": [a["sent"] for a in attempts]})
+    ok = bool(settled) and all(_settled(item) for item in settled)
+    r25.emit({"phase": "konm112_settle_unsent", "settled": settled, "ok": ok})
+    return 0 if ok else 8
+
+
+def inject(mode: str) -> int:
+    """Leave one more reserved-but-unsent task in a state the gate must refuse."""
+    from stock_agent.budget_guard import reserve_model_attempt
+
+    config = r24.read_json(Path("/app") / r25.CONFIG_REL)
+    label = "r25-negative-" + mode
+    with closing(r25.open_store()) as store:
+        task, _ = store.create_task(
+            title=f"KONM-112 negative {mode}", case_id=r24.CASE, execution_mode="replay",
+            business_intent_id=f"{r24.CASE}-{label}",
+            input_payload={"data_classification": "public", "research_question": f"Synthetic {label}"})
+        task_id = task["task_id"]
+        # running: the lease lasts one second and is allowed to lapse while the
+        # task stays running; live-lease: claimed, never started, lease alive.
+        claimed = store.claim_task(task_id, r24.ACTOR, ttl_seconds=1 if mode == "running" else 300)
+        worker = {"worker_id": r24.ACTOR, "fencing_token": claimed["fencing_token"]}
+        if mode == "running":
+            store.mark_running(task_id, expected_version=claimed["version"], **worker)
+        request = {"round": 1, "provider": "synthetic-local", "request_model": "r25-negative",
+                   "prompt_sha256": hashlib.sha256(label.encode()).hexdigest(),
+                   "started_at": r24.datetime.now().astimezone().isoformat(timespec="seconds")}
+        reservation = reserve_model_attempt(store, config, task_id, attempt=request, **worker)
+        store.prepare_invocation_attempt(
+            task_id, round_index=1, provider=request["provider"], request_model=request["request_model"],
+            prompt_sha256=request["prompt_sha256"], budget_event_id=reservation["event_id"],
+            deadline_seconds=30, **worker)
+        if mode == "running":
+            while r24.datetime.fromisoformat(store.get_task(task_id)["lease_expires_at"]) > \
+                    r24.datetime.now().astimezone():
+                time.sleep(1)
+        final = store.get_task(task_id)
+    r25.emit({"phase": "konm112_inject", "mode": mode, "task_id": task_id, "status": final["status"],
+              "lease_expires_at": final["lease_expires_at"], "reserved": reservation["reserved"]})
+    return 0
+
+
+def drain_gate() -> int:
+    """One read-only statement of what could still be written or dispatched."""
+    from stock_agent.task_runtime.store import ATTEMPT_DISPATCHED, ATTEMPT_PREPARED
+
+    read_at = r24.datetime.now().astimezone()
+    active = set(_status_constants())
+    live_leases, stale_timestamps = [], []
+    with closing(_store(r24.DATA)) as store:
+        summary = store.summary()
+        for task in store.list_tasks():
+            expires = str(task["lease_expires_at"] or "")
+            if not expires:
+                continue
+            try:
+                valid = r24.datetime.fromisoformat(expires) > read_at
+            except ValueError:
+                valid = False
+            if task["status"] in active and valid:
+                live_leases.append({"task_id": task["task_id"], "status": task["status"],
+                                    "lease_expires_at": expires})
+            elif task["status"] not in active:
+                stale_timestamps.append({"task_id": task["task_id"], "status": task["status"]})
+        open_attempts = store._conn.execute(
+            "SELECT state, COUNT(*) AS n FROM task_invocation_attempts WHERE state IN (?, ?) GROUP BY state",
+            (ATTEMPT_PREPARED, ATTEMPT_DISPATCHED)).fetchall()
+    counts = summary["task_counts"]
+    open_by_state = {row["state"]: int(row["n"]) for row in open_attempts}
+    report = {
+        "phase": "konm112_drain_gate", "read_at": read_at.isoformat(), "read_only": True,
+        "queued": int(counts.get("queued", 0)), "leased": int(counts.get("leased", 0)),
+        "running": int(counts.get("running", 0)), "live_leases": len(live_leases),
+        "live_lease_details": live_leases, "open_prepared": int(open_by_state.get(ATTEMPT_PREPARED, 0)),
+        "open_dispatched": int(open_by_state.get(ATTEMPT_DISPATCHED, 0)),
+        "terminal_tasks_with_past_lease_timestamp": len(stale_timestamps),
+        "task_counts": counts,
+    }
+    report["drained"] = not any(report[key] for key in (
+        "queued", "leased", "running", "live_leases", "open_prepared", "open_dispatched"))
+    r25.emit(report)
+    return 0 if report["drained"] else 9
 
 
 def resubmit() -> int:
@@ -224,6 +361,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("ledger").add_argument("data", nargs="?", default="")
+    commands.add_parser("settle-unsent")
+    commands.add_parser("inject").add_argument("mode", choices=("running", "live-lease"))
+    commands.add_parser("drain-gate")
     commands.add_parser("resubmit")
     read_parser = commands.add_parser("read")
     read_parser.add_argument("data")
@@ -238,6 +378,12 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "ledger":
         return ledger(args.data)
+    if args.command == "settle-unsent":
+        return settle_unsent()
+    if args.command == "inject":
+        return inject(args.mode)
+    if args.command == "drain-gate":
+        return drain_gate()
     if args.command == "resubmit":
         return resubmit()
     if args.command == "read":
