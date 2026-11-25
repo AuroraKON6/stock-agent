@@ -97,7 +97,7 @@ def ledger(data_value: str = "") -> int:
     data = _data_root(data_value)
     config = r24.read_json(Path("/app") / r25.CONFIG_REL)
     rows = r24.snapshot(data)
-    budget, budget_errors = r24.budget_projection(rows, config)
+    budget, budget_errors = r24.budget_projection(rows, config, drained=True)
     workflow, workflow_errors = r24.workflow_projection(data, rows, _live_manifest(data), config)
     tokens = 0
     for task in rows["research_tasks"]:

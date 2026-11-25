@@ -190,11 +190,12 @@ class Drill:
                 and restore["task_runtime_integrity"]["unknown_attempts_restored"] == 1
                 and not restore["source_overwrite_performed"] and not restore["live_project_modified"],
                 "Backup/restore controls or manifest binding disagreed")
-        self.fixture("positive", "compare", bundle, restored, "--raw")
+        self.fixture("positive", "compare", bundle, restored, "--raw", "--drained")
         for mode in NEGATIVES:
             self.fixture(f"mutate-{mode}", "corrupt", restored, mode)
-            self.fixture(f"negative-{mode}", "compare", bundle, f"/app/drill-negatives/{mode}", expected=13)
-        self.fixture("positive-after-negatives", "compare", bundle, restored)
+            self.fixture(f"negative-{mode}", "compare", bundle, f"/app/drill-negatives/{mode}", "--drained",
+                         expected=13)
+        self.fixture("positive-after-negatives", "compare", bundle, restored, "--drained")
 
         # ---- cross restart: one fixed image, same intents, no second delivery ----
         def receipt(name: str) -> str:
@@ -328,7 +329,7 @@ def main() -> None:
     require(not output.is_relative_to(ROOT), "Evidence directory must be outside the checkout")
     require(not output.exists(), f"Evidence directory already exists: {output}")
     output.mkdir(parents=True)
-    drill = Drill(args.image, args.commit, output)
+    drill = Drill(args.image, args.commit, output, args.negative)
     head = drill.run("candidate-head", ["git", "rev-parse", "HEAD"]).strip()
     require(head == args.commit and len(head) == 40, "Clean checkout HEAD must be the requested full SHA")
     require(not drill.run("candidate-status", ["git", "status", "--porcelain"]).strip(), "Checkout must be clean")

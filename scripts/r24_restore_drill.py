@@ -35,6 +35,11 @@ RECEIPT = {"basis": "synthetic_fixture", "receipt_id": "r24-receipt-1",
 USAGE = {"prompt_tokens": 120, "completion_tokens": 37, "total_tokens": 157}
 STATES = {"prepared": "no", "succeeded": "yes",
           "reconciled": "unknown", "outcome_unknown": "unknown"}
+# What each seeded attempt must look like: sent, its invocation events in
+# order, and the task status. R24 keeps the prepared fixture running for its
+# static restore; the R25 path (KONM-112) settles it before the snapshot.
+PREPARED = ("prepared", "no", [], "running")
+SETTLED_NOT_SENT = ("failed_known", "no", ["invocation_failed_known"], "failed")
 TABLE_KEYS = {
     "research_tasks": ("task_id",),
     "task_outbox": ("sequence",),
@@ -236,7 +241,18 @@ def row_diffs(source: dict, restored: dict) -> list:
     return differences
 
 
-def budget_projection(rows: dict, config: dict) -> tuple[list, list]:
+def budget_projection(rows: dict, config: dict, *, drained: bool = False) -> tuple[list, list]:
+    profile = {
+        PREPARED[0]: PREPARED,
+        "succeeded": ("succeeded", "yes", ["invocation_dispatched", "invocation_succeeded"], "succeeded"),
+        "reconciled": ("reconciled", "unknown",
+                       ["invocation_dispatched", "invocation_outcome_unknown", "invocation_reconciled"], "blocked"),
+        "outcome_unknown": ("outcome_unknown", "unknown",
+                            ["invocation_dispatched", "invocation_outcome_unknown"], "blocked"),
+    }
+    if drained:
+        del profile[PREPARED[0]]
+        profile[SETTLED_NOT_SENT[0]] = SETTLED_NOT_SENT
     errors = []
     projection = []
     attempts = rows["task_invocation_attempts"]
@@ -247,10 +263,11 @@ def budget_projection(rows: dict, config: dict) -> tuple[list, list]:
     limit = config["task_runtime"]["budget"]["daily_model_call_limit"]
     dates = {event_id: business_date(datetime.fromisoformat(event["created_at"]))
              for event_id, event in reservations.items()}
-    if (len(attempts) != len(STATES) or {row["state"] for row in attempts} != STATES.keys()
-            or len(reservations) != len(STATES)
+    if (len(attempts) != len(profile) or {row["state"] for row in attempts} != profile.keys()
+            or len(reservations) != len(profile)
             or {row["budget_event_id"] for row in attempts} != reservations.keys() or limit != LIMIT):
-        errors.append("Expected four distinct attempt states, each linked to one reservation, and an 8-call cap")
+        errors.append(f"Expected the four attempt states {sorted(profile)}, each linked to one reservation, "
+                     "and an 8-call cap")
 
     for row in attempts:
         task_id, attempt_id, state = (row[key] for key in ("task_id", "attempt_id", "state"))
@@ -269,20 +286,13 @@ def budget_projection(rows: dict, config: dict) -> tuple[list, list]:
                     payload.get(key) != row[key] for key in ("provider", "request_model", "prompt_sha256"))):
             errors.append(f"{label}: reservation/task/round binding disagrees")
 
-        expected_events = {
-            "prepared": [],
-            "succeeded": ["invocation_dispatched", "invocation_succeeded"],
-            "outcome_unknown": ["invocation_dispatched", "invocation_outcome_unknown"],
-            "reconciled": ["invocation_dispatched", "invocation_outcome_unknown", "invocation_reconciled"],
-        }
-        if (row["sent"] != STATES.get(state) or
-                [event["event_type"] for event in invocation_events] != expected_events.get(state) or
+        sent, events, status = profile.get(state, (None, None, None))
+        if (row["sent"] != sent or
+                [event["event_type"] for event in invocation_events] != events or
                 any(json.loads(event["payload"]).get("attempt_id") != attempt_id
                     or event["sequence"] <= reservation["sequence"] for event in invocation_events)):
             errors.append(f"{label}: invocation event sequence/state disagrees")
-        expected_task_status = {"prepared": "running", "succeeded": "succeeded",
-                                "reconciled": "blocked", "outcome_unknown": "blocked"}
-        if task["status"] != expected_task_status.get(state) or any(
+        if task["status"] != status or any(
                 event["event_type"] in {"task_requeued", "task_retry_scheduled"} for event in events):
             errors.append(f"{label}: task status or retry event disagrees")
 
@@ -368,7 +378,7 @@ def workflow_projection(data: Path, rows: dict, manifest: dict, config: dict) ->
     return {"run": run, "input_snapshot": inputs[0] if inputs else None, "files": files}, errors
 
 
-def compare(bundle: Path, restored: Path, *, raw: bool = False) -> int:
+def compare(bundle: Path, restored: Path, *, raw: bool = False, drained: bool = False) -> int:
     manifest_path = bundle / "manifest.json"
     manifest = read_json(manifest_path)
     digest = sha256(manifest_path)
@@ -378,8 +388,8 @@ def compare(bundle: Path, restored: Path, *, raw: bool = False) -> int:
     restored_config = read_json(restored / "config/watchlist.restore.json")
     source, recovered = snapshot(DATA), snapshot(restored / "data")
     differences = row_diffs(source, recovered)
-    budget_source, source_errors = budget_projection(source, source_config)
-    budget_restore, restore_errors = budget_projection(recovered, restored_config)
+    budget_source, source_errors = budget_projection(source, source_config, drained=drained)
+    budget_restore, restore_errors = budget_projection(recovered, restored_config, drained=drained)
     workflow_source, workflow_source_errors = workflow_projection(DATA, source, manifest, source_config)
     workflow_restore, workflow_restore_errors = workflow_projection(
         restored / "data", recovered, manifest, restored_config)
@@ -393,6 +403,7 @@ def compare(bundle: Path, restored: Path, *, raw: bool = False) -> int:
         "table_counts": {table: {"source": len(source[table]), "restore": len(recovered[table])}
                          for table in TABLE_KEYS},
         "row_differences": differences, "errors": errors, "r25_compare_exit": r25_exit,
+        "drained": bool(drained),
         "budget_source": budget_source, "budget_restore": budget_restore,
         "workflow_source": workflow_source, "workflow_restore": workflow_restore,
     }
@@ -458,13 +469,15 @@ def main() -> int:
     check.add_argument("bundle", type=Path)
     check.add_argument("restored", type=Path)
     check.add_argument("--raw", action="store_true")
+    check.add_argument("--drained", action="store_true",
+                       help="R25 path: the reserved-but-unsent fixture was settled before the snapshot")
     copy = commands.add_parser("corrupt")
     copy.add_argument("restored", type=Path)
     copy.add_argument("mode", choices=("amount", "state", "missing-workflow",
                                        "outbox-payload", "missing-object"))
     args = parser.parse_args()
     if args.command == "compare":
-        return compare(args.bundle, args.restored, raw=args.raw)
+        return compare(args.bundle, args.restored, raw=args.raw, drained=args.drained)
     if args.command == "corrupt":
         return corrupt(args.restored, args.mode)
     return {"seed": seed, "inventory": inventory, "collect": collect}[args.command]()
