@@ -7,6 +7,8 @@ travel with their own kinds; and the restore DRILL verifies the restored task
 runtime table-by-table against the live source, explicitly confirming that
 unknown-outcome attempts (open reconciliation work) survived.
 """
+import hashlib
+import os
 import sys
 import tempfile
 import unittest
@@ -125,6 +127,34 @@ class DefaultSourceSetTests(R24BackupTestCase):
         self.assertIn("personal_evidence_object", kinds)
         self.assertIn("personal_evidence_index", kinds)
 
+
+    def test_frozen_workflow_manifest_and_dsl_restore_from_the_bundle(self):
+        fixtures = Path(__file__).resolve().parents[1] / "config/candidates/dify/flows"
+        dsl = (fixtures / "single-research-replay.yml").read_bytes()
+        manifest = (fixtures / "single-research-replay.manifest.json").read_bytes()
+        relative = Path("data/workflow_artifacts") / hashlib.sha256(dsl).hexdigest()
+        frozen = self.root / relative
+        frozen.mkdir(parents=True)
+        (frozen / "single-research-replay.yml").write_bytes(dsl)
+        (frozen / "single-research-replay.manifest.json").write_bytes(manifest)
+        (frozen / "unrelated.json").write_text("{}", encoding="utf-8")
+        if os.name != "nt":
+            (frozen / "linked.yml").symlink_to(frozen / "single-research-replay.yml")
+        (frozen.parent / "draft").mkdir()
+        (frozen.parent / "draft/unsupported.yml").write_bytes(dsl)
+
+        backup = self._backup()
+        entries = {entry["path"]: entry["kind"] for entry in _manifest_entries(self.config, backup)
+                   if entry["path"].startswith("data/workflow_artifacts/")}
+        self.assertEqual(entries, {
+            (relative / "single-research-replay.yml").as_posix(): "workflow_dsl",
+            (relative / "single-research-replay.manifest.json").as_posix(): "workflow_manifest",
+        })
+        drill = run_restore_drill(self.config, backup["bundle_path"])
+        self.assertEqual(drill["status"], "PASS", drill.get("errors"))
+        restored = project_path(drill["restored_root"]) / relative
+        self.assertEqual((restored / "single-research-replay.yml").read_bytes(), dsl)
+        self.assertEqual((restored / "single-research-replay.manifest.json").read_bytes(), manifest)
 
 class DrillIntegrityTests(R24BackupTestCase):
     def test_drill_verifies_task_runtime_tables_and_unknown_survives(self):
