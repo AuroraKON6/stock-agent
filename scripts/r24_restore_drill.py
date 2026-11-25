@@ -243,7 +243,7 @@ def row_diffs(source: dict, restored: dict) -> list:
 
 def budget_projection(rows: dict, config: dict, *, drained: bool = False) -> tuple[list, list]:
     profile = {
-        PREPARED[0]: PREPARED[1:],
+        PREPARED[0]: PREPARED,
         "succeeded": ("succeeded", "yes", ["invocation_dispatched", "invocation_succeeded"], "succeeded"),
         "reconciled": ("reconciled", "unknown",
                        ["invocation_dispatched", "invocation_outcome_unknown", "invocation_reconciled"], "blocked"),
@@ -252,7 +252,7 @@ def budget_projection(rows: dict, config: dict, *, drained: bool = False) -> tup
     }
     if drained:
         del profile[PREPARED[0]]
-        profile[SETTLED_NOT_SENT[0]] = SETTLED_NOT_SENT[1:]
+        profile[SETTLED_NOT_SENT[0]] = SETTLED_NOT_SENT
     errors = []
     projection = []
     attempts = rows["task_invocation_attempts"]
@@ -286,7 +286,7 @@ def budget_projection(rows: dict, config: dict, *, drained: bool = False) -> tup
                     payload.get(key) != row[key] for key in ("provider", "request_model", "prompt_sha256"))):
             errors.append(f"{label}: reservation/task/round binding disagrees")
 
-        sent, events, status = profile.get(state, (None, None, None))
+        _, sent, events, status = profile.get(state, (state, None, None, None))
         if (row["sent"] != sent or
                 [event["event_type"] for event in invocation_events] != events or
                 any(json.loads(event["payload"]).get("attempt_id") != attempt_id
