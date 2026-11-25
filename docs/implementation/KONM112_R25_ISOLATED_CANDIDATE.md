@@ -72,19 +72,19 @@
 | 步 | 命令要点 | 预期退出 | 证明内容 |
 | --- | --- | --- | --- |
 | `seed` | `r24_restore_drill.py seed` | 0 | 四种 attempt 状态各带一笔预算预留（上限 8），带引用的个人证据任务，冻结工作流 |
-| `drain-in-flight` | `timeout 45 … worker-service --max-tasks 20` | 124 | 排空在途：seed 留下的排队任务被执行完，worker 空转直到超时 |
+| `drain-in-flight` | `timeout 45 … worker-service --max-tasks 20` | 124 | 排空在途：seed 留下的排队工作流任务被执行一次（Dify 关闭，结果为 failed），worker 空转直到超时 |
 | `ledger-after-drain` | `ledger` | 0 | 队列中无 `queued`/`leased` 任务 |
 | `access-log-quiescent` | `cat /app/data/dify/access_log.jsonl` | 0 | 停写时网关访问审计的内容 |
 | `writers-exited` | `docker ps -q` 按项目标签 | 0，输出为空 | 无在途写者，记为停写起点 |
 | `source-before` | `inventory` | 0 | 源卷逐文件字节数与 SHA-256 |
 | `backup` / `restore` | `backup-create` / `restore-drill` | 0 / 0 | 独立恢复到另一空卷，`live_project_modified=false` |
 | `positive`、五组 `negative-*`、`positive-after-negatives` | `compare` | 0、各 13、0 | 源/恢复逐行账本、预算投影、工作流制品及引用 |
-| `ledger-before-restart` | `ledger` | 0 | 九张表全行、逐 attempt 预留/消费、157 tokens、模拟收据 0.012345、outbox 32 条序号/ID/hash |
-| `consumer-deliver-before-restart` | `consume … pre-restart 0` | 0 | 读 32、投递 32 |
+| `ledger-before-restart` | `ledger` | 0 | 九张表全行、逐 attempt 预留/消费、157 tokens、模拟收据 0.012345、outbox 38 条序号/ID/hash |
+| `consumer-deliver-before-restart` | `consume … pre-restart 0` | 0 | 读 38、投递 38 |
 | `down-for-restart` … `stopped-after-recreate` | `down`、`up -d --no-build --pull never`、`inspect`、`down` | 全 0 | 停写起止时间；重建容器 `Image` 等于固定镜像 ID |
 | `ledger-after-restart`、`read-tail-after-restart` | `ledger`、`read` | 0 / 0，读为空 | 重启本身未改账本，游标之后无新事件 |
 | `resubmit-same-intents`、`ledger-after-resubmit` | `resubmit`、`ledger` | 0 / 0 | 五个意图均 `DUPLICATE`、任务 ID 不变，账本与重启前逐字段相等 |
-| `consumer-resume-after-restart`、`consumer-replay-from-zero` | `consume` | 0 / 0 | 续读 0 条、投递 0；从头重放读 32 条、全部判重、投递 0 |
+| `consumer-resume-after-restart`、`consumer-replay-from-zero` | `consume` | 0 / 0 | 续读 0 条、投递 0；从头重放读 38 条、全部判重、投递 0 |
 | `ledger-restored`、`read-restored-from-zero`、`consumer-restored-*` | 恢复侧同上 | 0 | 恢复库 outbox 与源库序号/ID/hash 一致，收据逐条相同 |
 | `worker-after-restart` | `timeout 20 … worker-service --max-tasks 1` | 124 | 空队列不重发：未决 `outcome_unknown` 保持 blocked，无新 attempt |
 | `ledger-after-worker` | `ledger` | 0 | 与重启前相等 |
