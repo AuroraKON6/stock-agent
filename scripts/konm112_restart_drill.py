@@ -173,6 +173,7 @@ class Drill:
                                f"live_leases={gate['live_leases']}); no backup was started")
         require(gate["drained"], f"Drain gate passed with work in flight: {gate}")
         self.drain_gate = gate
+        self.service("access-log-quiescent", "cat", "/app/data/dify/access_log.jsonl")
         window_start = self.stopped("writers-exited")
         before = self.fixture("source-before", "inventory")
         self.service("backup", "python", "-m", "stock_agent", "backup-create", "--config", CONFIG)
