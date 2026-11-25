@@ -286,9 +286,9 @@ def budget_projection(rows: dict, config: dict, *, drained: bool = False) -> tup
                     payload.get(key) != row[key] for key in ("provider", "request_model", "prompt_sha256"))):
             errors.append(f"{label}: reservation/task/round binding disagrees")
 
-        _, sent, events, status = profile.get(state, (state, None, None, None))
+        _, sent, expected_events, status = profile.get(state, (state, None, None, None))
         if (row["sent"] != sent or
-                [event["event_type"] for event in invocation_events] != events or
+                [event["event_type"] for event in invocation_events] != expected_events or
                 any(json.loads(event["payload"]).get("attempt_id") != attempt_id
                     or event["sequence"] <= reservation["sequence"] for event in invocation_events)):
             errors.append(f"{label}: invocation event sequence/state disagrees")
