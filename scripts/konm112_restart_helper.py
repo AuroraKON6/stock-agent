@@ -48,7 +48,12 @@ def event_digest(event: dict) -> str:
 
 
 def _data_root(value: str) -> Path:
-    return Path(value) if value.startswith("/") else r24.DATA / value
+    """The live store is named "" or "data"; anything else is an absolute path
+    (the independent restore's data tree)."""
+    value = value.strip()
+    if value in {"", "data"}:
+        return r24.DATA
+    return Path(value)
 
 
 def _store(data: Path):
