@@ -61,7 +61,7 @@
    `R25_IMAGE_BINDING` 指向外置的候选绑定，部署绑定 `deploy/docker/image_binding.json` 不改；不设时驱动读仓库默认绑定，
    候选摘要与之不符时 `031-provenance` 会以退出 6 失败。
 
-4. R24 排空/恢复 + 跨重启联合证据（一次驱动，含 R24 的 seed、backup、restore、compare 与五组负例）：
+4. R24 排空/恢复 + 跨重启联合证据（一次驱动 62 步，含 R24 的 seed、backup、restore、compare 与五组负例）：
 
    ```bash
    python3.12 scripts/konm112_restart_drill.py --image "$IMG" --commit "$(git rev-parse HEAD)" \
@@ -97,13 +97,14 @@
 | `source-before` | `inventory` | 0 | 源卷逐文件字节数与 SHA-256 |
 | `backup` / `restore` | `backup-create` / `restore-drill` | 0 / 0 | 独立恢复到另一空卷，`live_project_modified=false` |
 | `positive`、五组 `negative-*`、`positive-after-negatives` | `compare` | 0、各 13、0 | 源/恢复逐行账本、预算投影、工作流制品及引用 |
-| `ledger-before-restart` | `ledger` | 0 | 九张表全行、逐 attempt 预留/消费、157 tokens、模拟收据 0.012345、outbox 条目序号/ID/hash（条数以 `summary.json` 的 `outbox_events` 为准） |
-| `consumer-deliver-before-restart` | `consume … pre-restart 0` | 0 | 读 38、投递 38 |
+| `ledger-before-restart` | `ledger` | 0 | 九张表全行、逐 attempt 预留/消费、157 tokens、模拟收据 0.012345、outbox 40 条序号/ID/hash（含结算准备态夹具新增的 `invocation_failed_known`、`task_failed`；以 `summary.json` 的 `outbox_events` 为准） |
+| `consumer-deliver-before-restart` | `consume … pre-restart 0` | 0 | 读 40、投递 40 |
 | `down-for-restart` … `stopped-after-recreate` | `down`、`up -d --no-build --pull never`、`inspect`、`down` | 全 0 | 停写起止时间；重建容器 `Image` 等于固定镜像 ID |
 | `ledger-after-restart`、`read-tail-after-restart` | `ledger`、`read` | 0 / 0，读为空 | 重启本身未改账本，游标之后无新事件 |
-| `resubmit-same-intents`、`ledger-after-resubmit` | `resubmit`、`ledger` | 0 / 0 | 五个意图均 `DUPLICATE`、任务 ID 不变，账本与重启前逐字段相等 |
-| `consumer-resume-after-restart`、`consumer-replay-from-zero` | `consume` | 0 / 0 | 续读 0 条、投递 0；从头重放读 38 条、全部判重、投递 0 |
+| `resubmit-same-intents`、`ledger-after-resubmit` | `resubmit`、`ledger` | 0 / 0 | 五个意图均 `DUPLICATE`、任务 ID 不变；4 笔 attempt / 预留、157 tokens、模拟收据 0.012345、1 笔未决 `outcome_unknown` 原样保留，账本与重启前逐字段相等 |
+| `consumer-resume-after-restart`、`consumer-replay-from-zero` | `consume` | 0 / 0 | 续读 0 条、投递 0；从头重放读 40 条、全部判重、投递 0 |
 | `ledger-restored`、`read-restored-from-zero`、`consumer-restored-*` | 恢复侧同上 | 0 | 恢复库 outbox 与源库序号/ID/hash 一致，收据逐条相同 |
+| `drain-gate`（负例） | `drain-gate` | 9 | 驱动以退出 1 结束；其后只有 `negative-archive-empty`、`negative-no-snapshot` 和清理步骤 |
 | `worker-after-restart` | `timeout 20 … worker-service --max-tasks 1` | 124 | 空队列不重发：未决 `outcome_unknown` 保持 blocked，无新 attempt |
 | `ledger-after-worker` | `ledger` | 0 | 与重启前相等 |
 | `access-log-final`、`source-after` | `cat`、`inventory` | 0 | 20 个源文件中 19 个哈希不变（三个 SQLite 库在内）；唯一变化是 `dify/access_log.jsonl` 追加了重提交那次网关访问的审计行，原内容是新内容的前缀 |
