@@ -243,7 +243,7 @@ def row_diffs(source: dict, restored: dict) -> list:
 
 def budget_projection(rows: dict, config: dict, *, drained: bool = False) -> tuple[list, list]:
     profile = {
-        PREPARED[0]: PREPARED,
+        PREPARED[0]: PREPARED[1:],
         "succeeded": ("succeeded", "yes", ["invocation_dispatched", "invocation_succeeded"], "succeeded"),
         "reconciled": ("reconciled", "unknown",
                        ["invocation_dispatched", "invocation_outcome_unknown", "invocation_reconciled"], "blocked"),
@@ -252,7 +252,7 @@ def budget_projection(rows: dict, config: dict, *, drained: bool = False) -> tup
     }
     if drained:
         del profile[PREPARED[0]]
-        profile[SETTLED_NOT_SENT[0]] = SETTLED_NOT_SENT
+        profile[SETTLED_NOT_SENT[0]] = SETTLED_NOT_SENT[1:]
     errors = []
     projection = []
     attempts = rows["task_invocation_attempts"]
