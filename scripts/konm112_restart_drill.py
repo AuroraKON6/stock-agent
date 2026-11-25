@@ -148,6 +148,7 @@ class Drill:
         require(not drained["outbox_summary"]["task_counts"].get("queued")
                 and not drained["outbox_summary"]["task_counts"].get("leased"),
                 f"Queue not drained: {drained['outbox_summary']}")
+        self.service("access-log-quiescent", "cat", "/app/data/dify/access_log.jsonl")
         window_start = self.stopped("writers-exited")
         before = self.fixture("source-before", "inventory")
         self.service("backup", "python", "-m", "stock_agent", "backup-create", "--config", CONFIG)
@@ -248,8 +249,21 @@ class Drill:
         ledger3 = self.helper("ledger-after-worker", "ledger")
         require(ledger3 == ledger0, "Ledger changed after the restarted worker ran")
 
+        self.service("access-log-final", "cat", "/app/data/dify/access_log.jsonl")
         after = self.fixture("source-after", "inventory")
-        require(before == after and bool(before), "Source volume file hashes changed")
+        # The gateway's access audit is an append-only record OF the resubmission
+        # (its gate logs every call, duplicate or not). It may grow; nothing
+        # else on the source volume may change.
+        audit = "dify/access_log.jsonl"
+        changed = sorted(key for key in set(before) | set(after) if before.get(key) != after.get(key))
+        require(bool(before) and changed == [audit] and after[audit]["bytes"] > before[audit]["bytes"],
+                f"Source volume files other than the access audit changed: {changed}")
+        quiescent_log = (self.output / "access-log-quiescent.stdout").read_text(encoding="utf-8")
+        final_log = (self.output / "access-log-final.stdout").read_text(encoding="utf-8")
+        require(final_log.startswith(quiescent_log), "Access audit was rewritten rather than appended to")
+        access_audit = {"appended_bytes": after[audit]["bytes"] - before[audit]["bytes"],
+                        "lines_before": len(quiescent_log.splitlines()), "lines_after": len(final_log.splitlines()),
+                        "appended_lines": final_log[len(quiescent_log):].splitlines()}
         window_end = self.stopped("writers-still-exited")
         self.summary = {
             "baseline": BASELINE, "candidate": self.commit, "image": self.image, "docker_image_id": image_id,
@@ -258,7 +272,8 @@ class Drill:
             "quiescent_start_utc": window_start, "quiescent_end_utc": window_end,
             "stop_write_start_utc": stop_start, "stop_write_end_utc": stop_end,
             "manifest_id": manifest["manifest_id"], "manifest_sha256": backup["manifest_sha256"],
-            "restored_root": restored, "source_files_unchanged": len(before),
+            "restored_root": restored, "source_files_unchanged": len(before) - 1,
+            "source_files_total": len(before), "access_audit": access_audit,
             "outbox_events": len(ledger0["outbox"]), "table_counts": ledger0["table_counts"],
             "per_intent": ledger0["per_intent"], "resubmit": resubmit["results"],
             "delivery": {"first": first, "resume_after_restart": second, "replay_from_zero": replay,

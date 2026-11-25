@@ -74,6 +74,7 @@
 | `seed` | `r24_restore_drill.py seed` | 0 | 四种 attempt 状态各带一笔预算预留（上限 8），带引用的个人证据任务，冻结工作流 |
 | `drain-in-flight` | `timeout 45 … worker-service --max-tasks 20` | 124 | 排空在途：seed 留下的排队任务被执行完，worker 空转直到超时 |
 | `ledger-after-drain` | `ledger` | 0 | 队列中无 `queued`/`leased` 任务 |
+| `access-log-quiescent` | `cat /app/data/dify/access_log.jsonl` | 0 | 停写时网关访问审计的内容 |
 | `writers-exited` | `docker ps -q` 按项目标签 | 0，输出为空 | 无在途写者，记为停写起点 |
 | `source-before` | `inventory` | 0 | 源卷逐文件字节数与 SHA-256 |
 | `backup` / `restore` | `backup-create` / `restore-drill` | 0 / 0 | 独立恢复到另一空卷，`live_project_modified=false` |
@@ -87,7 +88,7 @@
 | `ledger-restored`、`read-restored-from-zero`、`consumer-restored-*` | 恢复侧同上 | 0 | 恢复库 outbox 与源库序号/ID/hash 一致，收据逐条相同 |
 | `worker-after-restart` | `timeout 20 … worker-service --max-tasks 1` | 124 | 空队列不重发：未决 `outcome_unknown` 保持 blocked，无新 attempt |
 | `ledger-after-worker` | `ledger` | 0 | 与重启前相等 |
-| `source-after` | `inventory` | 0 | 与 `source-before` 完全相同 |
+| `access-log-final`、`source-after` | `cat`、`inventory` | 0 | 20 个源文件中 19 个哈希不变（三个 SQLite 库在内）；唯一变化是 `dify/access_log.jsonl` 追加了重提交那次网关访问的审计行，原内容是新内容的前缀 |
 | `cleanup-compose`、`remaining-*` | `down --volumes`、按标签清点 | 全 0 | 容器、卷、网络均为 0 |
 
 读取与投递分开记录：`read`、`ledger` 只经 `TaskStore.events_after` 读游标；`consume` 是隔离的幂等
