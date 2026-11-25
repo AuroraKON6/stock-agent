@@ -137,6 +137,17 @@ class Drill:
 
         # ---- R24: quiescent snapshot, independent restore, row-level ledger ----
         self.fixture("seed", "seed")
+        # Drain what the seed left queued, so the quiescent snapshot holds no
+        # never-started task: only then is an empty queue after the restart a
+        # statement about resends. The worker waits for work once the queue is
+        # empty, so the time limit (124) is the expected outcome.
+        self.service("drain-in-flight", "timeout", "45", "python", "-B", "-m", "stock_agent", "worker-service",
+                     "--config", CONFIG, "--worker-id", "w-konm112-drain", "--max-tasks", "20",
+                     "--idle-sleep-seconds", "0.2", expected=124)
+        drained = self.helper("ledger-after-drain", "ledger")
+        require(not drained["outbox_summary"]["task_counts"].get("queued")
+                and not drained["outbox_summary"]["task_counts"].get("leased"),
+                f"Queue not drained: {drained['outbox_summary']}")
         window_start = self.stopped("writers-exited")
         before = self.fixture("source-before", "inventory")
         self.service("backup", "python", "-m", "stock_agent", "backup-create", "--config", CONFIG)

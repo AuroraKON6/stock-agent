@@ -72,7 +72,9 @@
 | 步 | 命令要点 | 预期退出 | 证明内容 |
 | --- | --- | --- | --- |
 | `seed` | `r24_restore_drill.py seed` | 0 | 四种 attempt 状态各带一笔预算预留（上限 8），带引用的个人证据任务，冻结工作流 |
-| `writers-exited` | `docker ps -q` 按项目标签 | 0，输出为空 | 排空：无在途写者，记为停写起点 |
+| `drain-in-flight` | `timeout 45 … worker-service --max-tasks 20` | 124 | 排空在途：seed 留下的排队任务被执行完，worker 空转直到超时 |
+| `ledger-after-drain` | `ledger` | 0 | 队列中无 `queued`/`leased` 任务 |
+| `writers-exited` | `docker ps -q` 按项目标签 | 0，输出为空 | 无在途写者，记为停写起点 |
 | `source-before` | `inventory` | 0 | 源卷逐文件字节数与 SHA-256 |
 | `backup` / `restore` | `backup-create` / `restore-drill` | 0 / 0 | 独立恢复到另一空卷，`live_project_modified=false` |
 | `positive`、五组 `negative-*`、`positive-after-negatives` | `compare` | 0、各 13、0 | 源/恢复逐行账本、预算投影、工作流制品及引用 |
