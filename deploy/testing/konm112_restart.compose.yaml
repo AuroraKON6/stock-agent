@@ -1,0 +1,11 @@
+# Overlay for r25_precheck.compose.yaml + r24_restore.compose.yaml (KONM-112).
+# Use only the one-shot drill service: the cross-restart helper and the
+# isolated consumer's receipt store (its own project-scoped temp volume).
+services:
+  drill:
+    volumes:
+      - ../../scripts/konm112_restart_helper.py:/drills/konm112_restart_helper.py:ro
+      - konm112-receipts:/drill-receipts
+
+volumes:
+  konm112-receipts:
