@@ -56,6 +56,7 @@ class Drill:
         self.negative = negative
         self.commit = commit
         self.output = output
+        self.barrier_container = ""
         self.project = "stock-agent-konm112-" + uuid.uuid4().hex[:12]
         self.env = {**os.environ, "R25_IMAGE": image}
         self.compose = [
@@ -97,6 +98,40 @@ class Drill:
     def fixture(self, name: str, *command: str, expected: int = 0) -> dict:
         output = self.service(name, "python", "-B", "/drills/r24_restore_drill.py", *command, expected=expected)
         return json.loads([line for line in output.splitlines() if line.strip()][-1])
+
+    def start_write_barrier(self) -> dict:
+        """Hold the task database's write lock in a detached container."""
+        command = self.compose + [
+            "run", "-d", "--no-deps", "--pull", "never", "-T", "drill",
+            "python", "-B", HELPER, "hold-writes"]
+        started = utc()
+        print(f"write-barrier-start $ {shlex.join(command)}", flush=True)
+        stdout, stderr = self.output / "write-barrier-start.stdout", self.output / "write-barrier-start.stderr"
+        result = subprocess.run(command, cwd=ROOT, env=self.env, text=True, capture_output=True)
+        stdout.write_text(result.stdout, encoding="utf-8")
+        stderr.write_text(result.stderr, encoding="utf-8")
+        container = ""
+        for line in reversed(result.stdout.splitlines()):
+            candidate = line.strip()
+            if len(candidate) >= 12 and all(char in "0123456789abcdef" for char in candidate):
+                container = candidate
+                break
+        self.records.append({"step": "write-barrier-start", "command": command, "exit": result.returncode,
+                             "expected": 0, "start_utc": started, "end_utc": utc()})
+        self.flush()
+        require(result.returncode == 0 and container,
+                f"Write barrier did not start: exit {result.returncode}, stdout {result.stdout!r}")
+        self.barrier_container = container
+        return self.helper("write-barrier-ready", "wait-barrier")
+
+    def release_write_barrier(self) -> None:
+        require(bool(self.barrier_container), "No write barrier is held")
+        self.helper("write-barrier-release", "release-writes")
+        container = self.barrier_container
+        waited = self.run("write-barrier-stopped", ["docker", "wait", container]).strip()
+        require(waited == "0", f"Write barrier holder exited {waited}")
+        self.run("write-barrier-removed", ["docker", "rm", container])
+        self.barrier_container = ""
 
     def stopped(self, name: str) -> str:
         running = self.run(name, ["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={self.project}"])
@@ -147,36 +182,85 @@ class Drill:
                      "--config", CONFIG, "--worker-id", "w-konm112-drain", "--max-tasks", "20",
                      "--idle-sleep-seconds", "0.2", expected=124)
         settled = self.helper("settle-unsent-prepared", "settle-unsent")
+        gaps = self.helper("repro-drain-gaps", "repro-drain-gaps")
+        require(gaps["ok"], f"Drain-gap reproduction did not refuse both cases: {gaps}")
         if self.negative:
-            # The negative controls leave ONE more reserved-but-unsent task in a
-            # state a quiescent snapshot must refuse.
+            # running: expired lease, status still running, no open attempt.
+            # live-lease: awaiting_human whose original fencing token can still
+            # complete, with every other blocker at zero.
             self.helper(f"inject-{self.negative}", "inject", self.negative)
-        # The gate: one read-only statement of the store, and nothing below
-        # (inventory, backup, restore) runs unless it exits 0.
+        # Stop writers before the gate, then hold the SQLite write lock until
+        # the backup snapshot returns. Negatives release it without a snapshot.
+        window_start = self.stopped("writers-exited")
+        barrier = self.start_write_barrier()
+        probe = self.helper("write-barrier-probe", "probe-writes")
+        require(probe["held"] and probe["refused"], f"Writes were still accepted before the gate: {probe}")
         self.helper("drain-gate", "drain-gate", expected=0 if not self.negative else 9)
         gate = json.loads((self.output / "drain-gate.stdout").read_text(encoding="utf-8")
                           .splitlines()[-1])
+        require(gate["snapshot"]["data_version_stable"], f"Drain gate snapshot moved during the read: {gate}")
         if self.negative:
+            if self.negative == "running":
+                require(gate["running"] >= 1 and gate["open_prepared"] == 0 and gate["open_dispatched"] == 0
+                        and gate["writable_leases"] >= 1,
+                        f"Expired running must block by itself: {gate}")
+            else:
+                require(all(gate[key] == 0 for key in (
+                    "queued", "leased", "running", "open_prepared", "open_dispatched"))
+                        and gate["writable_leases"] >= 1 and gate["live_leases"] >= 1,
+                        f"Writable awaiting_human lease must be the only blocker: {gate}")
             archive = self.service("negative-archive-empty", "ls", "-A", "/app/drill-archive").split()
             negatives = self.service("negative-no-snapshot", "ls", "-A", "/app/drill-restore").split()
             done = [record["step"] for record in self.records]
+            self.release_write_barrier()
             self.summary = {
                 "negative": self.negative, "gate": gate,
                 "settled_before_injection": settled["settled"],
+                "repro_drain_gaps": gaps,
+                "snapshot_stop_write": {
+                    "writers_exited_utc": window_start,
+                    "barrier_held_at": barrier["marker"]["held_at"],
+                    "probe_before_gate": probe,
+                    "gate_read_at": gate["read_at"],
+                    "backup_started": False,
+                },
                 "archive_entries": archive, "restore_entries": negatives,
                 "backup_steps": [step for step in done if step.startswith(("backup", "restore", "source-"))],
             }
             require(not archive and not negatives and not self.summary["backup_steps"],
                     "A refused gate was followed by snapshot work")
-            raise RuntimeError(f"drain gate refused the negative control {self.negative!r} "
-                               f"(queued={gate['queued']}, leased={gate['leased']}, running={gate['running']}, "
-                               f"live_leases={gate['live_leases']}); no backup was started")
+            raise RuntimeError(
+                f"drain gate refused the negative control {self.negative!r} "
+                f"(queued={gate['queued']}, leased={gate['leased']}, running={gate['running']}, "
+                f"live_leases={gate['live_leases']}, writable_leases={gate['writable_leases']}, "
+                f"open_prepared={gate['open_prepared']}, open_dispatched={gate['open_dispatched']}); "
+                f"no backup was started")
         require(gate["drained"], f"Drain gate passed with work in flight: {gate}")
         self.drain_gate = gate
         self.service("access-log-quiescent", "cat", "/app/data/dify/access_log.jsonl")
-        window_start = self.stopped("writers-exited")
         before = self.fixture("source-before", "inventory")
         self.service("backup", "python", "-m", "stock_agent", "backup-create", "--config", CONFIG)
+        probe_after = self.helper("write-barrier-probe-after-backup", "probe-writes")
+        require(probe_after["held"] and probe_after["refused"],
+                f"Writes were accepted before the backup snapshot finished: {probe_after}")
+        self.release_write_barrier()
+        self.snapshot_stop_write = {
+            "writers_exited_utc": window_start,
+            "barrier_held_at": barrier["marker"]["held_at"],
+            "probe_before_gate": probe,
+            "gate_read_at": gate["read_at"],
+            "probe_after_backup": probe_after,
+            "backup_end_utc": next(record["end_utc"] for record in self.records if record["step"] == "backup"),
+            "barrier_released_utc": next(record["end_utc"] for record in self.records
+                                         if record["step"] == "write-barrier-stopped"),
+        }
+        released = datetime.fromisoformat(self.snapshot_stop_write["barrier_released_utc"])
+        require(datetime.fromisoformat(window_start)
+                <= datetime.fromisoformat(self.snapshot_stop_write["barrier_held_at"])
+                <= datetime.fromisoformat(gate["read_at"])
+                <= datetime.fromisoformat(self.snapshot_stop_write["backup_end_utc"])
+                <= released,
+                f"Stop-write did not cover the gate read through the backup: {self.snapshot_stop_write}")
         self.stopped("after-backup")
         self.service("restore", "python", "-m", "stock_agent", "restore-drill", "--config", CONFIG)
 
@@ -297,7 +381,9 @@ class Drill:
             "compose_project": self.project, "volumes": sorted(volumes),
             "quiescent_start_utc": window_start, "quiescent_end_utc": window_end,
             "stop_write_start_utc": stop_start, "stop_write_end_utc": stop_end,
+            "snapshot_stop_write": self.snapshot_stop_write,
             "drain_gate": self.drain_gate, "settled_unsent": settled["settled"],
+            "repro_drain_gaps_ok": gaps["ok"],
             "manifest_id": manifest["manifest_id"], "manifest_sha256": backup["manifest_sha256"],
             "restored_root": restored, "source_files_unchanged": len(before) - 1,
             "source_files_total": len(before), "access_audit": access_audit,
@@ -323,8 +409,9 @@ def main() -> None:
     parser.add_argument("--binding", required=True, type=Path, help="External image binding JSON for the digest")
     parser.add_argument("--output", required=True, type=Path, help="New evidence directory outside the checkout")
     parser.add_argument("--negative", choices=NEGATIVE_DRAINS,
-                        help="negative control: leave one task running with a lapsed lease, or leased with a "
-                             "live lease; the drain gate must refuse it and no backup may start")
+                        help="negative control: leave one task running after its lease expired, or one "
+                             "awaiting_human task whose fencing token can still write, with no open attempt; "
+                             "the drain gate must refuse it and no backup may start")
     args = parser.parse_args()
     output = args.output.resolve()
     require(not output.is_relative_to(ROOT), "Evidence directory must be outside the checkout")

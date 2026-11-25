@@ -75,15 +75,19 @@
    `R25_IMAGE_BINDING` 指向外置的候选绑定，部署绑定 `deploy/docker/image_binding.json` 不改；不设时驱动读仓库默认绑定，
    候选摘要与之不符时 `031-provenance` 会以退出 6 失败。
 
-4. R24 排空/恢复 + 跨重启联合证据（一次驱动 62 步，含 R24 的 seed、backup、restore、compare 与五组负例）：
+4. R24 排空/恢复 + 跨重启联合证据（含 R24 的 seed、backup、restore、compare 与五组负例；
+   `summary.json` 在最后一条 `final-image-id` 之前写入，因此 `steps` 比 `steps.tsv` 少 1）：
 
    ```bash
    python3.12 scripts/konm112_restart_drill.py --image "$IMG" --commit "$(git rev-parse HEAD)" \
      --binding "$BINDING" --output <ev>/restart
    ```
 
-   预期：最后一行 `PASS`，`summary.json` 的 `verdict` 为 `PASS`、`cleanup_remaining` 为空，`drain_gate`
-   的 `queued/leased/running/live_leases/open_prepared/open_dispatched` 全为 0。
+   预期：最后一行 `PASS`，`summary.json` 的 `verdict` 为 `PASS`、`cleanup_remaining` 为空，`steps` 等于
+   `steps_matching_expected`。`drain_gate` 的 `queued/leased/running/live_leases/writable_leases/
+   open_prepared/open_dispatched` 全为 0，且 `snapshot.data_version_stable` 为 true。
+   `snapshot_stop_write` 里，写者退出、写锁持有、门禁 `read_at`、`backup` 结束、写锁释放按这个顺序发生；
+   备份结束之后、释放之前的第二次探测仍然被拒绝。
 
    排空门的两组独立负例（各自新证据目录，`--commit` 同上）：
 
@@ -95,8 +99,11 @@
    ```
 
    预期：驱动非零退出（1），`drain-gate` 步退出 9，`steps.tsv` 里没有任何 `source-before`、`backup`、
-   `restore` 步，`summary.json` 的 `archive_entries`、`restore_entries`、`backup_steps` 均为空。
-   `running`：任务仍为 `running`、租约已过期；`live-lease`：`running=0`、`leased=1` 且租约有效。
+   `restore` 步，`summary.json` 的 `archive_entries`、`restore_entries`、`backup_steps` 均为空，
+   `snapshot_stop_write.backup_started` 为 false。两组都不留下未闭合 attempt。
+   `running`：`running=1`、`open_prepared=0`、租约已过期，`writable_leases>=1`。
+   `live-lease`：`queued=leased=running=open_prepared=open_dispatched=0`，任务为 `awaiting_human`，
+   原 fencing token 仍可 `complete`，门禁因 `writable_leases>=1` 且 `live_leases>=1` 拒绝。
 
 ## 第 4 项逐步预期
 
@@ -105,11 +112,15 @@
 | `seed` | `r24_restore_drill.py seed` | 0 | 四种 attempt 状态各带一笔预算预留（上限 8），带引用的个人证据任务，冻结工作流 |
 | `drain-in-flight` | `timeout 45 … worker-service --max-tasks 20` | 124 | 排空在途：seed 留下的排队工作流任务被执行一次（Dify 关闭，结果为 failed），worker 空转直到超时 |
 | `settle-unsent-prepared` | `settle-unsent` | 0 | 仅预留、确认未发的准备态夹具经公开转换结算：attempt → `failed_known/sent=no`，任务 → `failed`（不重试）；预算预留保留、零新增调用、零消费。有任何 attempt 已派发的任务不动，留给排空门 |
-| `drain-gate` | `drain-gate`（只读） | 0 | 同一次只读账本读取，记 `read_at`：`queued`、`leased`、`running`、有效租约（仅 `leased/running` 且 `lease_expires_at` 晚于读取时刻；终态任务的历史时间戳不计）、未闭合的 `prepared/dispatched` attempt 均为 0。非零即中止，其后步骤不执行 |
-| `access-log-quiescent` | `cat /app/data/dify/access_log.jsonl` | 0 | 停写时网关访问审计的内容 |
-| `writers-exited` | `docker ps -q` 按项目标签 | 0，输出为空 | 无在途写者，记为停写起点（R24 独立夹具的 `seed` 保持原样，R25 路径只多出 `settle-unsent-prepared` 一步） |
-| `source-before` | `inventory` | 0 | 源卷逐文件字节数与 SHA-256 |
-| `backup` / `restore` | `backup-create` / `restore-drill` | 0 / 0 | 独立恢复到另一空卷，`live_project_modified=false` |
+| `repro-drain-gaps` | 临时库上的两项漏检复现 | 0 | 两个连接在同一次读取中交错提交时，快照始终带着阻断项、退出 9；`awaiting_human` 在 `queued=leased=running=open_prepared=open_dispatched=0` 时仍因可写租约退出 9，随后原 token 的 `complete` 得到 `succeeded` |
+| `writers-exited` | `docker ps -q` 按项目标签 | 0，输出为空 | 门禁之前确认没有在途写者 |
+| `write-barrier-start` / `write-barrier-ready` | 后台 `hold-writes`，再 `wait-barrier` | 0 / 0 | 对任务库 `BEGIN IMMEDIATE`，标记写在收据卷而不是源卷 |
+| `write-barrier-probe` | `probe-writes` | 0 | 第二个写事务得到 `database is locked` |
+| `drain-gate` | `drain-gate`（只读快照） | 0 | 任务计数、租约和未闭合 attempt 在同一个 SQLite 只读事务里读取。`queued`、`leased`、`running`、未过期可写租约、`writable_leases`（`leased`/`running`/`awaiting_human`，含已过期但仍接受原 fencing token 的行）、未闭合的 `prepared`/`dispatched` attempt 均为 0。`snapshot.data_version` 在事务内不变。非零即中止 |
+| `access-log-quiescent` | `cat /app/data/dify/access_log.jsonl` | 0 | 停写窗口内网关访问审计的内容 |
+| `source-before` | `inventory` | 0 | 源卷逐文件字节数与 SHA-256；此时写锁仍持有 |
+| `backup` | `backup-create` | 0 | 写锁仍持有。随后 `write-barrier-probe-after-backup` 仍退出 0，然后才 `release-writes` 并移除持锁容器 |
+| `restore` | `restore-drill` | 0 | 写锁已释放。独立恢复到另一空卷，`live_project_modified=false` |
 | `positive`、五组 `negative-*`、`positive-after-negatives` | `compare` | 0、各 13、0 | 源/恢复逐行账本、预算投影、工作流制品及引用 |
 | `ledger-before-restart` | `ledger` | 0 | 九张表全行、逐 attempt 预留/消费、157 tokens、模拟收据 0.012345、outbox 40 条序号/ID/hash（含结算准备态夹具新增的 `invocation_failed_known`、`task_failed`；以 `summary.json` 的 `outbox_events` 为准） |
 | `consumer-deliver-before-restart` | `consume … pre-restart 0` | 0 | 读 40、投递 40 |
@@ -118,7 +129,7 @@
 | `resubmit-same-intents`、`ledger-after-resubmit` | `resubmit`、`ledger` | 0 / 0 | 五个意图均 `DUPLICATE`、任务 ID 不变；4 笔 attempt / 预留、157 tokens、模拟收据 0.012345、1 笔未决 `outcome_unknown` 原样保留，账本与重启前逐字段相等 |
 | `consumer-resume-after-restart`、`consumer-replay-from-zero` | `consume` | 0 / 0 | 续读 0 条、投递 0；从头重放读 40 条、全部判重、投递 0 |
 | `ledger-restored`、`read-restored-from-zero`、`consumer-restored-*` | 恢复侧同上 | 0 | 恢复库 outbox 与源库序号/ID/hash 一致，收据逐条相同 |
-| `drain-gate`（负例） | `drain-gate` | 9 | 驱动以退出 1 结束；其后只有 `negative-archive-empty`、`negative-no-snapshot` 和清理步骤 |
+| `drain-gate`（负例） | `drain-gate` | 9 | 驱动以退出 1 结束。门禁之前已经停写并探测到写事务被拒绝；其后只有空目录检查、释放写锁和清理步骤，备份未启动 |
 | `worker-after-restart` | `timeout 20 … worker-service --max-tasks 1` | 124 | 空队列不重发：未决 `outcome_unknown` 保持 blocked，无新 attempt |
 | `ledger-after-worker` | `ledger` | 0 | 与重启前相等 |
 | `access-log-final`、`source-after` | `cat`、`inventory` | 0 | 20 个源文件中 19 个哈希不变（三个 SQLite 库在内）；唯一变化是 `dify/access_log.jsonl` 追加了重提交那次网关访问的审计行，原内容是新内容的前缀 |

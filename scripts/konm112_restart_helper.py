@@ -21,14 +21,32 @@ Subcommands (each prints one JSON object):
                                   attempt as failed_known/sent='no', the task
                                   as failed without retry. The budget
                                   reservation is kept, nothing is consumed.
-    inject <running|live-lease>   negative control for the drain gate: one
-                                  more reserved-but-unsent task left running
-                                  with an already expired lease, or left
-                                  leased with a live lease
-    drain-gate                    read-only, one snapshot of the store: queued,
-                                  leased, running, live leases, open
-                                  prepared/dispatched attempts, read time.
-                                  Exit 0 only when all of them are zero.
+    inject <running|live-lease>   negative control for the drain gate. running:
+                                  one task left running after its lease has
+                                  expired, with no open attempt. live-lease:
+                                  one awaiting_human task whose original
+                                  fencing token can still complete, and
+                                  queued/leased/running/open attempts are all
+                                  zero. Neither control prepares an attempt.
+    drain-gate                    one SQLite read-only snapshot: task counts,
+                                  leases and open attempts are read inside a
+                                  single deferred read transaction. Exit 0
+                                  only when queued, leased, running, live
+                                  leases, still-writable fencing leases
+                                  (leased/running/awaiting_human) and open
+                                  prepared/dispatched attempts are all zero.
+    repro-drain-gaps              re-run the two missed cases on temporary
+                                  databases: interleaved commits during the
+                                  read, and an awaiting_human token that can
+                                  still complete. Exit 0 only when both gates
+                                  refuse.
+    hold-writes                   hold BEGIN IMMEDIATE on the task database
+                                  until /drill-receipts releases it, so no
+                                  other connection can start a write
+    wait-barrier                  wait until that write barrier is held
+    probe-writes                  exit 0 only when a second write transaction
+                                  is refused while the barrier is held
+    release-writes                ask the barrier holder to roll back and exit
     read <data-root> <cursor> <limit>
                                   cursor read through TaskStore.events_after
     consume <data-root> <receipt-db> <label> <cursor>
@@ -53,6 +71,8 @@ import r24_restore_drill as r24  # noqa: E402
 
 r25 = r24.r25
 PAGE = 100
+BARRIER_MARKER = Path("/drill-receipts/konm112_write_barrier.json")
+BARRIER_RELEASE = Path("/drill-receipts/konm112_write_barrier.release")
 
 
 def event_digest(event: dict) -> str:
@@ -187,10 +207,13 @@ def settle_unsent() -> int:
 
 
 def inject(mode: str) -> int:
-    """Leave one more reserved-but-unsent task in a state the gate must refuse."""
-    from stock_agent.budget_guard import reserve_model_attempt
+    """Leave one task the gate must refuse for that reason alone.
 
-    config = r24.read_json(Path("/app") / r25.CONFIG_REL)
+    Neither mode prepares an invocation attempt. ``running`` stays running
+    after the lease timestamp has passed. ``live-lease`` is ``awaiting_human``
+    with the claim's fencing token still able to complete, while queued,
+    leased, running and open attempts are all zero.
+    """
     label = "r25-negative-" + mode
     with closing(r25.open_store()) as store:
         task, _ = store.create_task(
@@ -198,70 +221,274 @@ def inject(mode: str) -> int:
             business_intent_id=f"{r24.CASE}-{label}",
             input_payload={"data_classification": "public", "research_question": f"Synthetic {label}"})
         task_id = task["task_id"]
-        # running: the lease lasts one second and is allowed to lapse while the
-        # task stays running; live-lease: claimed, never started, lease alive.
         claimed = store.claim_task(task_id, r24.ACTOR, ttl_seconds=1 if mode == "running" else 300)
-        worker = {"worker_id": r24.ACTOR, "fencing_token": claimed["fencing_token"]}
-        if mode == "running":
-            store.mark_running(task_id, expected_version=claimed["version"], **worker)
-        request = {"round": 1, "provider": "synthetic-local", "request_model": "r25-negative",
-                   "prompt_sha256": hashlib.sha256(label.encode()).hexdigest(),
-                   "started_at": r24.datetime.now().astimezone().isoformat(timespec="seconds")}
-        reservation = reserve_model_attempt(store, config, task_id, attempt=request, **worker)
-        store.prepare_invocation_attempt(
-            task_id, round_index=1, provider=request["provider"], request_model=request["request_model"],
-            prompt_sha256=request["prompt_sha256"], budget_event_id=reservation["event_id"],
-            deadline_seconds=30, **worker)
-        if mode == "running":
+        worker = {"worker_id": r24.ACTOR, "fencing_token": int(claimed["fencing_token"])}
+        store.mark_running(task_id, expected_version=claimed["version"], **worker)
+        if mode == "live-lease":
+            store.request_awaiting_human(
+                task_id, human_request={"question": "Synthetic handoff before the snapshot?"}, **worker)
+        elif mode == "running":
             while r24.datetime.fromisoformat(store.get_task(task_id)["lease_expires_at"]) > \
                     r24.datetime.now().astimezone():
                 time.sleep(1)
         final = store.get_task(task_id)
+        attempts = store.invocation_attempts(task_id)
+    now = r24.datetime.now().astimezone()
+    try:
+        lease_live = r24.datetime.fromisoformat(str(final["lease_expires_at"])) > now
+    except ValueError:
+        lease_live = False
     r25.emit({"phase": "konm112_inject", "mode": mode, "task_id": task_id, "status": final["status"],
-              "lease_expires_at": final["lease_expires_at"], "reserved": reservation["reserved"]})
+              "lease_expires_at": final["lease_expires_at"], "lease_live": lease_live,
+              "fencing_token_unchanged": int(final["fencing_token"]) == int(claimed["fencing_token"]),
+              "open_attempts": len(attempts)})
     return 0
 
 
-def drain_gate() -> int:
-    """One read-only statement of what could still be written or dispatched."""
-    from stock_agent.task_runtime.store import ATTEMPT_DISPATCHED, ATTEMPT_PREPARED
+def _lease_still_valid(expires: str, read_at) -> bool:
+    if not expires:
+        return False
+    try:
+        return r24.datetime.fromisoformat(expires) > read_at
+    except ValueError:
+        return False
 
+
+def drain_gate() -> int:
+    """One read-only SQLite snapshot of what could still be written or dispatched.
+
+    Task counts, lease rows and open attempts share one deferred read
+    transaction on the read-only connection. A commit from another connection
+    cannot appear in only part of this report. ``store.summary()`` is called
+    inside that transaction so a hook placed between the old separate reads
+    still runs against the same snapshot; the numbers below come from the
+    snapshot queries, not from that return value.
+    """
+    from stock_agent.task_runtime.store import (
+        ATTEMPT_DISPATCHED, ATTEMPT_PREPARED, STATUS_AWAITING_HUMAN, STATUS_LEASED, STATUS_RUNNING,
+    )
+
+    # _assert_worker still accepts the current fencing token in these statuses,
+    # including after lease_expires_at and including awaiting_human.
+    writable_statuses = {STATUS_LEASED, STATUS_RUNNING, STATUS_AWAITING_HUMAN}
     read_at = r24.datetime.now().astimezone()
-    active = set(_status_constants())
-    live_leases, stale_timestamps = [], []
+    live_leases, writable_leases, historical = [], [], []
     with closing(_store(r24.DATA)) as store:
-        summary = store.summary()
-        for task in store.list_tasks():
-            expires = str(task["lease_expires_at"] or "")
-            if not expires:
-                continue
-            try:
-                valid = r24.datetime.fromisoformat(expires) > read_at
-            except ValueError:
-                valid = False
-            if task["status"] in active and valid:
-                live_leases.append({"task_id": task["task_id"], "status": task["status"],
+        connection = store._conn
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("BEGIN")
+        try:
+            data_version = int(connection.execute("PRAGMA data_version").fetchone()[0])
+            # Establishes the snapshot, then gives an interleaving hook the
+            # same transaction instead of a later autocommit read.
+            store.summary()
+            count_rows = connection.execute(
+                "SELECT status, COUNT(*) AS n FROM research_tasks GROUP BY status").fetchall()
+            task_rows = connection.execute(
+                "SELECT task_id, status, fencing_token, lease_expires_at FROM research_tasks "
+                "ORDER BY created_at").fetchall()
+            open_attempts = connection.execute(
+                "SELECT state, COUNT(*) AS n FROM task_invocation_attempts "
+                "WHERE state IN (?, ?) GROUP BY state",
+                (ATTEMPT_PREPARED, ATTEMPT_DISPATCHED)).fetchall()
+            data_version_after = int(connection.execute("PRAGMA data_version").fetchone()[0])
+        finally:
+            connection.execute("ROLLBACK")
+    counts = {row["status"]: int(row["n"]) for row in count_rows}
+    for task in task_rows:
+        expires = str(task["lease_expires_at"] or "")
+        valid = _lease_still_valid(expires, read_at)
+        if task["status"] in writable_statuses:
+            detail = {"task_id": task["task_id"], "status": task["status"],
+                      "lease_expires_at": expires, "lease_live": valid,
+                      "fencing_token_present": int(task["fencing_token"] or 0) > 0}
+            writable_leases.append(detail)
+            if valid:
+                live_leases.append({"task_id": detail["task_id"], "status": detail["status"],
                                     "lease_expires_at": expires})
-            elif task["status"] not in active:
-                stale_timestamps.append({"task_id": task["task_id"], "status": task["status"]})
-        open_attempts = store._conn.execute(
-            "SELECT state, COUNT(*) AS n FROM task_invocation_attempts WHERE state IN (?, ?) GROUP BY state",
-            (ATTEMPT_PREPARED, ATTEMPT_DISPATCHED)).fetchall()
-    counts = summary["task_counts"]
+        elif expires:
+            historical.append({"task_id": task["task_id"], "status": task["status"]})
     open_by_state = {row["state"]: int(row["n"]) for row in open_attempts}
     report = {
         "phase": "konm112_drain_gate", "read_at": read_at.isoformat(), "read_only": True,
         "queued": int(counts.get("queued", 0)), "leased": int(counts.get("leased", 0)),
         "running": int(counts.get("running", 0)), "live_leases": len(live_leases),
-        "live_lease_details": live_leases, "open_prepared": int(open_by_state.get(ATTEMPT_PREPARED, 0)),
+        "live_lease_details": live_leases, "writable_leases": len(writable_leases),
+        "writable_lease_details": writable_leases,
+        "open_prepared": int(open_by_state.get(ATTEMPT_PREPARED, 0)),
         "open_dispatched": int(open_by_state.get(ATTEMPT_DISPATCHED, 0)),
-        "terminal_tasks_with_past_lease_timestamp": len(stale_timestamps),
+        "terminal_tasks_with_past_lease_timestamp": len(historical),
         "task_counts": counts,
+        "snapshot": {"isolation": "deferred_read_transaction", "query_only": True,
+                     "data_version": data_version,
+                     "data_version_stable": data_version == data_version_after},
     }
-    report["drained"] = not any(report[key] for key in (
-        "queued", "leased", "running", "live_leases", "open_prepared", "open_dispatched"))
+    report["drained"] = bool(report["snapshot"]["data_version_stable"]) and not any(
+        report[key] for key in (
+            "queued", "leased", "running", "live_leases", "writable_leases",
+            "open_prepared", "open_dispatched"))
     r25.emit(report)
     return 0 if report["drained"] else 9
+
+
+def repro_drain_gaps() -> int:
+    """The two reads sol showed could pass. Both must now refuse."""
+    from tempfile import TemporaryDirectory
+    from unittest.mock import patch
+
+    from stock_agent.task_runtime import TaskStore
+
+    def create_fixture(store, title):
+        task, verdict = store.create_task(
+            title=title, execution_mode="replay", business_intent_id=title,
+            input_payload={"data_classification": "public", "research_question": title})
+        if verdict != "RECORDED":
+            raise RuntimeError(f"fixture was not recorded: {verdict}")
+        return task
+
+    def run_gate(path: Path):
+        from io import StringIO
+        from contextlib import redirect_stdout
+
+        output = StringIO()
+        with patch.object(r24, "DATA", path), redirect_stdout(output):
+            code = drain_gate()
+        return code, json.loads(output.getvalue())
+
+    results = []
+    with TemporaryDirectory() as folder:
+        path = Path(folder)
+        with closing(TaskStore(path / r24.DB)) as writer:
+            task = create_fixture(writer, "Synthetic attempt pending cleanup")
+            task_id = task["task_id"]
+            claim = writer.claim_task(task_id, "fixture-worker", ttl_seconds=300)
+            worker = {"worker_id": "fixture-worker", "fencing_token": claim["fencing_token"]}
+            writer.mark_running(task_id, expected_version=claim["version"], **worker)
+            writer.prepare_invocation_attempt(
+                task_id, round_index=1, provider="local-stub", request_model="fixture",
+                prompt_sha256="fixture", **worker)
+            writer.fail(task_id, error="Synthetic interruption", retryable=False, **worker)
+            before, before_gate = run_gate(path)
+            original_summary = TaskStore.summary
+
+            def summary_then_queue(reader):
+                summary = original_summary(reader)
+                create_fixture(writer, "Synthetic queued during drain check")
+                writer.recover_stale_invocation_attempts(task_id, error="Synthetic cleanup")
+                return summary
+
+            with patch.object(TaskStore, "summary", summary_then_queue):
+                code, report = run_gate(path)
+            after, after_gate = run_gate(path)
+        consistent_blocker = code == 9 and (
+            int(report["open_prepared"]) > 0 or int(report["queued"]) > 0
+            or int(report["writable_leases"]) > 0)
+        torn_clear = (int(report["queued"]) == 0 and int(report["open_prepared"]) == 0
+                      and int(report["writable_leases"]) == 0 and report["drained"])
+        results.append({
+            "scenario": "queued then open attempt closed between SELECTs",
+            "exit": code, "gate": report, "before_exit": before, "before_gate": before_gate,
+            "after_exit": after, "after_gate": after_gate,
+            "consistent_blocker": consistent_blocker, "torn_clear": torn_clear,
+        })
+
+    with TemporaryDirectory() as folder:
+        path = Path(folder)
+        with closing(TaskStore(path / r24.DB)) as writer:
+            task = create_fixture(writer, "Synthetic human handoff")
+            task_id = task["task_id"]
+            claim = writer.claim_task(task_id, "fixture-worker", ttl_seconds=300)
+            worker = {"worker_id": "fixture-worker", "fencing_token": claim["fencing_token"]}
+            writer.mark_running(task_id, expected_version=claim["version"], **worker)
+            task = writer.request_awaiting_human(
+                task_id, human_request={"question": "Synthetic?"}, **worker)
+            code, report = run_gate(path)
+            lease_live = r24.datetime.fromisoformat(task["lease_expires_at"]) > r24.datetime.fromisoformat(
+                report["read_at"])
+            completed = writer.complete(task_id, output={"synthetic": True}, **worker)
+        counters_clear = all(int(report[key]) == 0 for key in (
+            "queued", "leased", "running", "open_prepared", "open_dispatched"))
+        results.append({
+            "scenario": "awaiting_human and worker token still valid",
+            "exit": code, "gate": report, "lease_expires_at": task["lease_expires_at"],
+            "lease_live": lease_live, "counters_clear": counters_clear,
+            "status_after_same_worker_complete": completed["status"],
+        })
+
+    first, second = results
+    ok = (first["before_exit"] == 9 and first["after_exit"] == 9 and first["consistent_blocker"]
+          and not first["torn_clear"] and first["gate"]["snapshot"]["data_version_stable"]
+          and second["exit"] == 9 and second["counters_clear"] and second["lease_live"]
+          and int(second["gate"]["writable_leases"]) >= 1
+          and second["status_after_same_worker_complete"] == "succeeded")
+    r25.emit({"phase": "konm112_repro_drain_gaps", "ok": ok, "results": results})
+    return 0 if ok else 9
+
+
+def hold_writes() -> int:
+    """Keep a write transaction open so no other connection can start one."""
+    database = r24.DATA / r24.DB
+    BARRIER_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    if BARRIER_RELEASE.exists():
+        BARRIER_RELEASE.unlink()
+    connection = sqlite3.connect(str(database), timeout=30, isolation_level=None)
+    try:
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("BEGIN IMMEDIATE")
+        BARRIER_MARKER.write_text(json.dumps({
+            "held_at": r24.datetime.now().astimezone().isoformat(),
+            "database": database.as_posix(),
+        }), encoding="utf-8")
+        while not BARRIER_RELEASE.exists():
+            time.sleep(0.2)
+        connection.execute("ROLLBACK")
+    finally:
+        connection.close()
+        if BARRIER_MARKER.exists():
+            BARRIER_MARKER.unlink()
+    r25.emit({"phase": "konm112_hold_writes", "released": True})
+    return 0
+
+
+def wait_barrier() -> int:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if BARRIER_MARKER.is_file():
+            r25.emit({"phase": "konm112_wait_barrier", "present": True,
+                      "marker": json.loads(BARRIER_MARKER.read_text(encoding="utf-8"))})
+            return 0
+        time.sleep(0.2)
+    r25.emit({"phase": "konm112_wait_barrier", "present": False})
+    return 8
+
+
+def probe_writes() -> int:
+    """A second BEGIN IMMEDIATE must fail while the barrier holder is alive."""
+    database = r24.DATA / r24.DB
+    held = BARRIER_MARKER.is_file()
+    refused, error = False, ""
+    connection = sqlite3.connect(str(database), timeout=0.2, isolation_level=None)
+    try:
+        connection.execute("PRAGMA busy_timeout=200")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("ROLLBACK")
+    except sqlite3.OperationalError as exc:
+        error = str(exc)
+        refused = "locked" in error.lower() or "busy" in error.lower()
+    finally:
+        connection.close()
+    ok = held and refused
+    r25.emit({"phase": "konm112_probe_writes", "held": held, "refused": refused,
+              "error": error, "ok": ok})
+    return 0 if ok else 9
+
+
+def release_writes() -> int:
+    BARRIER_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    BARRIER_RELEASE.write_text("release\n", encoding="utf-8")
+    r25.emit({"phase": "konm112_release_writes", "ok": True})
+    return 0
 
 
 def resubmit() -> int:
@@ -364,6 +591,11 @@ def main() -> int:
     commands.add_parser("settle-unsent")
     commands.add_parser("inject").add_argument("mode", choices=("running", "live-lease"))
     commands.add_parser("drain-gate")
+    commands.add_parser("repro-drain-gaps")
+    commands.add_parser("hold-writes")
+    commands.add_parser("wait-barrier")
+    commands.add_parser("probe-writes")
+    commands.add_parser("release-writes")
     commands.add_parser("resubmit")
     read_parser = commands.add_parser("read")
     read_parser.add_argument("data")
@@ -384,6 +616,16 @@ def main() -> int:
         return inject(args.mode)
     if args.command == "drain-gate":
         return drain_gate()
+    if args.command == "repro-drain-gaps":
+        return repro_drain_gaps()
+    if args.command == "hold-writes":
+        return hold_writes()
+    if args.command == "wait-barrier":
+        return wait_barrier()
+    if args.command == "probe-writes":
+        return probe_writes()
+    if args.command == "release-writes":
+        return release_writes()
     if args.command == "resubmit":
         return resubmit()
     if args.command == "read":
