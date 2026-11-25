@@ -56,7 +56,21 @@
    done
    ```
 
-   容器内形式：`docker run --rm --network none -v "$PWD":/src:ro -w /src --entrypoint python "$IMG" -B scripts/run_isolated_tests.py --pattern <pattern>`。
+   容器内形式（R15 三组须清掉镜像内置的固定 `APP_*` 根目录，否则个人证据测试会读到镜像的
+   `/app/config`、`/var/stock-agent` 而失败；`$UNSET` 展开为 `-e APP_CONFIG_ROOT= -e APP_STATE_ROOT=
+   -e APP_EVIDENCE_ROOT= -e APP_REPORT_ROOT= -e APP_TEMP_ROOT= -e TMPDIR=/tmp`）：
+
+   ```bash
+   UNSET="-e APP_CONFIG_ROOT= -e APP_STATE_ROOT= -e APP_EVIDENCE_ROOT= -e APP_REPORT_ROOT= -e APP_TEMP_ROOT= -e TMPDIR=/tmp"
+   docker run --rm --network none -v "$PWD":/src:ro -w /src ${UNSET} --entrypoint python "$IMG" \
+     -B scripts/run_isolated_tests.py --pattern <pattern>
+   ```
+
+   两类已知的宿主隔离器误判（原失败保留，修正复跑各通过）：`test_backup_restore.py` 在 macOS 宿主和容器内经
+   `run_isolated_tests.py` 都有 4 个用例在清理临时目录时报 `PermissionError`（`dir_fd` 清理），绕过隔离器
+   直接运行 19/19：`python3.12 -B -m unittest tests.test_backup_restore`（在 `git archive HEAD` 解出的
+   副本里跑，避免写检出）。`test_refactor_r15_w10_skeleton.py` 在 macOS 宿主上 1 个用例因 `/var` 符号链接
+   被拒，在容器内通过 1/1。
 
    `R25_IMAGE_BINDING` 指向外置的候选绑定，部署绑定 `deploy/docker/image_binding.json` 不改；不设时驱动读仓库默认绑定，
    候选摘要与之不符时 `031-provenance` 会以退出 6 失败。
