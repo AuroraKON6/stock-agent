@@ -87,18 +87,14 @@ class IsolationTests(unittest.TestCase):
         cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as outside:
             os.chdir(outside)
-            # Registered before leaving the directory: cleanups run LIFO, so
-            # the cwd is restored before the temporary directory is removed.
-            self.addCleanup(self._restore_cwd, cwd)
-            with patch.object(self.module, "_fd_directory") as lookup:
-                self.audit("os.truncate", ("probe", 7))
-                lookup.assert_not_called()
-        self.addCleanup(self._restore_cwd, cwd)
-
-    @staticmethod
-    def _restore_cwd(cwd):
-        if os.path.isdir(cwd):
-            os.chdir(cwd)
+            try:
+                with patch.object(self.module, "_fd_directory") as lookup:
+                    self.audit("os.truncate", ("probe", 7))
+                    lookup.assert_not_called()
+            finally:
+                # Before the directory is removed: Windows refuses to delete
+                # the current directory, so it must be left first.
+                os.chdir(cwd)
 
     def test_rename_resolves_source_and_destination_fds_separately(self):
         # os.rename audits (src, dst, src_dir_fd, dst_dir_fd). Each side is

@@ -119,10 +119,8 @@ class ProcessIdentityTests(LocalOpsTestCase):
         self.assertFalse(check(1, self.CONFIG, "127.0.0.1", 8767, self.CMD.replace("--port 8767", "--port 87670")))
         self.assertFalse(check(1, self.CONFIG, "127.0.0.1", 8767, ""))
 
+    @unittest.skipUnless(os.name == "posix", "ps based lookup is POSIX only")
     def test_live_lookup_reads_the_real_command_line(self):
-        self.assertFalse(self.ops.is_workbench_process(0, self.CONFIG, "127.0.0.1", 8767))
-        if os.name == "nt":
-            self.skipTest("ps based lookup is POSIX only")
         own = os.getpid()
         self.assertFalse(self.ops.is_workbench_process(own, self.CONFIG, "127.0.0.1", 8767))
         self.assertFalse(self.ops.is_watch_process(own))
@@ -166,9 +164,20 @@ class StopSafetyTests(LocalOpsTestCase):
         lock = patch.object(self.ops, "_state_lock", side_effect=lambda _path: contextlib.nullcontext())
         lock.start()
         self.addCleanup(lock.stop)
+        # Every PID below is synthetic. Liveness and identity are faked, and
+        # os.kill / ps are closed off so no case can touch a host process
+        # (os.kill(pid, 0) is a console control event on Windows).
+        for item in (patch.object(self.ops, "_pid_alive", return_value=False),
+                     patch.object(self.ops, "is_watch_process", return_value=False),
+                     patch.object(self.ops, "is_workbench_process", return_value=False),
+                     patch.object(self.ops, "process_command", return_value=None),
+                     patch.object(self.ops.os, "kill",
+                                  side_effect=AssertionError("host process signal attempted"))):
+            item.start()
+            self.addCleanup(item.stop)
 
     def test_stop_agent_never_kills_a_foreign_pid(self):
-        self.pid_file.write_text("{0}\n".format(os.getpid()), encoding="ascii")
+        self.pid_file.write_text("4242\n", encoding="ascii")
         with patch.object(self.ops, "_terminate") as terminate:
             self.assertEqual(self.ops.cmd_stop_agent(self.parse("stop-agent")), 0)
         terminate.assert_not_called()
@@ -196,9 +205,9 @@ class StopSafetyTests(LocalOpsTestCase):
     def test_stop_workbench_refuses_foreign_pid_and_cleans_metadata(self):
         meta = self.state / "workbench.json"
         pid_file = self.state / "workbench.pid"
-        meta.write_text(json.dumps({"pid": os.getpid(), "port": 8767, "host": "127.0.0.1",
+        meta.write_text(json.dumps({"pid": 4242, "port": 8767, "host": "127.0.0.1",
                                     "config": "config/watchlist.example.json"}), encoding="utf-8")
-        pid_file.write_text("{0}".format(os.getpid()), encoding="ascii")
+        pid_file.write_text("4242", encoding="ascii")
         with patch.object(self.ops, "_terminate") as terminate:
             code = self.ops.cmd_stop_workbench(self.parse("stop-workbench", "--state-directory", str(self.state)))
         self.assertEqual(code, 0)
@@ -477,7 +486,10 @@ class WindowsHandOffTests(LocalOpsTestCase):
         posix_handler.assert_not_called()
 
     def test_ops_error_reports_the_locked_interpreter_rule(self):
-        with patch.object(self.ops, "ROOT", self.scratch), patch("sys.stderr") as stderr:
+        # The POSIX branch: on Windows the same call delegates to PowerShell
+        # (covered by test_windows_delegates_instead_of_running_the_posix_path).
+        with patch.object(self.ops, "ROOT", self.scratch), patch.object(self.ops, "IS_WINDOWS", False), \
+                patch("sys.stderr") as stderr:
             self.assertEqual(self.ops.main(["run-once"]), 2)
         self.assertIn("PATH python is not a supported fallback", "".join(call.args[0] for call in stderr.write.call_args_list))
 
