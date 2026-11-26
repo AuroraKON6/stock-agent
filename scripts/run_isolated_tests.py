@@ -16,13 +16,15 @@ from urllib.request import url2pathname
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Position of the dir_fd argument in each audited call that accepts one
-# (os.truncate takes an fd, not a path, so it has none).
+# Position of the dir_fd argument in each audited call that carries one.
 _PATH_DIR_FD = {"os.remove": 1, "os.rmdir": 1, "os.mkdir": 2, "os.chmod": 2, "os.utime": 3}
 
 
 def _arg(args, index):
-    return args[index] if len(args) > index else None
+    """Argument at ``index``, or None when the call did not pass one."""
+    if index is None or len(args) <= index:
+        return None
+    return args[index]
 
 
 def _fd_directory(dir_fd):
@@ -76,10 +78,15 @@ def install_guard(root: Path) -> None:
             ):
                 protect(args[0])
         elif event in {"os.remove", "os.rmdir", "os.mkdir", "os.chmod", "os.utime", "os.truncate"}:
-            protect(args[0], _arg(args, _PATH_DIR_FD.get(event, -1)))
+            # Only the events listed carry a dir_fd; for the others the last
+            # argument is something else (os.truncate's length) and must not
+            # be read as a directory fd.
+            protect(args[0], _arg(args, _PATH_DIR_FD[event]) if event in _PATH_DIR_FD else None)
         elif event in {"os.rename", "os.link", "os.symlink"}:
-            protect(args[0], _arg(args, 2))
-            protect(args[1], _arg(args, 3))
+            # os.rename/os.link: (src, dst, src_dir_fd, dst_dir_fd);
+            # os.symlink: (src, dst, dir_fd) applies to dst only.
+            protect(args[0], _arg(args, 2) if event != "os.symlink" else None)
+            protect(args[1], _arg(args, 3 if event == "os.link" else 2))
         elif event == "sqlite3.connect" and args[0] != ":memory:":
             if str(args[0]).startswith("file:"):
                 uri = urlsplit(str(args[0]))

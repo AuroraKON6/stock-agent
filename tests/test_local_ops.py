@@ -10,9 +10,12 @@ import json
 import os
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import shutil
+import subprocess
+import types
 import stat
 import unittest
 from unittest.mock import patch
@@ -244,6 +247,114 @@ class StopSafetyTests(LocalOpsTestCase):
     def test_stop_workbench_without_state_is_idempotent(self):
         self.assertEqual(self.ops.cmd_stop_workbench(
             self.parse("stop-workbench", "--state-directory", str(self.state / "missing"))), 0)
+
+
+class GoLiveIsolationTests(LocalOpsTestCase):
+    """The default checklist must run the suite through the isolation runner."""
+
+    def setUp(self):
+        super().setUp()
+        (self.scratch / ".venv312" / "bin").mkdir(parents=True)
+        (self.scratch / ".venv312" / "bin" / "python").write_bytes(b"")
+        for item in (patch.object(self.ops, "ROOT", self.scratch), patch.object(self.ops, "IS_WINDOWS", False)):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def _run(self, *arguments):
+        # The checklist's exit code follows the recorded readiness, not the steps.
+        for relative, payload in (("reports/health/latest.json", {"overall_status": "OK"}),
+                                  ("reports/production_pilot/latest.json",
+                                   {"technical_readiness": "READY", "go_live_decision": "GO"})):
+            path = self.scratch / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        commands = []
+
+        def fake_run(command, **_kwargs):
+            commands.append(list(command))
+            return types.SimpleNamespace(returncode=0)
+
+        with patch.object(self.ops.subprocess, "run", side_effect=fake_run):
+            code = self.ops.main(["go-live-check", *arguments])
+        return code, commands
+
+    def test_default_runs_the_isolated_runner_not_bare_unittest(self):
+        code, commands = self._run()
+        self.assertEqual(code, 3)
+        self.assertEqual(commands[0], [str(self.scratch / ".venv312" / "bin" / "python"),
+                                       str(self.scratch / "scripts" / "run_isolated_tests.py")])
+        for command in commands:
+            self.assertNotIn("unittest", command)
+
+    def test_skip_tests_runs_no_test_command(self):
+        code, commands = self._run("--skip-tests")
+        self.assertEqual(code, 3)
+        self.assertEqual(len(commands), len(self.ops.GO_LIVE_STEPS))
+        self.assertFalse(any("run_isolated_tests.py" in part for command in commands for part in command))
+
+
+class ConcurrentStartTests(LocalOpsTestCase):
+    """Two simultaneous starts must yield one recorded, trackable daemon."""
+
+    def setUp(self):
+        super().setUp()
+        (self.scratch / ".venv312" / "bin").mkdir(parents=True)
+        (self.scratch / ".venv312" / "bin" / "python").write_bytes(b"")
+        self.pid_file = self.scratch / "agent.pid"
+        self.lock_file = self.scratch / "stock_agent.lock"
+        for item in (patch.object(self.ops, "ROOT", self.scratch),
+                     patch.object(self.ops, "AGENT_PID_FILE", self.pid_file),
+                     patch.object(self.ops.time, "sleep", return_value=None)):
+            item.start()
+            self.addCleanup(item.stop)
+        self.gate = threading.Event()
+
+    @unittest.skipUnless(os.name == "posix", "flock based locking is POSIX only")
+    def test_concurrent_starts_launch_one_daemon_that_stop_can_clean(self):
+        launched = []
+
+        real_sleep = time.sleep
+
+        def fake_popen(command, **_kwargs):
+            launched.append(command)
+            # Hold the launch window open so an unsynchronised second caller
+            # would get past its "already running" check and launch too.
+            real_sleep(0.3)
+            return types.SimpleNamespace(pid=40000 + len(launched), returncode=None,
+                                         poll=lambda: None)
+
+        results = []
+
+        def starter():
+            self.gate.wait(10)
+            results.append(self.ops.cmd_start_agent(self.parse("start-agent")))
+
+        # The fake daemon is not a real process, so identity is asserted for it.
+        with patch.object(self.ops, "is_watch_process", return_value=True), \
+                patch.object(self.ops.subprocess, "Popen", side_effect=fake_popen):
+            threads = [threading.Thread(target=starter) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            self.gate.set()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(sorted(results), [0, 0], "second caller must report the running daemon")
+        self.assertEqual(len(launched), 1, "exactly one daemon may be launched")
+        self.assertEqual(self.pid_file.read_text(encoding="ascii").strip(), "40001")
+
+        with patch.object(self.ops, "is_watch_process", return_value=True), \
+                patch.object(self.ops, "_pid_alive", return_value=True), \
+                patch.object(self.ops, "_terminate") as terminate:
+            self.assertEqual(self.ops.cmd_stop_agent(self.parse("stop-agent")), 0)
+        terminate.assert_called_once_with(40001)
+        self.assertFalse(self.pid_file.exists())
+
+    @unittest.skipUnless(os.name == "posix", "flock based locking is POSIX only")
+    def test_lock_is_released_on_refusal_and_after_use(self):
+        with self.ops._state_lock(self.lock_file):
+            pass
+        with self.ops._state_lock(self.lock_file):
+            pass
 
 
 class GoLiveCheckTests(LocalOpsTestCase):

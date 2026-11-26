@@ -45,6 +45,7 @@ ROOT = Path(__file__).resolve().parents[1]
 IS_WINDOWS = os.name == "nt"
 HEALTH_TIMEOUT_SECONDS = 60
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+LOCK_TIMEOUT_SECONDS = 60
 
 # PowerShell counterpart of each subcommand (the only Windows implementation).
 PS1 = {
@@ -286,7 +287,51 @@ def cmd_watch(args: argparse.Namespace) -> int:
 AGENT_PID_FILE = ROOT / "data" / "stock_agent.pid"
 
 
+def _state_lock(path: Path):
+    """Serialize start/stop of one state directory against concurrent callers.
+
+    Without it two simultaneous starts both read "no PID file", both launch,
+    and only the second PID is recorded -- the first daemon becomes
+    untrackable. Advisory and blocking; released when the block ends or the
+    holder exits."""
+    import fcntl  # POSIX only; Windows hands off to the .ps1 scripts
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")
+    deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise OpsError("Timed out waiting for the operations lock: {0}".format(path))
+            time.sleep(0.05)
+
+    class _Held:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *exc):
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+            return False
+
+    return _Held()
+
+
+def _agent_lock() -> Path:
+    # Resolved per call so a relocated ROOT keeps its lock next to its PID file.
+    return ROOT / "data" / "stock_agent.lock"
+
+
 def cmd_start_agent(args: argparse.Namespace) -> int:
+    with _state_lock(_agent_lock()):
+        return _start_agent(args)
+
+
+def _start_agent(args: argparse.Namespace) -> int:
     config = resolve_config(args.config)
     interval = str(args.interval_minutes)
     config_text = _display(config["path"])
@@ -325,6 +370,11 @@ def cmd_start_agent(args: argparse.Namespace) -> int:
 
 
 def cmd_stop_agent(args: argparse.Namespace) -> int:
+    with _state_lock(_agent_lock()):
+        return _stop_agent(args)
+
+
+def _stop_agent(args: argparse.Namespace) -> int:
     recorded = _read_pid_file(AGENT_PID_FILE)
     if not recorded:
         if AGENT_PID_FILE.exists():
@@ -401,6 +451,7 @@ def _meta_config(value: str) -> Optional[Path]:
 
 
 def cmd_start_workbench(args: argparse.Namespace) -> int:
+    # Validate first: a refused start must not create state, not even a lock.
     host = args.host.strip().lower()
     if host not in LOOPBACK_HOSTS:
         print("Refusing to start: Host '{0}' is not a loopback address (127.0.0.1, localhost, ::1)."
@@ -414,8 +465,13 @@ def cmd_start_workbench(args: argparse.Namespace) -> int:
         print("Config not found: {0}".format(config_abs))
         return 1
     python = locked_python()
-
     state = _state_paths(args.state_directory)
+    with _state_lock(state["dir"] / "workbench.lock"):
+        return _start_workbench(args, host, config_abs, python, state)
+
+
+def _start_workbench(args: argparse.Namespace, host: str, config_abs: Path,
+                     python: Path, state: Dict[str, Path]) -> int:
     state["dir"].mkdir(parents=True, exist_ok=True)
     health_url = _url(host, args.port, "/health")
     display_url = _url(host, args.port, "/?view=runtime")
@@ -523,6 +579,11 @@ def _as_int(value: Any) -> int:
 
 def cmd_stop_workbench(args: argparse.Namespace) -> int:
     state = _state_paths(args.state_directory)
+    with _state_lock(state["dir"] / "workbench.lock"):
+        return _stop_workbench(args, state)
+
+
+def _stop_workbench(args: argparse.Namespace, state: Dict[str, Path]) -> int:
     meta = _read_json(state["meta"])
     if meta is None:
         if state["pid"].exists():
@@ -641,7 +702,9 @@ def cmd_go_live_check(args: argparse.Namespace) -> int:
         stdout_path = log_dir / "go_live_{0}.{1}.out.log".format(stamp, safe_name)
         stderr_path = log_dir / "go_live_{0}.{1}.err.log".format(stamp, safe_name)
         cli = step["cli"]
-        command = ([str(python), "-m", "unittest", "discover", "-s", "tests"] if cli is None
+        # The unit-test step goes through the isolation runner, never a bare
+        # unittest discover that could write into the real checkout.
+        command = ([str(python), str(ROOT / "scripts" / "run_isolated_tests.py")] if cli is None
                    else [str(python), "-m", "stock_agent", *cli])
         step_started = datetime.now().astimezone().isoformat()
         print(">>> {0}".format(safe_name))

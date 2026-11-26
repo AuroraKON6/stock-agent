@@ -68,6 +68,29 @@ class IsolationTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             self.audit("os.remove", ("probe", 10 ** 9))
 
+    def test_truncate_length_is_not_mistaken_for_a_dir_fd(self):
+        # os.truncate audits (path_or_fd, length): a RELATIVE path is resolved
+        # against the cwd, and the length must never be read as a directory fd.
+        cwd = os.getcwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, cwd)
+        with patch("fcntl.fcntl") as lookup, tempfile.TemporaryDirectory() as outside:
+            for value in ("data/probe", os.fsencode("data/probe"), self.root / "data" / "probe"):
+                with self.subTest(value=value), self.assertRaises(PermissionError):
+                    self.audit("os.truncate", (value, 7))
+            lookup.assert_not_called()
+            # fd taking form: an integer names a descriptor, not a workspace path
+            self.audit("os.truncate", (12345, 7))
+
+    def test_truncate_relative_name_outside_workspace_is_allowed(self):
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as outside:
+            os.chdir(outside)
+            self.addCleanup(os.chdir, cwd)
+            with patch("fcntl.fcntl") as lookup:
+                self.audit("os.truncate", ("probe", 7))
+                lookup.assert_not_called()
+
     def test_fd_taking_call_is_not_mistaken_for_a_dir_fd(self):
         # os.truncate audits (fd, length): the length must not be used as a base.
         self.audit("os.truncate", (12345, 7))
