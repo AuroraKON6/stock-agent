@@ -357,12 +357,22 @@ def build_safe_research_context(payload: Dict[str, Any], config: Optional[Dict[s
     return safe_context, delivery
 
 
+# Stable reasons recorded when the approved projection cannot carry a question.
+PROJECTION_REFUSALS = {
+    "approved_question_projection_missing": "approved question projection is missing",
+    "research_question_missing": "research question is missing from the approved projection",
+}
+
+
 def govern_egress(task: Dict[str, Any], config: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any], Dict[str, Any]]:
     """Run the shared LLM governance over the task's CURRENT payload.
 
     Returns ``(allowed, reason, governance_record, safe_payload)``. The safe
     payload is the minimized, approved projection the outbound prompt must be
-    built from; it is empty when denied.
+    built from; it is empty when denied. The projection is the ONLY source of
+    the outbound research question: when governance is enabled an approved
+    decision without this task's projection, or with a blank question in it,
+    blocks before any dispatch. Nothing falls back to the task's own input.
     """
 
     payload = dict(task.get("input_payload") or {})
@@ -371,7 +381,7 @@ def govern_egress(task: Dict[str, Any], config: Dict[str, Any]) -> Tuple[bool, s
         return False, "task input classification is not public", {
             "gate": "classification", "classification": classification, "decision": "denied",
         }, {}
-    from .llm_governance import prepare_llm_batch
+    from .llm_governance import governance_config, prepare_llm_batch
 
     carrier = _egress_carrier(task, config)
     approved, safe_payloads, stats = prepare_llm_batch([carrier], config, "research_task")
@@ -384,7 +394,24 @@ def govern_egress(task: Dict[str, Any], config: Dict[str, Any]) -> Tuple[bool, s
             "reasons": reasons,
             "audit_id": decision.get("audit_id", ""),
         }, {}
-    safe = safe_payloads.get(str(task["task_id"])) or payload
+    audit_id = str((carrier.llm_governance.get("research_task") or {}).get("audit_id") or "")
+
+    def _refused(reason: str) -> Tuple[bool, str, Dict[str, Any], Dict[str, Any]]:
+        return False, PROJECTION_REFUSALS[reason], {
+            "gate": "question_projection", "decision": "denied",
+            "reason": reason, "audit_id": audit_id,
+        }, {}
+
+    if not governance_config(config)["enabled"]:
+        # Governance disabled: no projection was screened. Only the question
+        # itself is passed on; the raw payload is never the safe payload.
+        safe = {"summary": payload.get("research_question") or ""}
+    else:
+        safe = safe_payloads.get(str(task["task_id"]))
+        if safe is None:
+            return _refused("approved_question_projection_missing")
+    if not str(safe.get("summary") or "").strip():
+        return _refused("research_question_missing")
     return True, "", {"gate": "llm_governance", "decision": "approved"}, safe
 
 
@@ -430,7 +457,9 @@ def build_user_prompt(task: Dict[str, Any], safe_payload: Dict[str, Any], safe_c
         "schema_version": WORKER_SCHEMA_VERSION,
         "task_id": task["task_id"],
         "input_version": task["input_version"],
-        "research_question": str(safe_payload.get("summary") or (task.get("input_payload") or {}).get("research_question") or ""),
+        # The question comes from the approved projection alone (govern_egress
+        # has already refused a projection without one).
+        "research_question": str(safe_payload.get("summary") or ""),
         "citation_contract": build_citation_contract(safe_context),
         "public_context": safe_context,
     }
