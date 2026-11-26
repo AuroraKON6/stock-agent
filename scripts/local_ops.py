@@ -696,7 +696,9 @@ def cmd_go_live_check(args: argparse.Namespace) -> int:
     print("Technical readiness: {0}".format(readiness))
     print("Business decision: {0}".format(decision))
     print("Doctor: {0}".format(doctor_overall))
-    print("Scheduled tasks installed: {0}".format(summary["scheduled_tasks_installed"]))
+    tasks = summary["scheduled_tasks_installed"]
+    print("Scheduled tasks installed: {0}".format(
+        "not applicable on this platform (Windows Task Scheduler only)" if tasks is None else tasks))
     print("Exit code: {0}".format(summary["exit_code"]))
     print("Summary: {0}".format(summary_path))
     if decision != "GO":
