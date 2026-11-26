@@ -364,7 +364,8 @@ PROJECTION_REFUSALS = {
 }
 
 
-def govern_egress(task: Dict[str, Any], config: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any], Dict[str, Any]]:
+def govern_egress(task: Dict[str, Any], config: Dict[str, Any], *,
+                  require_enforced: bool = False) -> Tuple[bool, str, Dict[str, Any], Dict[str, Any]]:
     """Run the shared LLM governance over the task's CURRENT payload.
 
     Returns ``(allowed, reason, governance_record, safe_payload)``. The safe
@@ -373,6 +374,8 @@ def govern_egress(task: Dict[str, Any], config: Dict[str, Any]) -> Tuple[bool, s
     the outbound research question: when governance is enabled an approved
     decision without this task's projection, or with a blank question in it,
     blocks before any dispatch. Nothing falls back to the task's own input.
+    ``require_enforced`` (external live dispatch) additionally refuses a
+    disabled or monitor-only governance before anything is screened.
     """
 
     payload = dict(task.get("input_payload") or {})
@@ -383,6 +386,15 @@ def govern_egress(task: Dict[str, Any], config: Dict[str, Any]) -> Tuple[bool, s
         }, {}
     from .llm_governance import governance_config, prepare_llm_batch
 
+    governance_cfg = governance_config(config)
+    if require_enforced and not (governance_cfg["enabled"] and governance_cfg["enforce"]):
+        # External LIVE dispatch needs a screened, enforced projection. A
+        # disabled or monitor-only (audit without enforcement) governance
+        # never admits a live request, whatever the task payload says.
+        return False, "external live dispatch requires enabled and enforced llm governance", {
+            "gate": "llm_governance_mode", "decision": "denied",
+            "reason": "live_requires_enforced_governance",
+        }, {}
     carrier = _egress_carrier(task, config)
     approved, safe_payloads, stats = prepare_llm_batch([carrier], config, "research_task")
     if not approved:
@@ -402,8 +414,8 @@ def govern_egress(task: Dict[str, Any], config: Dict[str, Any]) -> Tuple[bool, s
             "reason": reason, "audit_id": audit_id,
         }, {}
 
-    if not governance_config(config)["enabled"]:
-        # Governance disabled: no projection was screened. Only the question
+    if not governance_cfg["enabled"]:
+        # Governance disabled (replay only reaches this far): no projection was screened. Only the question
         # itself is passed on; the raw payload is never the safe payload.
         safe = {"summary": payload.get("research_question") or ""}
     else:
@@ -922,7 +934,8 @@ def _run_research_task(
     # --- Egress gate: re-run on EVERY attempt over the current payload. ---
     # Runs for replay too: a recorded answer still must not enter the task
     # from a denied payload, and the delivery record must exist for all modes.
-    allowed, reason, governance, safe_payload = govern_egress(task, config)
+    live_egress = model_call["mode"] != "replay"
+    allowed, reason, governance, safe_payload = govern_egress(task, config, require_enforced=live_egress)
     if not allowed:
         return _blocked(reason, governance)
     safe_context, delivery = build_safe_research_context(task.get("input_payload") or {}, config=config,
@@ -989,7 +1002,8 @@ def _run_research_task(
             if round_index > 1:
                 # Governance and context verification re-run on every round
                 # over the current payload — never only once at task start.
-                allowed, reason, governance, safe_payload = govern_egress(task, config)
+                allowed, reason, governance, safe_payload = govern_egress(
+                    task, config, require_enforced=live_egress)
                 if not allowed:
                     return _blocked(reason, governance)
                 safe_context, delivery = build_safe_research_context(task.get("input_payload") or {}, config=config,

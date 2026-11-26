@@ -72,12 +72,16 @@ if os.environ.get("R28_EVIDENCE_PATH"):
     atexit.register(_dump)
 
 
-def _governance(enabled: bool) -> dict:
-    """The example config's shared-governance block; only the two switches move."""
+def _governance(enabled: bool, enforce: bool = True) -> dict:
+    """The example config's shared-governance block; only the two switches move.
+
+    ``enabled=False`` is the example as shipped; ``enforce=False`` is the
+    monitor-only setting (audit without enforcement).
+    """
     example = json.loads((ROOT / "config" / "watchlist.example.json").read_text(encoding="utf-8"))
     block = copy.deepcopy(example["llm_governance"])
     block["enabled"] = enabled
-    block["enforce"] = enabled
+    block["enforce"] = enabled and enforce
     return block
 
 
@@ -128,10 +132,10 @@ class EgressProvenanceTests(unittest.TestCase):
         spec.update(extra)
         return spec
 
-    def drive(self, name, spec, outputs, *, enabled, injected=None):
+    def drive(self, name, spec, outputs, *, enabled, injected=None, enforce=True, mode="live"):
         """Run one leased task to the client boundary and record what arrived."""
-        config = dict(self.config, llm_governance=_governance(enabled))
-        task, _ = self.store.create_task(title="R28 合成研究", input_payload=spec, execution_mode="live")
+        config = dict(self.config, llm_governance=_governance(enabled, enforce))
+        task, _ = self.store.create_task(title="R28 合成研究", input_payload=spec, execution_mode=mode)
         claimed = self.store.claim_next("w-r28")
         self.assertEqual(claimed["task_id"], task["task_id"])
         calls = []
@@ -209,6 +213,9 @@ class EgressProvenanceTests(unittest.TestCase):
             "run": os.environ.get("R28_RUN_LABEL", ""),
             "kind": "synthetic_fault_injection" if injected is not None else "real_config",
             "governance_enabled": enabled,
+            "governance_enforce": enabled and enforce,
+            "budget_attempt_events": len([event for event in self.store.events(task["task_id"])
+                                          if event["event_type"] == "research_attempt_started"]),
             "status": result.get("status"),
             "error": result.get("error"),
             "governance": model_call.get("governance"),
@@ -343,19 +350,41 @@ class EgressProvenanceTests(unittest.TestCase):
         self.assertEqual(RECORDS[-1]["dispatched_attempts"], 0)
         self.assertEqual(RECORDS[-1]["governance"]["gate"], "question_projection")
 
-    # ---- real governance, disabled (the example config's shipped switches) ----
+    # ---- no approved projection can exist: disabled, or monitor-only ----
 
-    def test_disabled_still_delivers_the_task_question(self):
-        result, calls = self.drive("disabled_question", self.spec(), [_output(None)], enabled=False)
-        self.assertEqual(result["status"], "succeeded", result.get("error"))
-        self.assertEqual(json.loads(calls[0]["user_content"])["research_question"], SEVEN_QUESTIONS)
+    def _assert_refused_before_reservation(self, result, record):
+        self.assertEqual(result["status"], "blocked", result.get("error"))
+        self.assertEqual(record["mock_calls"], 0)
+        self.assertEqual(record["dispatched_attempts"], 0)
+        self.assertEqual(record["budget_attempt_events"], 0, "no budget reservation may be recorded")
+        self.assertEqual(record["governance"], {
+            "gate": "llm_governance_mode", "decision": "denied",
+            "reason": "live_requires_enforced_governance"})
 
-    def test_disabled_payload_summary_key_cannot_replace_the_question(self):
-        result, calls = self.drive("disabled_payload_summary_key", self.spec(summary="PAYLOAD_SUMMARY_SENTINEL_DO_NOT_SEND"),
+    def test_disabled_governance_refuses_live_before_reservation(self):
+        result, calls = self.drive("disabled_live", self.spec(), [_output(None)], enabled=False)
+        self.assertEqual(len(calls), 0)
+        self._assert_refused_before_reservation(result, RECORDS[-1])
+
+    def test_disabled_governance_payload_summary_key_never_reaches_a_client(self):
+        result, calls = self.drive("disabled_live_payload_summary_key",
+                                   self.spec(summary="PAYLOAD_SUMMARY_SENTINEL_DO_NOT_SEND"),
                                    [_output(None)], enabled=False)
-        self.assertEqual(result["status"], "succeeded", result.get("error"))
-        self.assertEqual(json.loads(calls[0]["user_content"])["research_question"], SEVEN_QUESTIONS)
-        self.assertNotIn("PAYLOAD_SUMMARY_SENTINEL_DO_NOT_SEND", calls[0]["user_content"])
+        self.assertEqual(len(calls), 0)
+        self._assert_refused_before_reservation(result, RECORDS[-1])
+
+    def test_monitor_only_governance_refuses_live_before_reservation(self):
+        # Shared governance still audits, but without enforcement its verdict
+        # cannot admit an external live request.
+        result, calls = self.drive("monitor_only_live", self.spec(), [_output(None)], enabled=True, enforce=False)
+        self.assertEqual(len(calls), 0)
+        self._assert_refused_before_reservation(result, RECORDS[-1])
+
+    def test_disabled_governance_keeps_replay_working(self):
+        # Replay never dispatches: a disabled governance does not stop it.
+        result, calls = self.drive("disabled_replay", self.spec(), [], enabled=False, mode="replay")
+        self.assertIn(result["status"], ("succeeded", "awaiting_human"), result.get("error"))
+        self.assertEqual((len(calls), RECORDS[-1]["dispatched_attempts"]), (0, 0))
 
     # ---- synthetic fault injection: never a real-configuration reproduction ----
 
