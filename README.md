@@ -132,11 +132,26 @@ python -m stock_agent doctor --config config/watchlist.local.json
 
 ## 快速开始
 
-在 `E:\stock agent` 目录执行：
+Windows（`E:\stock agent` 目录）：
 
 ```powershell
 python -m stock_agent run --config config/watchlist.example.json
 ```
+
+macOS / Linux：先按 [`docs/macos-runbook.md`](docs/macos-runbook.md) 创建锁定的 `.venv312`
+并安装依赖，然后使用跨平台入口（Windows 上同样的入口会转交给对应 `.ps1`）：
+
+```bash
+scripts/run_once.sh                                   # 单次运行
+scripts/watch.sh --interval-minutes 30                # 前台持续运行
+scripts/start_agent.sh && scripts/stop_agent.sh       # 后台守护进程
+scripts/start_research_workbench.sh                   # 本地研究工作台（仅回环地址）
+.venv312/bin/python scripts/run_isolated_tests.py     # 全量离线测试
+```
+
+`config/watchlist.example.json` 只启用本地情报池、关闭全部行情源和 LLM，可离线安全空跑；
+没有 `config/watchlist.local.json` 时入口会明确提示使用的是开发示例配置。Windows 专有
+入口（计划任务、桌面快捷方式）在 macOS 上的对应关系见运行手册第 7 节。
 
 生成结果会写入：
 

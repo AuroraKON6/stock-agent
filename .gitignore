@@ -8,6 +8,8 @@ venv/
 # Local credentials and machine state
 .env
 .env.*
+# The tracked credential template carries placeholders only.
+!.env.example
 config/watchlist.local.json
 .agents/
 .codex/
