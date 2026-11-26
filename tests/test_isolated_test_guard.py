@@ -1,5 +1,6 @@
 """Exercise the guard callback without installing an irreversible test-wide hook."""
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -42,3 +43,31 @@ class IsolationTests(unittest.TestCase):
         self.audit("sqlite3.connect", ((Path(tempfile.gettempdir()) / "encoded name.sqlite").as_uri() + "?mode=ro",))
         with self.assertRaises(PermissionError):
             self.audit("sqlite3.connect", ("file://other-host/database.sqlite?mode=ro",))
+
+    @unittest.skipUnless(Path("/dev/fd").exists(), "directory fds are a POSIX facility")
+    def test_relative_name_is_anchored_to_its_dir_fd(self):
+        # POSIX shutil.rmtree passes bare names relative to a directory fd; a
+        # bare resolve() would read "probe" against the cwd, i.e. the checkout.
+        with tempfile.TemporaryDirectory() as outside:
+            fd = os.open(outside, os.O_RDONLY)
+            try:
+                self.audit("os.rmdir", ("probe", fd))
+                self.audit("os.rename", ("probe", "moved", fd, fd))
+            finally:
+                os.close(fd)
+        fd = os.open(self.root, os.O_RDONLY)
+        try:
+            for event, args in [("os.remove", ("probe", fd)), ("os.rmdir", ("probe", fd)),
+                                ("os.rename", ("probe", "moved", fd, fd))]:
+                with self.subTest(event=event), self.assertRaises(PermissionError):
+                    self.audit(event, args)
+        finally:
+            os.close(fd)
+
+    def test_unverifiable_dir_fd_fails_closed(self):
+        with self.assertRaises(PermissionError):
+            self.audit("os.remove", ("probe", 10 ** 9))
+
+    def test_fd_taking_call_is_not_mistaken_for_a_dir_fd(self):
+        # os.truncate audits (fd, length): the length must not be used as a base.
+        self.audit("os.truncate", (12345, 7))
