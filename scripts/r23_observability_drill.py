@@ -81,6 +81,9 @@ FORBIDDEN = tuple(SECRETS.values())
 DRILL_CONFIG = {
     "storage": {"sqlite_path": "data/stock_agent.sqlite3"},
     "task_runtime": {"db_path": DB_REL},
+    # The frozen live case must reach the model stub: an external live
+    # dispatch is refused unless governance is enabled AND enforced.
+    "llm_governance": {"enabled": True, "enforce": True, "external_provider": True},
     "dify": {"enabled": True, "service_credentials_path": CREDS_REL,
              "approved_workflow_versions": ["wf-demo-1"]},
     "kimi_integration": {"enabled": True},

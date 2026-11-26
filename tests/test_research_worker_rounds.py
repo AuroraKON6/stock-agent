@@ -13,7 +13,7 @@ from stock_agent.task_runtime import TaskStore, TaskFencingError, TaskTransition
 from stock_agent.task_supply import build_task_spec
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _vault_fixture import import_document, vault_config
+from _vault_fixture import enforced_governance, import_document, vault_config
 
 NOW = datetime.now(timezone.utc)
 _RESEARCH_WORKER_GOVERN = None
@@ -60,7 +60,7 @@ class MultiRoundTestCase(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.enterContext(project_path_override(lambda value: self.root / value))
-        self.config = vault_config(self.root, {})
+        self.config = enforced_governance(vault_config(self.root, {}), self.root)
         mdg = self.config.setdefault("market_data_governance", {})
         mdg["approved_internal_research_providers"] = ["eastmoney"]
         mdg["use_production_pilot_provider_registry"] = False

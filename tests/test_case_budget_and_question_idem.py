@@ -13,7 +13,7 @@ from stock_agent.task_runtime import TaskStore
 from stock_agent.task_supply import build_task_spec
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _vault_fixture import import_document, vault_config
+from _vault_fixture import enforced_governance, import_document, vault_config
 
 NOW = datetime.now(timezone.utc)
 
@@ -45,7 +45,7 @@ class CaseTimeLimitTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.enterContext(project_path_override(lambda value: self.root / value))
-        self.config = vault_config(self.root, {})
+        self.config = enforced_governance(vault_config(self.root, {}), self.root)
         self.config["task_runtime"] = {"db_path": str(self.root / "tasks.sqlite3")}
         self.store = TaskStore(self.config["task_runtime"]["db_path"])
         self.addCleanup(self.store.close)
@@ -100,7 +100,7 @@ class QuestionIdempotencyTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.enterContext(project_path_override(lambda value: self.root / value))
-        self.config = vault_config(self.root, {})
+        self.config = enforced_governance(vault_config(self.root, {}), self.root)
         self.config["task_runtime"] = {"db_path": str(self.root / "tasks.sqlite3")}
         self.store = TaskStore(self.config["task_runtime"]["db_path"])
         self.addCleanup(self.store.close)

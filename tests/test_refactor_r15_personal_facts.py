@@ -53,7 +53,7 @@ from stock_agent.task_runtime import TaskStore
 from stock_agent.task_supply import build_task_spec
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _vault_fixture import vault_config
+from _vault_fixture import enforced_governance, vault_config
 
 OWNER = "lead-analyst"
 FOREIGN_OWNER = "another-analyst"
@@ -97,7 +97,7 @@ class R15PersonalFactsTestCase(unittest.TestCase):
         original_root = config_module.PROJECT_ROOT
         config_module.PROJECT_ROOT = self.root
         self.addCleanup(setattr, config_module, "PROJECT_ROOT", original_root)
-        self.config = vault_config(self.root, {})
+        self.config = enforced_governance(vault_config(self.root, {}), self.root)
         mdg = self.config.setdefault("market_data_governance", {})
         mdg["approved_internal_research_providers"] = ["eastmoney"]
         mdg["use_production_pilot_provider_registry"] = False
