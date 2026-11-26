@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import tempfile
+import contextlib
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -160,6 +161,11 @@ class StopSafetyTests(LocalOpsTestCase):
             self.addCleanup(item.stop)
         self.state = self.scratch / "state"
         self.state.mkdir()
+        # These cases exercise identity validation; the POSIX start/stop lock
+        # itself is covered by ConcurrentStartTests on POSIX.
+        lock = patch.object(self.ops, "_state_lock", side_effect=lambda _path: contextlib.nullcontext())
+        lock.start()
+        self.addCleanup(lock.stop)
 
     def test_stop_agent_never_kills_a_foreign_pid(self):
         self.pid_file.write_text("{0}\n".format(os.getpid()), encoding="ascii")
@@ -212,10 +218,63 @@ class StopSafetyTests(LocalOpsTestCase):
         meta.write_text(json.dumps({
             "pid": 4242, "port": port, "host": "127.0.0.1", "config": "config/watchlist.example.json",
             "instance_id": "inst-1", "url": "http://127.0.0.1:{0}/".format(port)}), encoding="utf-8")
-        with patch.object(self.ops, "is_workbench_process", return_value=False):
-            code = self.ops.cmd_stop_workbench(self.parse("stop-workbench", "--state-directory", str(self.state)))
+        arguments = ["stop-workbench", "--state-directory", str(self.state)]
+        # The recorded PID is fake: after /shutdown the process is gone, so no
+        # signal path may ever be reached for it.
+        with patch.object(self.ops, "is_workbench_process", return_value=False), \
+                patch.object(self.ops, "_pid_alive", return_value=False) as alive, \
+                patch.object(self.ops, "_terminate") as terminate:
+            code = self.ops.cmd_stop_workbench(self.parse(*arguments))
         self.assertEqual(code, 0)
         self.assertEqual(_HealthHandler.shutdown_calls, [("/shutdown", "inst-1")])
+        terminate.assert_not_called()
+        self.assertFalse(meta.exists())
+        self.assertIn(4242, [call.args[0] for call in alive.call_args_list])
+
+    def test_stop_workbench_signals_only_when_shutdown_leaves_the_process_alive(self):
+        server = HTTPServer(("127.0.0.1", 0), _HealthHandler)
+        port = server.server_address[1]
+        _HealthHandler.shutdown_calls = []
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        meta = self.state / "workbench.json"
+        meta.write_text(json.dumps({
+            "pid": 4242, "port": port, "host": "127.0.0.1", "config": "config/watchlist.example.json",
+            "instance_id": "inst-1", "url": "http://127.0.0.1:{0}/".format(port)}), encoding="utf-8")
+        alive = {"value": True}
+
+        def fake_terminate(pid):
+            self.assertEqual(pid, 4242)
+            alive["value"] = False
+
+        with patch.object(self.ops, "is_workbench_process", return_value=False), \
+                patch.object(self.ops, "_pid_alive", side_effect=lambda _pid: alive["value"]), \
+                patch.object(self.ops, "_terminate", side_effect=fake_terminate) as terminate:
+            code = self.ops.cmd_stop_workbench(
+                self.parse("stop-workbench", "--state-directory", str(self.state)))
+        self.assertEqual(code, 0)
+        self.assertEqual(_HealthHandler.shutdown_calls, [("/shutdown", "inst-1")])
+        terminate.assert_called_once_with(4242)
+        self.assertFalse(meta.exists())
+
+    def test_stop_workbench_refuses_to_signal_when_shutdown_is_not_acknowledged(self):
+        _HealthHandler.shutdown_calls = []
+        meta = self.state / "workbench.json"
+        meta.write_text(json.dumps({
+            "pid": 4242, "port": 1, "host": "127.0.0.1", "config": "config/watchlist.example.json",
+            "instance_id": "inst-1", "url": "http://127.0.0.1:1/"}), encoding="utf-8")
+        with patch.object(self.ops, "is_workbench_process", return_value=True), \
+                patch.object(self.ops, "_pid_alive", return_value=True), \
+                patch.object(self.ops, "_http_json", return_value=None) as http, \
+                patch.object(self.ops, "_terminate") as terminate:
+            code = self.ops.cmd_stop_workbench(
+                self.parse("stop-workbench", "--state-directory", str(self.state)))
+        self.assertEqual(code, 0)
+        # The endpoint did not answer "stopping", so the validated PID is terminated.
+        self.assertEqual(http.call_args.args[1], "http://127.0.0.1:1/shutdown")
+        terminate.assert_called_once_with(4242)
         self.assertFalse(meta.exists())
 
     def test_health_requires_matching_instance_and_pid(self):

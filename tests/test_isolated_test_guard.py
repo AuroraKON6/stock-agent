@@ -13,6 +13,7 @@ class IsolationTests(unittest.TestCase):
             "isolated_runner", Path(__file__).resolve().parents[1] / "scripts/run_isolated_tests.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        self.module = module
         self.root = Path(__file__).resolve().parents[1]
         with patch.object(module.sys, "addaudithook") as hook:
             module.install_guard(self.root)
@@ -74,22 +75,65 @@ class IsolationTests(unittest.TestCase):
         cwd = os.getcwd()
         os.chdir(self.root)
         self.addCleanup(os.chdir, cwd)
-        with patch("fcntl.fcntl") as lookup, tempfile.TemporaryDirectory() as outside:
+        with patch.object(self.module, "_fd_directory") as lookup:
             for value in ("data/probe", os.fsencode("data/probe"), self.root / "data" / "probe"):
                 with self.subTest(value=value), self.assertRaises(PermissionError):
                     self.audit("os.truncate", (value, 7))
-            lookup.assert_not_called()
             # fd taking form: an integer names a descriptor, not a workspace path
             self.audit("os.truncate", (12345, 7))
+            lookup.assert_not_called()
 
     def test_truncate_relative_name_outside_workspace_is_allowed(self):
         cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as outside:
             os.chdir(outside)
-            self.addCleanup(os.chdir, cwd)
-            with patch("fcntl.fcntl") as lookup:
+            # Registered before leaving the directory: cleanups run LIFO, so
+            # the cwd is restored before the temporary directory is removed.
+            self.addCleanup(self._restore_cwd, cwd)
+            with patch.object(self.module, "_fd_directory") as lookup:
                 self.audit("os.truncate", ("probe", 7))
                 lookup.assert_not_called()
+        self.addCleanup(self._restore_cwd, cwd)
+
+    @staticmethod
+    def _restore_cwd(cwd):
+        if os.path.isdir(cwd):
+            os.chdir(cwd)
+
+    def test_rename_resolves_source_and_destination_fds_separately(self):
+        # os.rename audits (src, dst, src_dir_fd, dst_dir_fd). Each side is
+        # anchored to its own descriptor; the destination fd is not the
+        # source's.
+        directories = {}
+
+        def fake_fd_directory(dir_fd):
+            return directories[dir_fd]
+
+        with tempfile.TemporaryDirectory() as outside, patch.object(
+                self.module, "_fd_directory", side_effect=fake_fd_directory):
+            directories.update({10: self.root, 20: Path(outside)})
+            with self.assertRaises(PermissionError):
+                # source outside, destination inside: the write into the checkout is denied
+                self.audit("os.rename", ("probe", "probe", 20, 10))
+            with self.assertRaises(PermissionError):
+                # source inside, destination outside: the removal from the checkout is denied
+                self.audit("os.rename", ("probe", "probe", 10, 20))
+            self.audit("os.rename", ("probe", "moved", 20, 20))
+            self.audit("os.rename", (str(Path(outside) / "probe"), str(Path(outside) / "moved"), 10, 10))
+            self.audit("os.rename", (str(Path(outside) / "probe"), str(Path(outside) / "moved")))
+            with self.assertRaises(PermissionError):
+                self.audit("os.rename", (str(Path(outside) / "probe"), str(self.root / "moved")))
+            # os.symlink: the single dir_fd applies to the link being created
+            with self.assertRaises(PermissionError):
+                self.audit("os.symlink", ("target", "link", 10))
+            self.audit("os.symlink", ("target", "link", 20))
+            # the target text is never resolved, not even inside the checkout
+            self.audit("os.symlink", (str(self.root / "elsewhere"), "link", 20))
+            self.audit("os.symlink", (str(self.root / "elsewhere"), str(Path(outside) / "link")))
+            # os.link shares rename's signature
+            with self.assertRaises(PermissionError):
+                self.audit("os.link", ("probe", "probe", 20, 10))
+            self.audit("os.link", ("probe", "probe", 20, 20))
 
     def test_fd_taking_call_is_not_mistaken_for_a_dir_fd(self):
         # os.truncate audits (fd, length): the length must not be used as a base.

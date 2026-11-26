@@ -18,6 +18,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # Position of the dir_fd argument in each audited call that carries one.
 _PATH_DIR_FD = {"os.remove": 1, "os.rmdir": 1, "os.mkdir": 2, "os.chmod": 2, "os.utime": 3}
+# (source dir_fd, destination dir_fd) positions; None where the side is never
+# interpreted against a directory fd. os.symlink audits (src, dst, dir_fd) and
+# the dir_fd applies to the link being created, i.e. the destination.
+_TWO_PATH_DIR_FD = {"os.rename": (2, 3), "os.link": (2, 3), "os.symlink": (None, 2)}
 
 
 def _arg(args, index):
@@ -82,11 +86,12 @@ def install_guard(root: Path) -> None:
             # argument is something else (os.truncate's length) and must not
             # be read as a directory fd.
             protect(args[0], _arg(args, _PATH_DIR_FD[event]) if event in _PATH_DIR_FD else None)
-        elif event in {"os.rename", "os.link", "os.symlink"}:
-            # os.rename/os.link: (src, dst, src_dir_fd, dst_dir_fd);
-            # os.symlink: (src, dst, dir_fd) applies to dst only.
-            protect(args[0], _arg(args, 2) if event != "os.symlink" else None)
-            protect(args[1], _arg(args, 3 if event == "os.link" else 2))
+        elif event in _TWO_PATH_DIR_FD:
+            source_fd, destination_fd = _TWO_PATH_DIR_FD[event]
+            if source_fd is not None:
+                # A symlink's source is its target text, not a path of ours.
+                protect(args[0], _arg(args, source_fd))
+            protect(args[1], _arg(args, destination_fd))
         elif event == "sqlite3.connect" and args[0] != ":memory:":
             if str(args[0]).startswith("file:"):
                 uri = urlsplit(str(args[0]))
