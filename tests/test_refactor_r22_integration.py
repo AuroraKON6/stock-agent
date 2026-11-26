@@ -75,7 +75,7 @@ from stock_agent.task_supply import build_task_spec
 from stock_agent.workflow_service import cancel_task as workflow_cancel_task
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _vault_fixture import import_document, vault_config
+from _vault_fixture import enforced_governance, import_document, vault_config
 
 OWNER = "review-owner"
 OTHER = "review-other"
@@ -107,7 +107,7 @@ class R22IntegrationCase(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
         self.enterContext(project_path_override(lambda value: self.root / value))
-        self.config = vault_config(self.root, {})
+        self.config = enforced_governance(vault_config(self.root, {}), self.root)
         self.config["task_runtime"] = {"db_path": str(self.root / "tasks.sqlite3")}
         self.config["personal_evidence"] = {"root": str(self.root / "personal_evidence")}
         self.db_path = Path(self.config["task_runtime"]["db_path"])

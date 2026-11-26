@@ -16,7 +16,7 @@ from stock_agent.task_supply import build_task_spec
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _task_fixture_helpers import final_replay_response
-from _vault_fixture import vault_config
+from _vault_fixture import enforced_governance, vault_config
 
 NOW = datetime.now(timezone.utc)
 
@@ -42,12 +42,12 @@ class ReservationTestCase(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.root = Path(temporary.name).resolve()
         self.enterContext(project_path_override(lambda value: self.root / value))
         # Same enriched config as the budget-guard worker tests: real vault
         # paths and market relaxations so governance passes and the budget
         # gate is what actually decides.
-        self.config = vault_config(self.root, {})
+        self.config = enforced_governance(vault_config(self.root, {}), self.root)
         self.config["task_runtime"] = {"db_path": str(self.root / "tasks.sqlite3"),
                                        "budget": {"daily_model_call_limit": 1}}
         self.store = TaskStore(self.config["task_runtime"]["db_path"])

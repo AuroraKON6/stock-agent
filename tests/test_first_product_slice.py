@@ -269,9 +269,9 @@ class ResearchWorkerTests(unittest.TestCase):
 
         if str(Path(__file__).resolve().parent) not in _sys.path:
             _sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from _vault_fixture import import_document, vault_config
+        from _vault_fixture import enforced_governance, import_document, vault_config
 
-        self.vault_cfg = vault_config(self.root, {})
+        self.vault_cfg = enforced_governance(vault_config(self.root, {}), self.root)
         _, self.doc_sha = import_document(self.vault_cfg, self.root, content="官方公告正文", title="官方公告摘要")
         self.doc_id = "document:sha256:{0}".format(self.doc_sha)
 
@@ -342,9 +342,9 @@ class TaskBoardTests(unittest.TestCase):
 
         if str(Path(__file__).resolve().parent) not in _sys.path:
             _sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from _vault_fixture import import_document, vault_config
+        from _vault_fixture import enforced_governance, import_document, vault_config
 
-        self.vault_cfg = vault_config(self.root, {})
+        self.vault_cfg = enforced_governance(vault_config(self.root, {}), self.root)
         _, self.doc_sha = import_document(self.vault_cfg, self.root, content="官方公告正文", title="官方公告摘要")
         self.doc_id = "document:sha256:{0}".format(self.doc_sha)
         self.server = create_task_board_server(self.store, host="127.0.0.1", port=0)

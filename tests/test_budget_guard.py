@@ -14,7 +14,7 @@ from stock_agent.task_runtime import TaskStore
 from stock_agent.task_supply import build_task_spec
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _vault_fixture import vault_config
+from _vault_fixture import enforced_governance, vault_config
 
 NOW = datetime.now(timezone.utc)
 
@@ -110,7 +110,7 @@ class WorkerBudgetIntegrationTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         self.enterContext(project_path_override(lambda value: self.root / value))
-        self.config = vault_config(self.root, {})
+        self.config = enforced_governance(vault_config(self.root, {}), self.root)
         self.config["task_runtime"] = {"db_path": str(self.root / "tasks.sqlite3"),
                                        "budget": {"daily_model_call_limit": 1}}
         self.store = TaskStore(self.config["task_runtime"]["db_path"])

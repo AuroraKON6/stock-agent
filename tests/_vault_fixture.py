@@ -37,6 +37,25 @@ def vault_config(root: Path, base: Dict[str, Any] | None = None) -> Dict[str, An
     return config
 
 
+def enforced_governance(config: Dict[str, Any], root: Path | None = None) -> Dict[str, Any]:
+    """Shared LLM governance enabled AND enforced (KONM-137).
+
+    An external live dispatch is refused under a disabled or monitor-only
+    governance, so a fixture that expects a live task to reach the model
+    client must say so explicitly instead of relying on the disabled default.
+    ``root`` pins the governance audit and exception files inside the
+    temporary workspace by ABSOLUTE path: a worker thread does not inherit
+    the project-path override, so a relative path would reach the checkout.
+    """
+    config["llm_governance"] = {"enabled": True, "enforce": True, "external_provider": True}
+    if root is not None:
+        config["llm_governance"].update({
+            "audit_path": str(Path(root).resolve() / "llm_governance" / "audit"),
+            "exception_path": str(Path(root).resolve() / "llm_governance" / "exceptions"),
+        })
+    return config
+
+
 def import_document(config: Dict[str, Any], root: Path, *, content: str, title: str,
                     signal_ids=None, seed_signals: bool = True) -> Tuple[str, str]:
     """Import one official document through the real importer.
